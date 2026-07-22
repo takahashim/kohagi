@@ -55,87 +55,82 @@ fn parse_line(line: &str) -> Result<Option<InRecord>, String> {
     }))
 }
 
-/// Embed one chunk and write its output lines (one complete line per record,
-/// written in a single `write` each, so a crash never leaves a partial line).
-fn run_chunk(
-    embedder: &Embedder,
+/// Embed the buffered chunk, write its output lines, and empty the buffer.
+/// Returns how many records were written.
+///
+/// The model is loaded here on first use, so input with no valid records
+/// never loads it at all. Each record is written as one complete line, so an
+/// abort can never leave a half-written line for the caller to misread.
+fn flush_chunk(
+    embedder: &mut Option<Embedder>,
+    load: &impl Fn() -> Result<Embedder>,
     prefix: &str,
-    chunk: &[InRecord],
+    chunk: &mut Vec<InRecord>,
     out: &mut impl Write,
-) -> Result<()> {
+) -> Result<usize> {
+    if chunk.is_empty() {
+        return Ok(0);
+    }
+    let embedder = match embedder {
+        Some(e) => e,
+        None => embedder.insert(load()?),
+    };
+
     let prefixed: Vec<String> = chunk
         .iter()
         .map(|r| format!("{prefix}{}", r.text))
         .collect();
     let texts: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-    let vecs = embedder.embed(&texts)?;
+    let vectors = embedder.embed(&texts)?;
 
-    for (rec, vec) in chunk.iter().zip(&vecs) {
+    for (record, vector) in chunk.iter().zip(&vectors) {
         serde_json::to_writer(
             &mut *out,
             &OutRecord {
-                id: &rec.id,
-                embedding: vec,
+                id: &record.id,
+                embedding: vector,
             },
         )?;
         out.write_all(b"\n")?;
     }
+    // Flush per chunk so the caller can consume output as it is produced.
     out.flush()?;
-    Ok(())
+
+    let written = chunk.len();
+    chunk.clear();
+    Ok(written)
 }
 
-/// Run the protocol over stdin/stdout. `load` is called lazily before the
-/// first chunk, so empty input succeeds without touching the model. Returns
-/// the number of skipped lines — the caller maps >0 to exit code 2; fatal
-/// errors (model load, I/O) return `Err` (exit 1).
-pub fn run(
-    load: impl FnOnce() -> Result<Embedder>,
-    prefix: &str,
-    model_label: &str,
-) -> Result<usize> {
+/// Run the protocol over stdin/stdout. Returns the number of skipped lines —
+/// the caller maps >0 to exit code 2; fatal errors (model load, I/O) return
+/// `Err` (exit 1).
+pub fn run(load: impl Fn() -> Result<Embedder>, prefix: &str, model_label: &str) -> Result<usize> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
-    let mut load = Some(load);
     let mut embedder: Option<Embedder> = None;
     let mut chunk: Vec<InRecord> = Vec::new();
     let mut n_out = 0usize;
     let mut skipped = 0usize;
-    let mut lineno = 0usize;
 
-    for line in stdin.lock().lines() {
+    for (lineno, line) in stdin.lock().lines().enumerate() {
         let line = line.context("reading stdin")?;
-        lineno += 1;
         match parse_line(&line) {
-            Ok(Some(rec)) => {
-                chunk.push(rec);
+            Ok(Some(record)) => {
+                chunk.push(record);
                 if chunk.len() >= CHUNK_ROWS {
-                    let e = match &embedder {
-                        Some(e) => e,
-                        None => embedder.insert(load.take().unwrap()()?),
-                    };
-                    run_chunk(e, prefix, &chunk, &mut out)?;
-                    n_out += chunk.len();
-                    chunk.clear();
+                    n_out += flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
                 }
             }
             Ok(None) => {}
             Err(why) => {
                 skipped += 1;
-                eprintln!("kohagi: skip line {lineno}: {why}");
+                eprintln!("kohagi: skip line {}: {why}", lineno + 1);
             }
         }
     }
-    if !chunk.is_empty() {
-        let e = match &embedder {
-            Some(e) => e,
-            None => embedder.insert(load.take().unwrap()()?),
-        };
-        run_chunk(e, prefix, &chunk, &mut out)?;
-        n_out += chunk.len();
-        chunk.clear();
-    }
+    n_out += flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
 
     // `in` counts record lines (blank lines are ignored entirely); with no
     // valid input the model was never loaded and dim is unknown (0).

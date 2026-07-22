@@ -7,9 +7,45 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use kohagi::{stdio, Embedder, ModelSource, Options, Pooling, Precision};
+
+/// CLI spellings of the library enums, so `--help` lists the valid values and
+/// clap rejects anything else before we do any work.
+#[derive(Clone, Copy, ValueEnum)]
+enum PoolingArg {
+    /// Mask-aware mean over tokens (Ruri v3, modernbert-embed).
+    Mean,
+    /// First token only.
+    Cls,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PrecisionArg {
+    /// Matches the PyTorch reference; works on every CPU.
+    F32,
+    /// ~2x faster on x86_64 CPUs with AVX512-BF16, at cosine ~0.99999.
+    Bf16,
+}
+
+impl From<PoolingArg> for Pooling {
+    fn from(p: PoolingArg) -> Self {
+        match p {
+            PoolingArg::Mean => Pooling::Mean,
+            PoolingArg::Cls => Pooling::Cls,
+        }
+    }
+}
+
+impl From<PrecisionArg> for Precision {
+    fn from(p: PrecisionArg) -> Self {
+        match p {
+            PrecisionArg::F32 => Precision::F32,
+            PrecisionArg::Bf16 => Precision::Bf16,
+        }
+    }
+}
 
 /// Local sentence embeddings for Ruri v3 / ModernBERT models.
 ///
@@ -34,14 +70,13 @@ struct Args {
     /// sentence similarity).
     #[arg(long, default_value = "")]
     prefix: String,
-    /// Pooling: mean (Ruri v3, modernbert-embed) or cls.
-    #[arg(long, default_value = "mean")]
-    pooling: String,
-    /// Numeric precision: f32 (default, identical everywhere) or bf16, a
-    /// ~2x faster path for short texts on x86_64 CPUs with AVX512-BF16
-    /// (cosine ~0.99999 vs f32 — close, but not bit-identical).
-    #[arg(long, default_value = "f32")]
-    precision: String,
+    /// How to reduce token embeddings to one vector per text.
+    #[arg(long, value_enum, default_value_t = PoolingArg::Mean)]
+    pooling: PoolingArg,
+    /// Numeric precision of the forward pass. f32 is identical everywhere;
+    /// bf16 is faster but not bit-identical.
+    #[arg(long, value_enum, default_value_t = PrecisionArg::F32)]
+    precision: PrecisionArg,
     /// Skip L2 normalization (normalized output is the default; unit vectors
     /// make dot product = cosine).
     #[arg(long)]
@@ -58,68 +93,75 @@ struct Args {
     text: Vec<String>,
 }
 
-fn run(args: Args) -> anyhow::Result<usize> {
-    let pooling = match args.pooling.as_str() {
-        "mean" => Pooling::Mean,
-        "cls" => Pooling::Cls,
-        other => anyhow::bail!("invalid pooling '{other}' (expected mean or cls)"),
-    };
-    let precision = match args.precision.as_str() {
-        "f32" => Precision::F32,
-        "bf16" => Precision::Bf16,
-        other => anyhow::bail!("invalid precision '{other}' (expected f32 or bf16)"),
-    };
-    let opts = Options {
-        pooling,
-        normalize: !args.no_normalize,
-        max_seq_length: args.max_seq_length,
-        batch_size: args.batch_size,
-        precision,
-    };
-    let (source, label) = match (&args.model_path, &args.tokenizer_path) {
-        (Some(model), Some(tokenizer)) => {
-            let label = model.file_name().map_or_else(
-                || model.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            (
-                ModelSource::Files {
+impl Args {
+    fn options(&self) -> Options {
+        Options {
+            pooling: self.pooling.into(),
+            normalize: !self.no_normalize,
+            max_seq_length: self.max_seq_length,
+            batch_size: self.batch_size,
+            precision: self.precision.into(),
+        }
+    }
+
+    /// Where to load the model from, plus the name to show in the summary.
+    fn source(&self) -> (ModelSource, String) {
+        match (&self.model_path, &self.tokenizer_path) {
+            // clap's `requires` guarantees these two arrive together.
+            (Some(model), Some(tokenizer)) => {
+                let label = model.file_name().map_or_else(
+                    || model.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                let source = ModelSource::Files {
                     model: model.clone(),
                     tokenizer: tokenizer.clone(),
-                },
-                label,
-            )
+                };
+                (source, label)
+            }
+            _ => {
+                let source = ModelSource::Hub {
+                    repo: self.model_id.clone(),
+                };
+                (source, self.model_id.clone())
+            }
         }
-        _ => (
-            ModelSource::Hub {
-                repo: args.model_id.clone(),
-            },
-            args.model_id.clone(),
-        ),
-    };
+    }
+}
+
+/// `--text` mode: embed the arguments and print the same JSONL that stdio
+/// mode would, with the argument positions as ids.
+fn embed_arguments(args: &Args, source: &ModelSource) -> anyhow::Result<()> {
+    #[derive(serde::Serialize)]
+    struct Out<'a> {
+        id: usize,
+        embedding: &'a [f32],
+    }
+
+    let embedder = Embedder::load(source, args.options())?;
+    let prefixed: Vec<String> = args
+        .text
+        .iter()
+        .map(|t| format!("{}{t}", args.prefix))
+        .collect();
+    let texts: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+    for (id, embedding) in embedder.embed(&texts)?.iter().enumerate() {
+        println!("{}", serde_json::to_string(&Out { id, embedding })?);
+    }
+    Ok(())
+}
+
+/// Returns the number of skipped input lines (0 in `--text` mode).
+fn run(args: Args) -> anyhow::Result<usize> {
+    let (source, label) = args.source();
 
     if !args.text.is_empty() {
-        // One-shot mode: embed the arguments, print the same JSONL as stdio
-        // mode with positional ids.
-        #[derive(serde::Serialize)]
-        struct Out<'a> {
-            id: usize,
-            embedding: &'a [f32],
-        }
-        let embedder = Embedder::load(&source, opts)?;
-        let prefixed: Vec<String> = args
-            .text
-            .iter()
-            .map(|t| format!("{}{t}", args.prefix))
-            .collect();
-        let texts: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-        for (id, vec) in embedder.embed(&texts)?.iter().enumerate() {
-            println!("{}", serde_json::to_string(&Out { id, embedding: vec })?);
-        }
+        embed_arguments(&args, &source)?;
         return Ok(0);
     }
 
-    stdio::run(move || Embedder::load(&source, opts), &args.prefix, &label)
+    let opts = args.options();
+    stdio::run(|| Embedder::load(&source, opts), &args.prefix, &label)
 }
 
 fn main() -> ExitCode {

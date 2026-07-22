@@ -26,7 +26,7 @@ use candle_transformers::models::modernbert::{Config, ModernBert};
 use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
-use crate::batch::{l2_normalize, load_tokenizer, pool_one, tokenize_bucket, BatchInput, Pooling};
+use crate::batch::{l2_normalize, load_tokenizer, pool_row, tokenize_bucket, BatchInput, Pooling};
 
 /// Attention-scratch budget per forward, in `rows * seq^2` elements.
 const ATTN_BUDGET: usize = 2 * 512 * 512;
@@ -38,6 +38,14 @@ fn rows_per_forward(seq: usize) -> usize {
 
 /// Pooled vectors from one forward, tagged with their caller-side row index.
 type PooledRows = Vec<(usize, Vec<f32>)>;
+
+/// One forward pass: rows `start .. start + rows` of `batch`. A bucketed
+/// batch is split into as many of these as the memory budget requires.
+struct Unit<'a> {
+    batch: &'a BatchInput,
+    start: usize,
+    rows: usize,
+}
 
 /// Where the model weights come from.
 pub enum ModelSource {
@@ -66,6 +74,7 @@ pub enum Precision {
 }
 
 /// Knobs for [`Embedder::load`]. `Default` matches Ruri v3.
+#[derive(Clone, Copy)]
 pub struct Options {
     pub pooling: Pooling,
     /// L2-normalize each embedding (unit length, so dot = cosine).
@@ -149,16 +158,15 @@ impl Embedder {
         }
         let batches = tokenize_bucket(&self.tokenizer, texts, self.opts.batch_size)?;
 
-        // Split each bucketed batch into forwards that fit the attention
-        // budget (row ranges over the batch's padded layout).
+        // Split each bucketed batch into forwards that fit the memory budget.
         let limit = self.weights.max_rows_per_forward();
-        let mut units: Vec<(&BatchInput, usize, usize)> = Vec::new();
-        for b in &batches {
-            let cap = rows_per_forward(b.seq).min(limit);
+        let mut units: Vec<Unit> = Vec::new();
+        for batch in &batches {
+            let cap = rows_per_forward(batch.seq).min(limit);
             let mut start = 0;
-            while start < b.batch {
-                let rows = cap.min(b.batch - start);
-                units.push((b, start, rows));
+            while start < batch.batch {
+                let rows = cap.min(batch.batch - start);
+                units.push(Unit { batch, start, rows });
                 start += rows;
             }
         }
@@ -169,16 +177,25 @@ impl Embedder {
         let per_unit: Vec<Result<PooledRows>> = worker_pool()?.install(|| {
             units
                 .par_iter()
-                .map(|&(b, start, rows)| {
-                    let (lo, hi) = (start * b.seq, (start + rows) * b.seq);
-                    let (ids, mask) = (&b.ids[lo..hi], &b.mask[lo..hi]);
-                    let (data, dim) = weights.forward(device, ids, mask, rows, b.seq)?;
-                    let mut out = Vec::with_capacity(rows);
-                    for bi in 0..rows {
-                        let orig = b.orig[start + bi];
-                        out.push((orig, pool_one(&data, mask, bi, b.seq, dim, pooling)));
+                .map(|unit| {
+                    let (batch, seq) = (unit.batch, unit.batch.seq);
+                    // This unit's slice of the batch's `[batch, seq]` layout.
+                    let range = unit.start * seq..(unit.start + unit.rows) * seq;
+                    let ids = &batch.ids[range.clone()];
+                    let mask = &batch.mask[range];
+                    let (hidden, dim) = weights.forward(device, ids, mask, unit.rows, seq)?;
+
+                    let mut pooled = Vec::with_capacity(unit.rows);
+                    for row in 0..unit.rows {
+                        let vector = pool_row(
+                            &hidden[row * seq * dim..(row + 1) * seq * dim],
+                            &mask[row * seq..(row + 1) * seq],
+                            dim,
+                            pooling,
+                        );
+                        pooled.push((batch.orig[unit.start + row], vector));
                     }
-                    Ok(out)
+                    Ok(pooled)
                 })
                 .collect()
         });
