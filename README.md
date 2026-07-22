@@ -96,8 +96,9 @@ kohagi --model-path models/ruri-v3-130m/model.safetensors \
 Spawn the process, write JSONL to stdin, read JSONL from stdout — **from a
 separate thread**, so the pipe never fills up. Match results by `id`. A
 complete Ruby example is in
-[`examples/rails_open3.rb`](examples/rails_open3.rb); exit code semantics are
-in [PROTOCOL.md](PROTOCOL.md).
+[`examples/rails_open3.rb`](examples/rails_open3.rb), explained in
+[`examples/README.md`](examples/README.md); exit code semantics are in
+[PROTOCOL.md](PROTOCOL.md).
 
 ## Using the library
 
@@ -146,70 +147,28 @@ embeddings from different hosts land in the same index.
 Other CPUs (including Apple Silicon) reject `--precision bf16` at startup with
 a clear message rather than silently falling back.
 
-## Parity with PyTorch
+## Accuracy and reproducibility
 
-kohagi's f32 output *is* the sentence-transformers output, to f32 rounding —
-that is the point of the project, so it is checked rather than asserted.
-[`examples/parity_check.py`](examples/parity_check.py) runs both sides and
-compares them:
+kohagi's f32 output matches the sentence-transformers / PyTorch reference to
+f32 rounding — `1 - cosine ≈ 3e-12` on 512-token inputs, some five orders of
+magnitude below what an f32 vector column can even represent. Verify it on
+your own texts with
+[`examples/parity_check.py`](examples/parity_check.py); the measured numbers,
+and the three settings that must match for the comparison to mean anything,
+are in [`examples/README.md`](examples/README.md).
 
-```console
-$ python examples/parity_check.py --kohagi ./target/release/kohagi
-model      : cl-nagoya/ruri-v3-130m (512 dims, f32)
-mean 1-cos : 1.387e-12
-worst 1-cos: 5.760e-12
-```
+Within one binary on one machine, output is **bit-identical** — verified
+across repeat runs, `RAYON_NUM_THREADS` of 1/8/16, and `--batch-size` 7/64.
+Batching and threading can never change a vector: each one is computed inside
+a single forward pass, and padding is masked out.
 
-Measured on ruri-v3-130m against `sentence-transformers` on CPU:
-
-| texts | mean `1 - cosine` | worst |
-|---|---:|---:|
-| 1200 short (~60 tokens) | 2e-13 | 9e-12 |
-| 240 long (512 tokens) | 3e-12 | 2e-11 |
-| 12 texts swept from 15 to 645 tokens | — | below f32 resolution at every length |
-
-`--precision bf16` is a deliberate tradeoff and sits far above that, at
-`1 - cosine ≈ 2e-5` (worst 9e-5) — still negligible for ranking.
-
-Three settings must match or the comparison is meaningless, and they are the
-usual cause of a reported "mismatch":
-
-- **prefix**, exactly, trailing space included. Dropping the space moves
-  `1 - cosine` to ~`3e-3` — ten orders of magnitude above the real difference.
-- **max_seq_length**: kohagi defaults to 512, sentence-transformers to
-  whatever `sentence_bert_config.json` says (8192 for ruri-v3), so long texts
-  get truncated on one side only.
-- **pooling**, against the model's `1_Pooling/config.json` (mean for ruri-v3
-  and modernbert-embed).
-
-## Reproducibility
-
-Within one binary on one machine, output is **bit-identical** — verified across
-repeat runs, `RAYON_NUM_THREADS` of 1/8/16, and `--batch-size` 7/64. Batching
-and threading can never change a vector: each one is computed inside a single
-forward pass, and padding is masked out.
-
-Across *platforms* it is numerically equivalent but not bit-identical. The
-macOS build routes matmuls and vectorized `exp`/`tanh` through Apple's
-Accelerate framework, while Linux uses candle's pure-Rust `gemm`; different
-summation orders round differently in the last bits. For scale, two
-independent f32 implementations measured here (candle's `gemm` vs PyTorch's
-MKL, ruri-v3-130m) differ by `1 - cosine ≈ 3e-12` on 512-token inputs, worst
-case `2e-11` — about four orders of magnitude below what an f32 vector column
-can even represent. It cannot affect ranking. A spot check on Apple Silicon
-landed at the same magnitude, with a maximum elementwise difference of ~2e-7
-on short texts.
-
-If you measure this yourself, **accumulate the cosine in float64**. Two f32
-vectors this close saturate f32 arithmetic: the same pair that scores
-`1 - cosine = 9e-12` in float64 scores `1.2e-7` in float32, which is the
-precision floor of the measurement rather than a property of the vectors.
-
-Two practical consequences:
+Across platforms it is numerically equivalent but not bit-identical, since
+macOS routes matmuls through Accelerate and Linux through candle's pure-Rust
+`gemm`. The difference is the same order as above and cannot affect ranking,
+so vectors built on either platform can share an index. Two consequences
+worth designing around:
 
 - Detect staleness by hashing the **input text**, never the output vector.
-  Vectors regenerated on another machine are equal for every purpose that
-  matters, but not byte-equal.
 - Assert on cosine with a tolerance in tests, not on exact float equality.
 
 By far the likeliest cause of genuinely different vectors is a **config**
@@ -245,7 +204,7 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 - x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では
   `--precision bf16` で 1.5〜1.9 倍高速化(cosine ≈ 0.99999、既定は f32)
 - 出力は f32 で PyTorch / sentence-transformers と一致(1 - cosine ≈ 3e-12 を実測)。
-  検証は `examples/parity_check.py` で誰でも再現できる
+  検証手順と実測値は [`examples/README.md`](examples/README.md) を参照
 - 同一マシン・同一バイナリなら出力はビット単位で再現(スレッド数・batch-size に依らない)。
   mac と Linux の間は BLAS が違うためビット一致はしないが、差は上記のとおり無視できる
 - メモリ使用量は入力サイズによらず一定(チャンク処理+attention 予算キャップ)

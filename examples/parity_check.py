@@ -21,6 +21,8 @@ The three settings that actually bite:
 Cosine is accumulated in float64 on purpose: two f32 vectors this close
 saturate f32 arithmetic at `1 - cosine ≈ 1.2e-7`, which measures the
 accumulator rather than the vectors.
+
+See examples/README.md for the measured numbers and the reasoning.
 """
 
 import argparse
