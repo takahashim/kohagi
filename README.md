@@ -123,6 +123,11 @@ The CLI is built on the same API, and its `main.rs` is ~100 lines.
 * Batches run in parallel across physical CPU cores. Set `RAYON_NUM_THREADS` to override the default; additional threads may improve throughput at the cost of memory.
 * `--max-seq-length` has the largest effect on throughput because attention cost grows quadratically with sequence length.
 
+Throughput is worth measuring on your own machine and texts rather than taking
+numbers on faith. [`examples/benchmark.py`](examples/benchmark.py) times kohagi against
+Sentence Transformers on the same corpus and settings; see
+[`examples/README.md`](examples/README.md) for measured results on Apple Silicon.
+
 ### `--precision bf16` on AVX512-BF16 CPUs
 
 On Zen 4 (Sapphire Rapids) and newer CPUs, `--precision bf16` uses `bf16` for projection layers while keeping normalization, softmax, and attention scores in `f32`.
