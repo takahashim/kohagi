@@ -31,9 +31,19 @@ use crate::batch::{l2_normalize, load_tokenizer, pool_row, tokenize_bucket, Batc
 /// Attention-scratch budget per forward, in `rows * seq^2` elements.
 const ATTN_BUDGET: usize = 2 * 512 * 512;
 
+/// Same budget for the GPU, which wants the opposite shape: one stream of wide
+/// forwards rather than many narrow ones. 2 rows at seq 512 leaves an Apple GPU
+/// almost entirely idle. Provisional — it is a starting point for measurement,
+/// not a tuned value.
+const METAL_ATTN_BUDGET: usize = 16 * 512 * 512;
+
 /// Rows allowed in one forward of padded length `seq`.
-fn rows_per_forward(seq: usize) -> usize {
-    (ATTN_BUDGET / (seq * seq).max(1)).max(1)
+fn rows_per_forward(seq: usize, backend: Backend) -> usize {
+    let budget = match backend {
+        Backend::Cpu => ATTN_BUDGET,
+        Backend::Metal => METAL_ATTN_BUDGET,
+    };
+    (budget / (seq * seq).max(1)).max(1)
 }
 
 /// Pooled vectors from one forward, tagged with their caller-side row index.
@@ -73,6 +83,22 @@ pub enum Precision {
     Bf16,
 }
 
+/// Which device runs the forward pass.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Backend {
+    /// CPU, via Apple Accelerate on macOS and candle's own gemm elsewhere.
+    #[default]
+    Cpu,
+    /// Apple GPU via candle's Metal backend. Requires the `metal` cargo
+    /// feature; [`Embedder::load`] fails clearly when it is absent.
+    ///
+    /// Not the default even on macOS: it has not been measured to beat the
+    /// Accelerate path for this model, and the two use opposite execution
+    /// strategies (see [`Embedder::embed`]), so it is a real fork rather than
+    /// a drop-in swap. Benchmark before choosing it.
+    Metal,
+}
+
 /// Knobs for [`Embedder::load`]. `Default` matches Ruri v3.
 #[derive(Clone, Copy)]
 pub struct Options {
@@ -85,6 +111,7 @@ pub struct Options {
     /// Bucketing granularity (rows per padded batch before the memory cap).
     pub batch_size: usize,
     pub precision: Precision,
+    pub backend: Backend,
 }
 
 impl Default for Options {
@@ -95,6 +122,7 @@ impl Default for Options {
             max_seq_length: 512,
             batch_size: 64,
             precision: Precision::F32,
+            backend: Backend::Cpu,
         }
     }
 }
@@ -133,7 +161,14 @@ impl Embedder {
             .with_context(|| format!("cannot parse {}", config_path.display()))?;
         let dim = config.hidden_size;
 
-        let device = Device::Cpu;
+        // The bf16 path is a hand-written CPU GEMM (see `crate::bf16`), so it
+        // has nothing to run on a GPU.
+        anyhow::ensure!(
+            !(opts.backend == Backend::Metal && opts.precision == Precision::Bf16),
+            "bf16 is a CPU-only fast path and cannot run on Metal; pick one"
+        );
+
+        let device = open_device(opts.backend)?;
         let weights = load_weights(&model_path, &config, &device, opts.precision)?;
         let tokenizer = load_tokenizer(&tokenizer_path, opts.max_seq_length)?;
         Ok(Self {
@@ -162,7 +197,7 @@ impl Embedder {
         let limit = self.weights.max_rows_per_forward();
         let mut units: Vec<Unit> = Vec::new();
         for batch in &batches {
-            let cap = rows_per_forward(batch.seq).min(limit);
+            let cap = rows_per_forward(batch.seq, self.opts.backend).min(limit);
             let mut start = 0;
             while start < batch.batch {
                 let rows = cap.min(batch.batch - start);
@@ -174,31 +209,36 @@ impl Embedder {
         let weights = &self.weights;
         let device = &self.device;
         let pooling = self.opts.pooling;
-        let per_unit: Vec<Result<PooledRows>> = worker_pool()?.install(|| {
-            units
-                .par_iter()
-                .map(|unit| {
-                    let (batch, seq) = (unit.batch, unit.batch.seq);
-                    // This unit's slice of the batch's `[batch, seq]` layout.
-                    let range = unit.start * seq..(unit.start + unit.rows) * seq;
-                    let ids = &batch.ids[range.clone()];
-                    let mask = &batch.mask[range];
-                    let (hidden, dim) = weights.forward(device, ids, mask, unit.rows, seq)?;
+        let run = |unit: &Unit| -> Result<PooledRows> {
+            let (batch, seq) = (unit.batch, unit.batch.seq);
+            // This unit's slice of the batch's `[batch, seq]` layout.
+            let range = unit.start * seq..(unit.start + unit.rows) * seq;
+            let ids = &batch.ids[range.clone()];
+            let mask = &batch.mask[range];
+            let (hidden, dim) = weights.forward(device, ids, mask, unit.rows, seq)?;
 
-                    let mut pooled = Vec::with_capacity(unit.rows);
-                    for row in 0..unit.rows {
-                        let vector = pool_row(
-                            &hidden[row * seq * dim..(row + 1) * seq * dim],
-                            &mask[row * seq..(row + 1) * seq],
-                            dim,
-                            pooling,
-                        );
-                        pooled.push((batch.orig[unit.start + row], vector));
-                    }
-                    Ok(pooled)
-                })
-                .collect()
-        });
+            let mut pooled = Vec::with_capacity(unit.rows);
+            for row in 0..unit.rows {
+                let vector = pool_row(
+                    &hidden[row * seq * dim..(row + 1) * seq * dim],
+                    &mask[row * seq..(row + 1) * seq],
+                    dim,
+                    pooling,
+                );
+                pooled.push((batch.orig[unit.start + row], vector));
+            }
+            Ok(pooled)
+        };
+
+        // The two backends want opposite shapes. On the CPU, parallelism comes
+        // from running many narrow forwards at once. There is only one GPU, so
+        // fanning out just makes threads contend over command submission and
+        // multiplies scratch memory; Metal runs wide forwards back to back
+        // instead, and gets its parallelism inside each one.
+        let per_unit: Vec<Result<PooledRows>> = match self.opts.backend {
+            Backend::Cpu => worker_pool()?.install(|| units.par_iter().map(run).collect()),
+            Backend::Metal => units.iter().map(run).collect(),
+        };
 
         let mut rows_out: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
         for unit in per_unit {
@@ -210,6 +250,24 @@ impl Embedder {
             }
         }
         Ok(rows_out)
+    }
+}
+
+/// Open the requested device, failing with a fixable message rather than a
+/// silent fallback — a run that quietly lands on the CPU looks like a Metal
+/// benchmark result.
+fn open_device(backend: Backend) -> Result<Device> {
+    match backend {
+        Backend::Cpu => Ok(Device::Cpu),
+        #[cfg(feature = "metal")]
+        Backend::Metal => {
+            Device::new_metal(0).context("cannot open Metal device 0 (no Apple GPU available?)")
+        }
+        #[cfg(not(feature = "metal"))]
+        Backend::Metal => anyhow::bail!(
+            "this binary was built without Metal support; rebuild with \
+             `cargo build --release --features metal`"
+        ),
     }
 }
 
