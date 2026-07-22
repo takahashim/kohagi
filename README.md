@@ -146,6 +146,42 @@ embeddings from different hosts land in the same index.
 Other CPUs (including Apple Silicon) reject `--precision bf16` at startup with
 a clear message rather than silently falling back.
 
+## Parity with PyTorch
+
+kohagi's f32 output *is* the sentence-transformers output, to f32 rounding —
+that is the point of the project, so it is checked rather than asserted.
+[`examples/parity_check.py`](examples/parity_check.py) runs both sides and
+compares them:
+
+```console
+$ python examples/parity_check.py --kohagi ./target/release/kohagi
+model      : cl-nagoya/ruri-v3-130m (512 dims, f32)
+mean 1-cos : 1.387e-12
+worst 1-cos: 5.760e-12
+```
+
+Measured on ruri-v3-130m against `sentence-transformers` on CPU:
+
+| texts | mean `1 - cosine` | worst |
+|---|---:|---:|
+| 1200 short (~60 tokens) | 2e-13 | 9e-12 |
+| 240 long (512 tokens) | 3e-12 | 2e-11 |
+| 12 texts swept from 15 to 645 tokens | — | below f32 resolution at every length |
+
+`--precision bf16` is a deliberate tradeoff and sits far above that, at
+`1 - cosine ≈ 2e-5` (worst 9e-5) — still negligible for ranking.
+
+Three settings must match or the comparison is meaningless, and they are the
+usual cause of a reported "mismatch":
+
+- **prefix**, exactly, trailing space included. Dropping the space moves
+  `1 - cosine` to ~`3e-3` — ten orders of magnitude above the real difference.
+- **max_seq_length**: kohagi defaults to 512, sentence-transformers to
+  whatever `sentence_bert_config.json` says (8192 for ruri-v3), so long texts
+  get truncated on one side only.
+- **pooling**, against the model's `1_Pooling/config.json` (mean for ruri-v3
+  and modernbert-embed).
+
 ## Reproducibility
 
 Within one binary on one machine, output is **bit-identical** — verified across
@@ -208,7 +244,8 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
   (`--model-path`/`--tokenizer-path` でオフライン運用も可)
 - x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では
   `--precision bf16` で 1.5〜1.9 倍高速化(cosine ≈ 0.99999、既定は f32)
-- 出力は f32 で PyTorch / sentence-transformers と一致(1 - cosine ≈ 3e-12 を実測)
+- 出力は f32 で PyTorch / sentence-transformers と一致(1 - cosine ≈ 3e-12 を実測)。
+  検証は `examples/parity_check.py` で誰でも再現できる
 - 同一マシン・同一バイナリなら出力はビット単位で再現(スレッド数・batch-size に依らない)。
   mac と Linux の間は BLAS が違うためビット一致はしないが、差は上記のとおり無視できる
 - メモリ使用量は入力サイズによらず一定(チャンク処理+attention 予算キャップ)
