@@ -160,7 +160,14 @@ summation orders round differently in the last bits. For scale, two
 independent f32 implementations measured here (candle's `gemm` vs PyTorch's
 MKL, ruri-v3-130m) differ by `1 - cosine ≈ 3e-12` on 512-token inputs, worst
 case `2e-11` — about four orders of magnitude below what an f32 vector column
-can even represent. It cannot affect ranking.
+can even represent. It cannot affect ranking. A spot check on Apple Silicon
+landed at the same magnitude, with a maximum elementwise difference of ~2e-7
+on short texts.
+
+If you measure this yourself, **accumulate the cosine in float64**. Two f32
+vectors this close saturate f32 arithmetic: the same pair that scores
+`1 - cosine = 9e-12` in float64 scores `1.2e-7` in float32, which is the
+precision floor of the measurement rather than a property of the vectors.
 
 Two practical consequences:
 
