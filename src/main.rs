@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use kohagi::{stdio, Embedder, ModelSource, Options, Pooling};
+use kohagi::{stdio, Embedder, ModelSource, Options, Pooling, Precision};
 
 /// Local sentence embeddings for Ruri v3 / ModernBERT models.
 ///
@@ -37,6 +37,11 @@ struct Args {
     /// Pooling: mean (Ruri v3, modernbert-embed) or cls.
     #[arg(long, default_value = "mean")]
     pooling: String,
+    /// Numeric precision: f32 (default, identical everywhere) or bf16, a
+    /// ~2x faster path for short texts on x86_64 CPUs with AVX512-BF16
+    /// (cosine ~0.99999 vs f32 — close, but not bit-identical).
+    #[arg(long, default_value = "f32")]
+    precision: String,
     /// Skip L2 normalization (normalized output is the default; unit vectors
     /// make dot product = cosine).
     #[arg(long)]
@@ -59,11 +64,17 @@ fn run(args: Args) -> anyhow::Result<usize> {
         "cls" => Pooling::Cls,
         other => anyhow::bail!("invalid pooling '{other}' (expected mean or cls)"),
     };
+    let precision = match args.precision.as_str() {
+        "f32" => Precision::F32,
+        "bf16" => Precision::Bf16,
+        other => anyhow::bail!("invalid precision '{other}' (expected f32 or bf16)"),
+    };
     let opts = Options {
         pooling,
         normalize: !args.no_normalize,
         max_seq_length: args.max_seq_length,
         batch_size: args.batch_size,
+        precision,
     };
     let (source, label) = match (&args.model_path, &args.tokenizer_path) {
         (Some(model), Some(tokenizer)) => {

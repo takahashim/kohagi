@@ -125,6 +125,27 @@ what the CLI itself is built on — `main.rs` is ~100 lines.
 - `--max-seq-length` is the main throughput lever: attention cost grows with
   the square of sequence length.
 
+### `--precision bf16` (x86_64 with AVX512-BF16)
+
+On Zen 4, Sapphire Rapids and newer, kohagi can run the four projection
+`Linear`s through a bf16 kernel while keeping norms, softmax and attention
+scores in f32 — the same split `torch.autocast` uses. Measured on an 8-core
+Zen 4 (ruri-v3-130m, 1200 short texts / 240 texts at the 512-token limit):
+
+| input | f32 | `--precision bf16` | peak RSS (f32 → bf16) |
+|---|---:|---:|---|
+| short (~60 tokens) | 10.2 s | **5.5 s** (1.9×) | 1.5 GB → 0.9 GB |
+| long (512 tokens) | 54.1 s | **37.1 s** (1.5×) | 1.8 GB → 1.6 GB |
+
+Embeddings agree with the f32 path at cosine ≈ 0.99999 (worst case 0.9996 on
+long inputs) — far below the noise floor for retrieval ranking, but *not*
+bit-identical. It stays opt-in for that reason: with the default f32, the
+same text yields the same vector on every machine, which matters when
+embeddings from different hosts land in the same index.
+
+Other CPUs (including Apple Silicon) reject `--precision bf16` at startup with
+a clear message rather than silently falling back.
+
 ---
 
 ## 日本語
@@ -142,6 +163,8 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 
 - モデルは初回に Hugging Face Hub から自動ダウンロード
   (`--model-path`/`--tokenizer-path` でオフライン運用も可)
+- x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では
+  `--precision bf16` で 1.5〜1.9 倍高速化(cosine ≈ 0.99999、既定は f32)
 - 出力は f32 で PyTorch / sentence-transformers と一致(cosine ≈ 1.0)
 - メモリ使用量は入力サイズによらず一定(チャンク処理+attention 予算キャップ)
 - 入出力の契約・exit code(0/2/1)は [PROTOCOL.md](PROTOCOL.md) を参照。

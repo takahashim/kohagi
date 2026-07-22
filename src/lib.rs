@@ -27,8 +27,10 @@
 //! [candle]: https://github.com/huggingface/candle
 
 mod batch;
+#[cfg(target_arch = "x86_64")]
+pub mod bf16;
 mod model;
 pub mod stdio;
 
 pub use batch::Pooling;
-pub use model::{Embedder, ModelSource, Options};
+pub use model::{Embedder, ModelSource, Options, Precision};

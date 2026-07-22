@@ -51,6 +51,20 @@ pub enum ModelSource {
     Files { model: PathBuf, tokenizer: PathBuf },
 }
 
+/// Numeric precision of the forward pass.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Precision {
+    /// Full f32 — matches the PyTorch reference, works everywhere.
+    #[default]
+    F32,
+    /// The four projection `Linear`s in bf16 (see [`crate::bf16`]). Measured
+    /// on an 8-core Zen 4: 1.9× faster on short texts, 1.5× on 512-token
+    /// ones, at cosine ≈ 0.99999 against f32 — and it halves the memory the
+    /// weights occupy. Requires x86_64 with AVX512-BF16 (Zen 4, Sapphire
+    /// Rapids or newer); [`Embedder::load`] fails clearly elsewhere.
+    Bf16,
+}
+
 /// Knobs for [`Embedder::load`]. `Default` matches Ruri v3.
 pub struct Options {
     pub pooling: Pooling,
@@ -61,18 +75,32 @@ pub struct Options {
     pub max_seq_length: usize,
     /// Bucketing granularity (rows per padded batch before the memory cap).
     pub batch_size: usize,
+    pub precision: Precision,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { pooling: Pooling::Mean, normalize: true, max_seq_length: 512, batch_size: 64 }
+        Self {
+            pooling: Pooling::Mean,
+            normalize: true,
+            max_seq_length: 512,
+            batch_size: 64,
+            precision: Precision::F32,
+        }
     }
+}
+
+/// The loaded weights, in whichever precision was requested.
+enum Weights {
+    F32(Arc<ModernBert>),
+    #[cfg(target_arch = "x86_64")]
+    Bf16(Arc<crate::bf16::Bf16ModernBert>),
 }
 
 /// A loaded ModernBERT sentence encoder. Cheap to share by reference; one
 /// instance can serve any number of `embed` calls.
 pub struct Embedder {
-    model: Arc<ModernBert>,
+    weights: Weights,
     device: Device,
     tokenizer: Tokenizer,
     opts: Options,
@@ -97,9 +125,9 @@ impl Embedder {
         let dim = config.hidden_size;
 
         let device = Device::Cpu;
-        let model = load_modernbert(&model_path, &config, &device)?;
+        let weights = load_weights(&model_path, &config, &device, opts.precision)?;
         let tokenizer = load_tokenizer(&tokenizer_path, opts.max_seq_length)?;
-        Ok(Self { model: Arc::new(model), device, tokenizer, opts, dim })
+        Ok(Self { weights, device, tokenizer, opts, dim })
     }
 
     /// The embedding dimension (`hidden_size` — 512 for ruri-v3-130m).
@@ -117,9 +145,10 @@ impl Embedder {
 
         // Split each bucketed batch into forwards that fit the attention
         // budget (row ranges over the batch's padded layout).
+        let limit = self.weights.max_rows_per_forward();
         let mut units: Vec<(&BatchInput, usize, usize)> = Vec::new();
         for b in &batches {
-            let cap = rows_per_forward(b.seq);
+            let cap = rows_per_forward(b.seq).min(limit);
             let mut start = 0;
             while start < b.batch {
                 let rows = cap.min(b.batch - start);
@@ -128,7 +157,7 @@ impl Embedder {
             }
         }
 
-        let model = &self.model;
+        let weights = &self.weights;
         let device = &self.device;
         let pooling = self.opts.pooling;
         let per_unit: Vec<Result<PooledRows>> = worker_pool()?.install(|| {
@@ -137,7 +166,7 @@ impl Embedder {
                 .map(|&(b, start, rows)| {
                     let (lo, hi) = (start * b.seq, (start + rows) * b.seq);
                     let (ids, mask) = (&b.ids[lo..hi], &b.mask[lo..hi]);
-                    let (data, dim) = forward(model, device, ids, mask, rows, b.seq)?;
+                    let (data, dim) = weights.forward(device, ids, mask, rows, b.seq)?;
                     let mut out = Vec::with_capacity(rows);
                     for bi in 0..rows {
                         let orig = b.orig[start + bi];
@@ -175,40 +204,102 @@ fn fetch_from_hub(repo: &str) -> Result<(PathBuf, PathBuf)> {
     Ok((model, tokenizer))
 }
 
-fn load_modernbert(weights: &Path, config: &Config, device: &Device) -> Result<ModernBert> {
-    // Bare encoder checkpoints (ruri, modernbert-embed) store weights at the
-    // root (embeddings.*, layers.*, final_norm.*). Try that first; if this
-    // candle expects the "model." prefix (used by its MLM/classification
-    // wrappers), remap the keys and retry.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, device)? };
-    if let Ok(m) = ModernBert::load(vb, config) {
-        return Ok(m);
+fn load_weights(
+    path: &Path,
+    config: &Config,
+    device: &Device,
+    precision: Precision,
+) -> Result<Weights> {
+    // Two views of the same memory-mapped file, because the two loaders ask
+    // for different names. candle's `ModernBert::load` prefixes every weight
+    // with `model.` — right for checkpoints saved from a wrapper class (MLM,
+    // classification), wrong for the bare sentence encoders we target (ruri,
+    // modernbert-embed), which store `embeddings.*`, `layers.*` and
+    // `final_norm.*` at the root. Our own bf16 loader reads them at the root.
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], DType::F32, device)? };
+    let (wrapped, encoder) = if vb.contains_tensor("model.embeddings.tok_embeddings.weight") {
+        (vb.clone(), vb.pp("model"))
+    } else {
+        let strip = vb
+            .clone()
+            .rename_f(|name| name.strip_prefix("model.").unwrap_or(name).to_string());
+        (strip, vb)
+    };
+
+    match precision {
+        Precision::F32 => {
+            let model = ModernBert::load(wrapped, config).context("loading ModernBERT weights")?;
+            Ok(Weights::F32(Arc::new(model)))
+        }
+        Precision::Bf16 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                anyhow::ensure!(
+                    crate::bf16::supported(),
+                    "bf16 needs an x86_64 CPU with AVX512-BF16 (Zen 4, Sapphire Rapids or newer); \
+                     this CPU lacks it — use the default f32 precision"
+                );
+                let model = crate::bf16::Bf16ModernBert::load(encoder, config)
+                    .context("loading ModernBERT weights for the bf16 path")?;
+                Ok(Weights::Bf16(Arc::new(model)))
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = encoder;
+                anyhow::bail!(
+                    "bf16 is an x86_64-only fast path (AVX512-BF16); use the default f32 precision"
+                );
+            }
+        }
     }
-    let tensors = candle_core::safetensors::load(weights, device)?;
-    let remapped: std::collections::HashMap<String, Tensor> =
-        tensors.into_iter().map(|(k, v)| (format!("model.{k}"), v)).collect();
-    let vb = VarBuilder::from_tensors(remapped, DType::F32, device);
-    ModernBert::load(vb, config)
-        .context("candle ModernBert::load failed (tried both root and 'model.' prefix)")
 }
 
-/// Run one forward pass, returning flat `[batch * seq * dim]` hidden states.
-fn forward(
-    model: &ModernBert,
-    device: &Device,
-    ids: &[i64],
-    mask: &[i64],
-    batch: usize,
-    seq: usize,
-) -> Result<(Vec<f32>, usize)> {
-    let ids_u: Vec<u32> = ids.iter().map(|&v| v as u32).collect();
-    let mask_u: Vec<u32> = mask.iter().map(|&v| v as u32).collect();
-    let xs = Tensor::from_vec(ids_u, (batch, seq), device)?;
-    let m = Tensor::from_vec(mask_u, (batch, seq), device)?;
-    let out = model.forward(&xs, &m)?; // [batch, seq, dim]
-    let dim = out.dim(2)?;
-    let data = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok((data, dim))
+impl Weights {
+    /// Run one forward pass, returning flat `[batch * seq * dim]` hidden
+    /// states and the dimension.
+    fn forward(
+        &self,
+        device: &Device,
+        ids: &[i64],
+        mask: &[i64],
+        batch: usize,
+        seq: usize,
+    ) -> Result<(Vec<f32>, usize)> {
+        match self {
+            Self::F32(model) => {
+                let ids_u: Vec<u32> = ids.iter().map(|&v| v as u32).collect();
+                let mask_u: Vec<u32> = mask.iter().map(|&v| v as u32).collect();
+                let xs = Tensor::from_vec(ids_u, (batch, seq), device)?;
+                let m = Tensor::from_vec(mask_u, (batch, seq), device)?;
+                let out = model.forward(&xs, &m)?; // [batch, seq, dim]
+                let dim = out.dim(2)?;
+                let data = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                Ok((data, dim))
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::Bf16(model) => model.forward_batch(ids, mask, batch, seq),
+        }
+    }
+
+    /// Upper bound on rows per forward, on top of the memory budget.
+    ///
+    /// The bf16 GEMM is single-threaded by design, so all parallelism comes
+    /// from having many forwards in flight; coarse ones load-balance badly
+    /// because the last wave leaves cores idle, and they waste more padding.
+    /// Measured on 1200 short texts, 8-core Zen 4: 4 rows 5.3s, 8 → 5.6s,
+    /// 16 → 6.3s, 64 → 8.4s (2 rows is 5.5s — past the sweet spot, per-call
+    /// overhead starts to show). The budget already caps long inputs below
+    /// this, so it only bites on short ones.
+    ///
+    /// The f32 path needs no such limit: candle's gemm is internally
+    /// efficient on wider batches.
+    fn max_rows_per_forward(&self) -> usize {
+        match self {
+            Self::F32(_) => usize::MAX,
+            #[cfg(target_arch = "x86_64")]
+            Self::Bf16(_) => 4,
+        }
+    }
 }
 
 /// Physical-core rayon pool (see module docs); `RAYON_NUM_THREADS` overrides.

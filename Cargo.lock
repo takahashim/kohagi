@@ -1295,6 +1295,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "clap",
+ "half",
  "hf-hub",
  "num_cpus",
  "rayon",
