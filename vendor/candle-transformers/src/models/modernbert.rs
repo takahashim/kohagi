@@ -77,16 +77,48 @@ impl RotaryEmbedding {
         })
     }
 
-    fn apply_rotary_emb_qkv(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &self.cos, &self.sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &self.cos, &self.sin)?;
-        Ok((q_embed, k_embed))
+    /// Rotate `[b, heads, seq, dim]`, the layout the fused QKV slices arrive in.
+    fn rope_bhsd(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
+        Ok((
+            candle_nn::rotary_emb::rope(&q.contiguous()?, &self.cos, &self.sin)?,
+            candle_nn::rotary_emb::rope(&k.contiguous()?, &self.cos, &self.sin)?,
+        ))
+    }
+
+    /// Rotate `[b, seq, heads, dim]`, the layout the split projections produce.
+    ///
+    /// Same arithmetic as [`Self::rope_bhsd`] — verified bit-identical — but it
+    /// takes the tensors as they come off the projection, so the transpose into
+    /// attention's layout happens afterwards and stays a view.
+    fn rope_thd(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
+        Ok((
+            candle_nn::rotary_emb::rope_thd(q, &self.cos, &self.sin)?,
+            candle_nn::rotary_emb::rope_thd(k, &self.cos, &self.sin)?,
+        ))
     }
 }
 
 #[derive(Clone)]
+enum Qkv {
+    Fused(Linear),
+    Split { q: Linear, k: Linear, v: Linear },
+}
+
+#[derive(Clone)]
 struct ModernBertAttention {
-    qkv: Linear,
+    /// How the QKV projection is stored, which differs by backend.
+    ///
+    /// Metal wants it split. Fused, the three slices come out of one tensor at
+    /// offsets h*d apart, and candle's Metal sdpa mishandles a non-zero start
+    /// offset — silently, with error proportional to the offset. Giving each of
+    /// q/k/v its own allocation at offset 0 lets sdpa read strided views
+    /// correctly, which removes three per-layer copies and measured 1.43x end
+    /// to end.
+    ///
+    /// The CPU wants it fused: it has no sdpa to hand views to, so it would
+    /// materialize them anyway, and three narrow matmuls run slower there than
+    /// one wide one.
+    qkv: Qkv,
     proj: Linear,
     num_attention_heads: usize,
     attention_head_size: usize,
@@ -99,6 +131,19 @@ impl ModernBertAttention {
         let attention_head_size = config.hidden_size / config.num_attention_heads;
 
         let qkv = linear_no_bias(config.hidden_size, config.hidden_size * 3, vb.pp("Wqkv"))?;
+        let qkv = if vb.device().is_metal() {
+            // Linear weights are [out, in]; the fused Wqkv concatenates q, k
+            // and v along the output axis, so the split is by rows.
+            let w = qkv.weight();
+            let h = config.hidden_size;
+            Qkv::Split {
+                q: Linear::new(w.narrow(0, 0, h)?.contiguous()?, None),
+                k: Linear::new(w.narrow(0, h, h)?.contiguous()?, None),
+                v: Linear::new(w.narrow(0, 2 * h, h)?.contiguous()?, None),
+            }
+        } else {
+            Qkv::Fused(qkv)
+        };
         let proj = linear_no_bias(config.hidden_size, config.hidden_size, vb.pp("Wo"))?;
 
         Ok(Self {
@@ -113,22 +158,32 @@ impl ModernBertAttention {
     fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let xs = hidden_states.clone();
         let (b, seq_len, d) = xs.dims3()?;
-        let qkv = xs
-            .apply(&self.qkv)?
-            .reshape((
-                b,
-                seq_len,
-                3,
-                self.num_attention_heads,
-                self.attention_head_size,
-            ))?
-            .permute((2, 0, 3, 1, 4))?;
-
-        let q = qkv.get(0)?;
-        let k = qkv.get(1)?;
-        let v = qkv.get(2)?;
-
-        let (q, k) = self.rotary_emb.apply_rotary_emb_qkv(&q, &k)?;
+        let heads = (b, seq_len, self.num_attention_heads, self.attention_head_size);
+        // Both arms end at [b, heads, seq, dim], but they get there differently
+        // and rotate in different layouts to avoid materializing on the way.
+        let (q, k, v) = match &self.qkv {
+            Qkv::Split { q, k, v } => {
+                let q = xs.apply(q)?.reshape(heads)?;
+                let k = xs.apply(k)?.reshape(heads)?;
+                let v = xs.apply(v)?.reshape(heads)?.transpose(1, 2)?;
+                let (q, k) = self.rotary_emb.rope_thd(&q, &k)?;
+                (q.transpose(1, 2)?, k.transpose(1, 2)?, v)
+            }
+            Qkv::Fused(qkv) => {
+                let t = xs
+                    .apply(qkv)?
+                    .reshape((
+                        b,
+                        seq_len,
+                        3,
+                        self.num_attention_heads,
+                        self.attention_head_size,
+                    ))?
+                    .permute((2, 0, 3, 1, 4))?;
+                let (q, k) = self.rotary_emb.rope_bhsd(&t.get(0)?, &t.get(1)?)?;
+                (q, k, t.get(2)?)
+            }
+        };
 
         let scale = (self.attention_head_size as f64).powf(-0.5);
 
@@ -150,15 +205,19 @@ impl ModernBertAttention {
                 .clamp(-60f32, 0f32)?
                 .broadcast_as((mb, self.num_attention_heads, ms, mk))?;
             candle_nn::ops::sdpa(
-                &q.contiguous()?,
-                &k.contiguous()?,
-                &v.contiguous()?,
+                &q,
+                &k,
+                &v,
                 Some(&mask),
                 false,
                 scale as f32,
                 1.0,
             )?
         } else {
+            // The CPU matmul cannot consume the transposed views, and there is
+            // no sdpa to hand them to, so materialize here rather than paying
+            // for it on both backends.
+            let (q, k, v) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
             let q = (q * scale)?;
             let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
             let att = att.broadcast_add(attention_mask)?;
