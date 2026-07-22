@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write # attach binaries to releases on tag pushes
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      - run: cargo clippy -- -D warnings
+
+  # Release binaries: Apple Silicon macOS and x86_64 Linux. Uploaded as
+  # artifacts on every push; attached to the GitHub Release on v* tags.
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Smoke-test the protocol without a model
+        run: |
+          # Empty input must exit 0 without loading anything.
+          : | ./target/release/kohagi --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
+      - name: Package
+        run: |
+          mkdir dist
+          tar -czf dist/kohagi-${{ matrix.target }}.tar.gz -C target/release kohagi
+          cd dist && shasum -a 256 *.tar.gz > kohagi-${{ matrix.target }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kohagi-${{ matrix.target }}
+          path: dist/*
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

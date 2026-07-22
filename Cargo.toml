@@ -1,0 +1,32 @@
+[package]
+name = "kohagi"
+version = "0.1.0"
+edition = "2021"
+description = "Local sentence embeddings for Ruri v3 and other ModernBERT models: JSONL in, vectors out. Pure Rust, bounded memory."
+license = "MIT"
+repository = "https://github.com/takahashim/kohagi"
+keywords = ["embeddings", "ruri", "modernbert", "candle", "jsonl"]
+categories = ["command-line-utilities", "text-processing"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+num_cpus = "1"
+tokenizers = "0.21"
+hf-hub = "0.4"
+
+# candle runs pure-CPU on every platform; the macOS target below adds Apple
+# Accelerate (AMX) for its sgemm. No GPU: candle 0.10 lacks the Metal kernels
+# ModernBERT's rotary embeddings need, and CPU is fast enough for batch work.
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.10", features = ["accelerate"] }
+
+[profile.release]
+lto = "thin"
