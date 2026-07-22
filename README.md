@@ -146,6 +146,35 @@ embeddings from different hosts land in the same index.
 Other CPUs (including Apple Silicon) reject `--precision bf16` at startup with
 a clear message rather than silently falling back.
 
+## Reproducibility
+
+Within one binary on one machine, output is **bit-identical** — verified across
+repeat runs, `RAYON_NUM_THREADS` of 1/8/16, and `--batch-size` 7/64. Batching
+and threading can never change a vector: each one is computed inside a single
+forward pass, and padding is masked out.
+
+Across *platforms* it is numerically equivalent but not bit-identical. The
+macOS build routes matmuls and vectorized `exp`/`tanh` through Apple's
+Accelerate framework, while Linux uses candle's pure-Rust `gemm`; different
+summation orders round differently in the last bits. For scale, two
+independent f32 implementations measured here (candle's `gemm` vs PyTorch's
+MKL, ruri-v3-130m) differ by `1 - cosine ≈ 3e-12` on 512-token inputs, worst
+case `2e-11` — about four orders of magnitude below what an f32 vector column
+can even represent. It cannot affect ranking.
+
+Two practical consequences:
+
+- Detect staleness by hashing the **input text**, never the output vector.
+  Vectors regenerated on another machine are equal for every purpose that
+  matters, but not byte-equal.
+- Assert on cosine with a tolerance in tests, not on exact float equality.
+
+By far the likeliest cause of genuinely different vectors is a **config**
+difference, not a platform one — a `--prefix` that lost its trailing space
+shifts `1 - cosine` to ~`3e-3`, a hundred million times the platform effect.
+Pin `--prefix`, `--pooling`, `--max-seq-length` and `--precision` wherever you
+invoke kohagi.
+
 ## The name
 
 The model is named for 瑠璃 (*ruri*, lapis lazuli). In 氷室冴子's Heian-era
@@ -172,7 +201,9 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
   (`--model-path`/`--tokenizer-path` でオフライン運用も可)
 - x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では
   `--precision bf16` で 1.5〜1.9 倍高速化(cosine ≈ 0.99999、既定は f32)
-- 出力は f32 で PyTorch / sentence-transformers と一致(cosine ≈ 1.0)
+- 出力は f32 で PyTorch / sentence-transformers と一致(1 - cosine ≈ 3e-12 を実測)
+- 同一マシン・同一バイナリなら出力はビット単位で再現(スレッド数・batch-size に依らない)。
+  mac と Linux の間は BLAS が違うためビット一致はしないが、差は上記のとおり無視できる
 - メモリ使用量は入力サイズによらず一定(チャンク処理+attention 予算キャップ)
 - 入出力の契約・exit code(0/2/1)は [PROTOCOL.md](PROTOCOL.md) を参照。
   Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb)
