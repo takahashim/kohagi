@@ -31,8 +31,9 @@ candle-core = { version = "0.11", features = ["accelerate"] }
 
 [features]
 # Apple GPU via candle's Metal backend: `cargo build --release --features metal`,
-# then `kohagi --device metal`. Off by default because it is not yet measured to
-# beat the Accelerate CPU path, and it pulls in candle-metal-kernels.
+# then `kohagi --device metal`. ~1.2x the Accelerate CPU path on an M2, but only
+# with the patched candle in vendor/, so it stays opt-in and pulls in
+# candle-metal-kernels only when asked for.
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 
 [profile.release]

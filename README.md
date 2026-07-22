@@ -29,14 +29,9 @@ Prebuilt binaries for macOS (Apple Silicon) and Linux (x86_64) are on the
 tar -xzf kohagi-<target>.tar.gz && mv kohagi ~/.local/bin/
 ```
 
-The binaries are not signed with an Apple Developer ID, so on macOS the quarantine
-attribute is carried over if you unpack the `.tar.gz` from Finder, and Gatekeeper
-blocks the binary. Extracting with `tar` as above avoids this; if you do get
-blocked, clear the attribute:
-
-```bash
-xattr -dr com.apple.quarantine ~/.local/bin/kohagi
-```
+The binaries are unsigned, so unpacking from Finder on macOS leaves a quarantine
+attribute that Gatekeeper blocks. Extracting with `tar` as above avoids it;
+otherwise run `xattr -dr com.apple.quarantine ~/.local/bin/kohagi`.
 
 Or with cargo:
 
@@ -119,7 +114,7 @@ The CLI is built on the same API, and its `main.rs` is ~100 lines.
 
 ## Performance notes
 
-* CPU only by design. Candle 0.10 does not provide Metal kernels for ModernBERT rotary embeddings, while Apple Accelerate already performs within about 20% of PyTorch with equivalent output.
+* CPU by default, via Apple Accelerate on macOS, which performs within about 20% of PyTorch with equivalent output.
 * Batches run in parallel across physical CPU cores. Set `RAYON_NUM_THREADS` to override the default; additional threads may improve throughput at the cost of memory.
 * `--max-seq-length` has the largest effect on throughput because attention cost grows quadratically with sequence length.
 
@@ -127,6 +122,15 @@ Throughput is worth measuring on your own machine and texts rather than taking
 numbers on faith. [`examples/benchmark.py`](examples/benchmark.py) times kohagi against
 Sentence Transformers on the same corpus and settings; see
 [`examples/README.md`](examples/README.md) for measured results on Apple Silicon.
+
+### `--device metal` on Apple Silicon
+
+Building with `--features metal` adds an Apple GPU backend. On an M2 it runs
+512-token batches about 1.2× faster than the Accelerate CPU path, with f32
+output unchanged (worst `1 - cosine` 9e-13 against CPU).
+
+This needs the patched candle in [`vendor/`](vendor/README.md), so it is off by
+default and only applies when building from this repository.
 
 ### `--precision bf16` on AVX512-BF16 CPUs
 
@@ -175,6 +179,7 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 
 - モデルは初回には Hugging Face Hub から自動ダウンロードします (`--model-path`/`--tokenizer-path` でオフライン運用も可)
 - x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では `--precision bf16` で 1.5〜1.9 倍高速化します(cosine ≈ 0.99999、既定は f32。精度は若干落ちます)
+- Apple Silicon では `--features metal` でビルドすると `--device metal` が使え、CPU の約1.2倍で動きます(出力は f32 のまま変わりません)
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
 - メモリ使用量は入力サイズによらず一定になるようにしました (チャンク処理+attention 予算キャップ)
 - 入出力の契約・exit code(0/2/1)は [PROTOCOL.md](PROTOCOL.md) を参照してください。

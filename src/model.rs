@@ -31,10 +31,13 @@ use crate::batch::{l2_normalize, load_tokenizer, pool_row, tokenize_bucket, Batc
 /// Attention-scratch budget per forward, in `rows * seq^2` elements.
 const ATTN_BUDGET: usize = 2 * 512 * 512;
 
-/// Same budget for the GPU, which wants the opposite shape: one stream of wide
-/// forwards rather than many narrow ones. 2 rows at seq 512 leaves an Apple GPU
-/// almost entirely idle. Provisional — it is a starting point for measurement,
-/// not a tuned value.
+/// Same budget for the GPU, which runs one stream of wide forwards rather than
+/// many narrow ones.
+///
+/// The width barely matters now: with the vendored candle's SDPA the attention
+/// scores are never materialized, so 4 rows measured 16.80s against 17.59s at
+/// 64 on a 240-text run. It mattered a great deal before that, in the opposite
+/// direction, which is why the constant exists at all.
 const METAL_ATTN_BUDGET: usize = 16 * 512 * 512;
 
 /// Rows allowed in one forward of padded length `seq`.
@@ -92,10 +95,12 @@ pub enum Backend {
     /// Apple GPU via candle's Metal backend. Requires the `metal` cargo
     /// feature; [`Embedder::load`] fails clearly when it is absent.
     ///
-    /// Not the default even on macOS: it has not been measured to beat the
-    /// Accelerate path for this model, and the two use opposite execution
-    /// strategies (see [`Embedder::embed`]), so it is a real fork rather than
-    /// a drop-in swap. Benchmark before choosing it.
+    /// About 1.2x faster than Accelerate on an M2 at 512 tokens, with f32
+    /// output unchanged. Still not the default: the margin depends on the
+    /// patched candle in `vendor/`, so a build against stock candle would be
+    /// markedly slower here than on the CPU. The two also use opposite
+    /// execution strategies (see [`Embedder::embed`]), so this is a fork of
+    /// the pipeline rather than a drop-in swap.
     Metal,
 }
 
