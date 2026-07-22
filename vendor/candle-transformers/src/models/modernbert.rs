@@ -132,20 +132,20 @@ impl ModernBertAttention {
 
         let scale = (self.attention_head_size as f64).powf(-0.5);
 
-        // EXPERIMENT: on Metal, fuse the whole attention so the [b, h, s, s]
-        // score tensor is never materialized. sdpa is Metal-only, so the CPU
-        // keeps the explicit path.
+        // On Metal, fuse the whole attention so the [b, h, s, s] score tensor is
+        // never materialized. sdpa is Metal-only, so the CPU keeps the explicit
+        // path.
         let xs = if q.device().is_metal() {
             let (mb, _, ms, mk) = attention_mask.dims4()?;
-            // A fully-padded query row is all -inf, and softmax of that is NaN.
-            // The explicit path gets away with it because pooling skips padded
-            // positions; the fused kernel lets the NaN reach the whole row. A
-            // finite floor keeps exp() at exactly 0 for real rows and yields a
-            // row sums to 0 and divides to NaN) leaves masked weights negligible instead.
-            // Clamp on the small [b,1,s,s] tensor, then widen to the head count
-            // as a *view*: sdpa checks dims but reads through strides, so a
-            // stride-0 head axis satisfies it without materializing the
-            // [b,h,s,s] mask this fusion exists to avoid.
+            // Clamp on the small [b, 1, s, s] mask, then widen to the head count
+            // as a *view*: sdpa checks dims but reads the mask through strides,
+            // so a stride-0 head axis satisfies it without materializing the
+            // [b, h, s, s] tensor this fusion exists to avoid.
+            //
+            // The floor is finite because a fully padded query row is all -inf,
+            // and softmax of that is NaN. The explicit path hides it — pooling
+            // skips padded positions — but the fused kernel lets the NaN reach
+            // the whole row.
             let mask = attention_mask
                 .clamp(-60f32, 0f32)?
                 .broadcast_as((mb, self.num_attention_heads, ms, mk))?;
