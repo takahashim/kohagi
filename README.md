@@ -146,6 +146,13 @@ embeddings from different hosts land in the same index.
 Other CPUs (including Apple Silicon) reject `--precision bf16` at startup with
 a clear message rather than silently falling back.
 
+## The name
+
+The model is named for 瑠璃 (*ruri*, lapis lazuli). In 氷室冴子's Heian-era
+novel series 『なんて素敵にジャパネスク』, the heroine 瑠璃姫 (Ruri-hime) has
+a lady-in-waiting called 小萩 (*Kohagi*) — so kohagi is the one who attends
+Ruri.
+
 ---
 
 ## 日本語
@@ -169,6 +176,9 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 - メモリ使用量は入力サイズによらず一定(チャンク処理+attention 予算キャップ)
 - 入出力の契約・exit code(0/2/1)は [PROTOCOL.md](PROTOCOL.md) を参照。
   Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb)
+
+名前は氷室冴子『なんて素敵にジャパネスク』から。瑠璃姫に仕える女房が小萩なので、
+ruri に仕えるものとして kohagi と名づけました。
 
 ## License
 
