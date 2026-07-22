@@ -22,12 +22,12 @@ hf-hub = "0.4"
 # candle runs pure-CPU by default; the macOS target below adds Apple Accelerate
 # (AMX) for its sgemm. Apple GPU support is behind the `metal` feature — see
 # `Backend` in src/model.rs for why it is opt-in rather than the default.
-candle-core = "0.10"
-candle-nn = "0.10"
-candle-transformers = "0.10"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.10", features = ["accelerate"] }
+candle-core = { version = "0.11", features = ["accelerate"] }
 
 [features]
 # Apple GPU via candle's Metal backend: `cargo build --release --features metal`,
@@ -37,3 +37,4 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 
 [profile.release]
 lto = "thin"
+
