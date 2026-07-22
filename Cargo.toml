@@ -38,3 +38,9 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 [profile.release]
 lto = "thin"
 
+# candle-transformers is vendored with four changes to its ModernBERT — all
+# Metal wins that leave f32 output unchanged. See vendor/candle-transformers/
+# NOTES.md for the measurements, modernbert.patch for the diff against the
+# published 0.11.0 crate.
+[patch.crates-io]
+candle-transformers = { path = "vendor/candle-transformers" }
