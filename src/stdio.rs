@@ -49,7 +49,10 @@ fn parse_line(line: &str) -> Result<Option<InRecord>, String> {
     if text.is_empty() {
         return Err("empty \"text\"".to_string());
     }
-    Ok(Some(InRecord { id, text: text.to_string() }))
+    Ok(Some(InRecord {
+        id,
+        text: text.to_string(),
+    }))
 }
 
 /// Embed one chunk and write its output lines (one complete line per record,
@@ -60,12 +63,21 @@ fn run_chunk(
     chunk: &[InRecord],
     out: &mut impl Write,
 ) -> Result<()> {
-    let prefixed: Vec<String> = chunk.iter().map(|r| format!("{prefix}{}", r.text)).collect();
+    let prefixed: Vec<String> = chunk
+        .iter()
+        .map(|r| format!("{prefix}{}", r.text))
+        .collect();
     let texts: Vec<&str> = prefixed.iter().map(String::as_str).collect();
     let vecs = embedder.embed(&texts)?;
 
     for (rec, vec) in chunk.iter().zip(&vecs) {
-        serde_json::to_writer(&mut *out, &OutRecord { id: &rec.id, embedding: vec })?;
+        serde_json::to_writer(
+            &mut *out,
+            &OutRecord {
+                id: &rec.id,
+                embedding: vec,
+            },
+        )?;
         out.write_all(b"\n")?;
     }
     out.flush()?;
@@ -139,10 +151,14 @@ mod tests {
 
     #[test]
     fn parse_accepts_int_and_string_ids() {
-        let r = parse_line(r#"{"id": 123, "text": "hello"}"#).unwrap().unwrap();
+        let r = parse_line(r#"{"id": 123, "text": "hello"}"#)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.id, Value::from(123));
         assert_eq!(r.text, "hello");
-        let r = parse_line(r#"{"id": "b-9", "text": "改行\nあり"}"#).unwrap().unwrap();
+        let r = parse_line(r#"{"id": "b-9", "text": "改行\nあり"}"#)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.id, Value::from("b-9"));
         assert_eq!(r.text, "改行\nあり");
     }

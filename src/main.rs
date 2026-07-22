@@ -82,9 +82,20 @@ fn run(args: Args) -> anyhow::Result<usize> {
                 || model.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             );
-            (ModelSource::Files { model: model.clone(), tokenizer: tokenizer.clone() }, label)
+            (
+                ModelSource::Files {
+                    model: model.clone(),
+                    tokenizer: tokenizer.clone(),
+                },
+                label,
+            )
         }
-        _ => (ModelSource::Hub { repo: args.model_id.clone() }, args.model_id.clone()),
+        _ => (
+            ModelSource::Hub {
+                repo: args.model_id.clone(),
+            },
+            args.model_id.clone(),
+        ),
     };
 
     if !args.text.is_empty() {
@@ -96,8 +107,11 @@ fn run(args: Args) -> anyhow::Result<usize> {
             embedding: &'a [f32],
         }
         let embedder = Embedder::load(&source, opts)?;
-        let prefixed: Vec<String> =
-            args.text.iter().map(|t| format!("{}{t}", args.prefix)).collect();
+        let prefixed: Vec<String> = args
+            .text
+            .iter()
+            .map(|t| format!("{}{t}", args.prefix))
+            .collect();
         let texts: Vec<&str> = prefixed.iter().map(String::as_str).collect();
         for (id, vec) in embedder.embed(&texts)?.iter().enumerate() {
             println!("{}", serde_json::to_string(&Out { id, embedding: vec })?);

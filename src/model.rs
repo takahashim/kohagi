@@ -127,7 +127,13 @@ impl Embedder {
         let device = Device::Cpu;
         let weights = load_weights(&model_path, &config, &device, opts.precision)?;
         let tokenizer = load_tokenizer(&tokenizer_path, opts.max_seq_length)?;
-        Ok(Self { weights, device, tokenizer, opts, dim })
+        Ok(Self {
+            weights,
+            device,
+            tokenizer,
+            opts,
+            dim,
+        })
     }
 
     /// The embedding dimension (`hidden_size` — 512 for ruri-v3-130m).

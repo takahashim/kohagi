@@ -29,6 +29,15 @@ Prebuilt binaries for macOS (Apple Silicon) and Linux (x86_64) are on the
 tar -xzf kohagi-<target>.tar.gz && mv kohagi ~/.local/bin/
 ```
 
+The binaries are not signed with an Apple Developer ID, so on macOS the quarantine
+attribute is carried over if you unpack the `.tar.gz` from Finder, and Gatekeeper
+blocks the binary. Extracting with `tar` as above avoids this; if you do get
+blocked, clear the attribute:
+
+```bash
+xattr -dr com.apple.quarantine ~/.local/bin/kohagi
+```
+
 Or with cargo:
 
 ```bash
@@ -158,6 +167,13 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 - メモリ使用量は入力サイズによらず一定になるようにしました (チャンク処理+attention 予算キャップ)
 - 入出力の契約・exit code(0/2/1)は [PROTOCOL.md](PROTOCOL.md) を参照してください。
   Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) にあります。
+
+なおmacOSで隔離属性のせいで起動がブロックされた場合は以下を実行して解除してください。
+
+```bash
+xattr -dr com.apple.quarantine ~/.local/bin/kohagi
+```
+
 
 kohagiの名前は氷室冴子『なんて素敵にジャパネスク』に登場する、瑠璃姫の女房である小萩に由来します。
 

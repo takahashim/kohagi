@@ -81,8 +81,8 @@ unsafe fn pack_row_avx512(src: *const f32, dst: *mut u16, cols: usize) {
     while c + 32 <= cols {
         let a = _mm512_loadu_ps(src.add(c)); // elements c..c+15
         let b = _mm512_loadu_ps(src.add(c + 16)); // elements c+16..c+31
-        // cvtne2ps_pbh(hi, lo) puts `lo` in the low 16 bf16 lanes and `hi` in
-        // the high 16 — i.e. back in the original element order.
+                                                  // cvtne2ps_pbh(hi, lo) puts `lo` in the low 16 bf16 lanes and `hi` in
+                                                  // the high 16 — i.e. back in the original element order.
         let packed = _mm512_cvtne2ps_pbh(b, a);
         _mm512_storeu_si512(
             dst.add(c) as *mut __m512i,
@@ -229,7 +229,13 @@ impl Bf16Linear {
     /// `weight` is `[n, k]` row-major, as PyTorch and candle store it.
     pub fn new(weight: &[f32], n: usize, k: usize) -> Self {
         let (wv, npad, kpad) = pack_w_vnni(weight, n, k);
-        Self { wv, npad, kpad, n, k }
+        Self {
+            wv,
+            npad,
+            kpad,
+            n,
+            k,
+        }
     }
 
     /// `x` is `[m, k]` row-major f32 → `[m, n]` row-major f32.

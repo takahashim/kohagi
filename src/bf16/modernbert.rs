@@ -69,7 +69,10 @@ impl RotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        Ok(Self { sin: freqs.sin()?, cos: freqs.cos()? })
+        Ok(Self {
+            sin: freqs.sin()?,
+            cos: freqs.cos()?,
+        })
     }
 
     fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -230,8 +233,11 @@ impl Bf16ModernBert {
             cfg.hidden_size,
             vb.pp("embeddings.tok_embeddings"),
         )?;
-        let norm =
-            layer_norm_no_bias(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("embeddings.norm"))?;
+        let norm = layer_norm_no_bias(
+            cfg.hidden_size,
+            cfg.layer_norm_eps,
+            vb.pp("embeddings.norm"),
+        )?;
 
         // Local layers use a shorter rope period than global ones.
         let global_rot = Arc::new(RotaryEmbedding::new(cfg, cfg.global_rope_theta, &device)?);
@@ -240,8 +246,17 @@ impl Bf16ModernBert {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for id in 0..cfg.num_hidden_layers {
             let uses_local = id % cfg.global_attn_every_n_layers != 0;
-            let rot = if uses_local { local_rot.clone() } else { global_rot.clone() };
-            layers.push(Layer::load(vb.pp(format!("layers.{id}")), cfg, rot, uses_local)?);
+            let rot = if uses_local {
+                local_rot.clone()
+            } else {
+                global_rot.clone()
+            };
+            layers.push(Layer::load(
+                vb.pp(format!("layers.{id}")),
+                cfg,
+                rot,
+                uses_local,
+            )?);
         }
         let final_norm =
             layer_norm_no_bias(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("final_norm"))?;

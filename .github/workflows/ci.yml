@@ -21,9 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
-      - run: cargo clippy -- -D warnings
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   # Release binaries: Apple Silicon macOS and x86_64 Linux. Uploaded as
   # artifacts on every push; attached to the GitHub Release on v* tags.
@@ -39,16 +42,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
+      - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Smoke-test the protocol without a model
         run: |
           # Empty input must exit 0 without loading anything.
-          : | ./target/release/kohagi --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
+          : | ./target/${{ matrix.target }}/release/kohagi --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
       - name: Package
         run: |
           mkdir dist
-          tar -czf dist/kohagi-${{ matrix.target }}.tar.gz -C target/release kohagi
+          tar -czf dist/kohagi-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release kohagi
           cd dist && shasum -a 256 *.tar.gz > kohagi-${{ matrix.target }}.sha256
       - uses: actions/upload-artifact@v4
         with:

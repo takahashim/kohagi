@@ -60,7 +60,11 @@ pub fn tokenize_bucket(
     let mut batches = Vec::new();
     for chunk in order.chunks(batch_size.max(1)) {
         let batch = chunk.len();
-        let seq = chunk.iter().map(|&i| encodings[i].get_ids().len()).max().unwrap_or(0);
+        let seq = chunk
+            .iter()
+            .map(|&i| encodings[i].get_ids().len())
+            .max()
+            .unwrap_or(0);
         let mut ids = vec![0i64; batch * seq];
         let mut mask = vec![0i64; batch * seq];
         for (bi, &i) in chunk.iter().enumerate() {
@@ -72,14 +76,27 @@ pub fn tokenize_bucket(
                 mask[bi * seq + t] = emask[t] as i64;
             }
         }
-        batches.push(BatchInput { ids, mask, batch, seq, orig: chunk.to_vec() });
+        batches.push(BatchInput {
+            ids,
+            mask,
+            batch,
+            seq,
+            orig: chunk.to_vec(),
+        });
     }
     Ok(batches)
 }
 
 /// Pool one batch row (index `b`) of the flat `[batch, seq, dim]` hidden
 /// states into a single vector.
-pub fn pool_one(data: &[f32], mask: &[i64], b: usize, seq: usize, dim: usize, pooling: Pooling) -> Vec<f32> {
+pub fn pool_one(
+    data: &[f32],
+    mask: &[i64],
+    b: usize,
+    seq: usize,
+    dim: usize,
+    pooling: Pooling,
+) -> Vec<f32> {
     match pooling {
         Pooling::Cls => {
             let start = (b * seq) * dim;
@@ -109,7 +126,11 @@ pub fn pool_one(data: &[f32], mask: &[i64], b: usize, seq: usize, dim: usize, po
 
 /// L2-normalize one vector in place (no-op on the zero vector).
 pub fn l2_normalize(row: &mut [f32]) {
-    let norm: f64 = row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+    let norm: f64 = row
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        .sqrt();
     if norm > 0.0 {
         let norm = norm as f32;
         for v in row {
