@@ -140,6 +140,13 @@ bf16 therefore remains opt-in. The default f32 mode produces consistent vectors 
 
 Unsupported CPUs, including Apple Silicon, reject `--precision bf16` at startup rather than silently falling back to f32.
 
+## Accuracy and reproducibility
+
+kohagi's f32 output matches the Sentence Transformers and PyTorch reference implementation to within f32 rounding error.
+On 512-token inputs, `1 - cosine ≈ 3e-12`.
+
+You can verify this on your own texts using [`examples/parity_check.py`](examples/parity_check.py).
+See [`examples/README.md`](examples/README.md) for the measured results and the three settings that must match for the comparison to be meaningful.
 
 ## The name
 
@@ -149,7 +156,7 @@ In Saeko Himuro’s Heian-era novel series *Nante Suteki ni Japonésque* (『な
 
 (in Japanese)
 
-## 小萩 (kohagi)
+## kohagi (小萩)
 
 kohagiは[Ruri v3](https://huggingface.co/cl-nagoya/ruri-v3-130m) などのModernBERT系文埋め込みモデルをローカル環境で動かすためのCLI/Rustライブラリです。
 使い方はシンプルで、標準入力に`{"id","text"}`のJSONLを流すと、標準出力に`{"id","embedding"}`を返します。
