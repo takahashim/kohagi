@@ -26,7 +26,12 @@ use serde::Deserialize;
 use core::f32;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// A ModernBERT `config.json`, in the two spellings the field names come in.
+///
+/// Deserialized through [`RawConfig`] so the LayerNorm epsilon can arrive as
+/// `norm_eps` (HF's `ModernbertConfig`), `layer_norm_eps` (older
+/// sentence-transformers checkpoints), both (ruri ships both), or neither.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub vocab_size: usize,
     pub hidden_size: usize,
@@ -40,6 +45,48 @@ pub struct Config {
     pub global_rope_theta: f64,
     pub local_attention: usize,
     pub local_rope_theta: f64,
+}
+
+#[derive(Deserialize)]
+struct RawConfig {
+    vocab_size: usize,
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    intermediate_size: usize,
+    max_position_embeddings: usize,
+    // A serde `alias` would reject a config carrying both names as a duplicate
+    // field, and ruri-v3 carries both, so they are two optional fields merged
+    // below rather than one aliased one.
+    layer_norm_eps: Option<f64>,
+    norm_eps: Option<f64>,
+    pad_token_id: u32,
+    global_attn_every_n_layers: usize,
+    global_rope_theta: f64,
+    local_attention: usize,
+    local_rope_theta: f64,
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let r = RawConfig::deserialize(d)?;
+        Ok(Config {
+            vocab_size: r.vocab_size,
+            hidden_size: r.hidden_size,
+            num_hidden_layers: r.num_hidden_layers,
+            num_attention_heads: r.num_attention_heads,
+            intermediate_size: r.intermediate_size,
+            max_position_embeddings: r.max_position_embeddings,
+            // Prefer the explicit `layer_norm_eps`; fall back to `norm_eps`,
+            // then to HF's default. The two agree wherever both appear.
+            layer_norm_eps: r.layer_norm_eps.or(r.norm_eps).unwrap_or(1e-5),
+            pad_token_id: r.pad_token_id,
+            global_attn_every_n_layers: r.global_attn_every_n_layers,
+            global_rope_theta: r.global_rope_theta,
+            local_attention: r.local_attention,
+            local_rope_theta: r.local_rope_theta,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -473,5 +520,64 @@ impl ModernBert {
         }
         let xs = xs.apply(&self.final_norm)?;
         Ok(xs)
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::Config;
+
+    /// A ModernBERT config with everything except the eps field, which the
+    /// three cases below vary. Values are arbitrary but well-formed.
+    fn config_json(eps_line: &str) -> String {
+        format!(
+            r#"{{
+                "vocab_size": 50004,
+                "hidden_size": 768,
+                "num_hidden_layers": 22,
+                "num_attention_heads": 12,
+                "intermediate_size": 1152,
+                "max_position_embeddings": 8192,
+                {eps_line}
+                "pad_token_id": 0,
+                "global_attn_every_n_layers": 3,
+                "global_rope_theta": 160000.0,
+                "local_attention": 128,
+                "local_rope_theta": 10000.0
+            }}"#
+        )
+    }
+
+    /// The older sentence-transformers spelling.
+    #[test]
+    fn accepts_layer_norm_eps() {
+        let c: Config = serde_json::from_str(&config_json(r#""layer_norm_eps": 2e-5,"#)).unwrap();
+        assert_eq!(c.layer_norm_eps, 2e-5);
+    }
+
+    /// ruri-v3 ships both spellings; an `alias` would have rejected that as a
+    /// duplicate field. They agree, and `layer_norm_eps` wins by construction.
+    #[test]
+    fn accepts_both_spellings() {
+        let c: Config = serde_json::from_str(&config_json(
+            r#""layer_norm_eps": 1e-5, "norm_eps": 1e-5,"#,
+        ))
+        .unwrap();
+        assert_eq!(c.layer_norm_eps, 1e-5);
+    }
+
+    /// HF `ModernbertConfig`'s own name — e.g. CodeSearch-ModernBERT-Crow-Plus,
+    /// which kohagi rejected before this alias.
+    #[test]
+    fn accepts_norm_eps() {
+        let c: Config = serde_json::from_str(&config_json(r#""norm_eps": 3e-5,"#)).unwrap();
+        assert_eq!(c.layer_norm_eps, 3e-5);
+    }
+
+    /// Neither present: fall back to HF's default rather than failing to parse.
+    #[test]
+    fn defaults_when_absent() {
+        let c: Config = serde_json::from_str(&config_json("")).unwrap();
+        assert_eq!(c.layer_norm_eps, 1e-5);
     }
 }
