@@ -16,6 +16,7 @@
 //!
 //! [`ModernBert`]: crate::encoder::ModernBert
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -46,10 +47,17 @@ pub struct CoreMlEncoder {
 }
 
 impl CoreMlEncoder {
-    /// Load every `seq-<N>.mlpackage` (or `.mlmodelc`) in `dir`, pinned to the
-    /// Neural Engine. `dim` is the model's hidden size (from `config.json`).
+    /// Load the `seq-<N>` bucket models in `dir`, pinned to the Neural Engine.
+    /// `dim` is the model's hidden size (from `config.json`).
+    ///
+    /// A bucket may be shipped as a compiled `.mlmodelc`, a portable
+    /// `.mlpackage`, or both. When both are present we prefer the `.mlmodelc`
+    /// (no per-run compile cost) and fall back to compiling the `.mlpackage`
+    /// only if the compiled form is missing or fails to load — e.g. it was
+    /// built for a different OS.
     pub fn load(dir: &Path, dim: usize) -> Result<Self> {
-        let mut buckets = Vec::new();
+        // seq -> (compiled .mlmodelc, portable .mlpackage)
+        let mut found: BTreeMap<usize, (Option<PathBuf>, Option<PathBuf>)> = BTreeMap::new();
         for entry in std::fs::read_dir(dir)
             .with_context(|| format!("reading CoreML model dir {}", dir.display()))?
         {
@@ -57,11 +65,14 @@ impl CoreMlEncoder {
             let Some(seq) = bucket_seq_of(&path) else {
                 continue;
             };
-            let model = load_model(&path)
-                .with_context(|| format!("loading CoreML model {}", path.display()))?;
-            buckets.push(Bucket { seq, model });
+            let slot = found.entry(seq).or_default();
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("mlmodelc") => slot.0 = Some(path),
+                Some("mlpackage") => slot.1 = Some(path),
+                _ => {}
+            }
         }
-        if buckets.is_empty() {
+        if found.is_empty() {
             return Err(UnsupportedRequest::new(format!(
                 "no `seq-<N>.mlpackage` bucket models found in {} — CoreML needs \
                  pre-converted fixed-shape models (see scripts/convert_coreml.py)",
@@ -69,7 +80,13 @@ impl CoreMlEncoder {
             ))
             .into());
         }
-        buckets.sort_by_key(|b| b.seq);
+
+        // BTreeMap iterates in ascending seq order, so buckets end up sorted.
+        let mut buckets = Vec::new();
+        for (seq, (compiled, package)) in found {
+            let model = load_bucket(seq, compiled.as_deref(), package.as_deref())?;
+            buckets.push(Bucket { seq, model });
+        }
         Ok(Self { buckets, dim })
     }
 
@@ -148,6 +165,30 @@ fn bucket_seq_of(path: &Path) -> Option<usize> {
         .and_then(|s| s.to_str())
         .and_then(|s| s.strip_prefix("seq-"))
         .and_then(|n| n.parse::<usize>().ok())
+}
+
+/// Load one bucket, preferring the compiled `.mlmodelc` and falling back to the
+/// portable `.mlpackage`. At least one of the two is `Some` (the caller only
+/// inserts a bucket when it finds a file).
+fn load_bucket(
+    seq: usize,
+    compiled: Option<&Path>,
+    package: Option<&Path>,
+) -> Result<Retained<MLModel>> {
+    if let Some(c) = compiled {
+        match load_model(c) {
+            Ok(model) => return Ok(model),
+            Err(e) if package.is_some() => {
+                eprintln!(
+                    "kohagi: seq-{seq}.mlmodelc did not load ({e:#}); \
+                     compiling seq-{seq}.mlpackage instead"
+                );
+            }
+            Err(e) => return Err(e).with_context(|| format!("loading {}", c.display())),
+        }
+    }
+    let package = package.expect("load_bucket called with neither model form");
+    load_model(package).with_context(|| format!("loading {}", package.display()))
 }
 
 /// Load one model, pinned to CPU+ANE. A `.mlpackage` is compiled to a

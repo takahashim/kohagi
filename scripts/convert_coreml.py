@@ -101,6 +101,13 @@ def main():
         default=[128, 256, 512],
         help="fixed sequence lengths to emit (one model each)",
     )
+    ap.add_argument(
+        "--compiled",
+        action="store_true",
+        help="also emit a compiled seq-<N>.mlmodelc beside each .mlpackage. "
+        "kohagi then loads the .mlmodelc directly (no per-run compile) and "
+        "falls back to the .mlpackage if it can't. Doubles the output size.",
+    )
     args = ap.parse_args()
 
     patch_int_op()
@@ -115,6 +122,14 @@ def main():
             shutil.rmtree(out)
         print(f"converting seq={seq} ...")
         convert_bucket(enc, seq, out)
+        if args.compiled:
+            from coremltools.models.utils import compile_model
+
+            mlmodelc = args.out_dir / f"seq-{seq}.mlmodelc"
+            if mlmodelc.exists():
+                shutil.rmtree(mlmodelc)
+            shutil.copytree(compile_model(str(out)), mlmodelc)
+            print(f"  compiled {mlmodelc.name}")
 
     # Copy tokenizer.json and config.json next to the buckets, from the HF cache.
     from huggingface_hub import hf_hub_download
