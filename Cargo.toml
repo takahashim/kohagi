@@ -1,7 +1,8 @@
 [package]
 name = "kohagi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.88"
 description = "Local sentence embeddings for Ruri v3 and other ModernBERT models: JSONL in, vectors out. Pure Rust, bounded memory."
 license = "MIT"
 repository = "https://github.com/takahashim/kohagi"
