@@ -50,27 +50,21 @@ impl CoreMlEncoder {
     /// Load the `seq-<N>` bucket models in `dir`, pinned to the Neural Engine.
     /// `dim` is the model's hidden size (from `config.json`).
     ///
-    /// A bucket may be shipped as a compiled `.mlmodelc`, a portable
-    /// `.mlpackage`, or both. When both are present we prefer the `.mlmodelc`
-    /// (no per-run compile cost) and fall back to compiling the `.mlpackage`
-    /// only if the compiled form is missing or fails to load — e.g. it was
-    /// built for a different OS.
+    /// Layout: portable `seq-<N>.mlpackage` bundles sit at the top level, and a
+    /// bucket may additionally ship a compiled `seq-<N>.mlmodelc` under
+    /// `compiled/` (a flat `.mlmodelc` at the top level is also accepted). When
+    /// both forms are present we prefer the `.mlmodelc` (no per-run compile) and
+    /// fall back to compiling the `.mlpackage` only if the compiled form is
+    /// missing or fails to load — e.g. it was built for a different OS.
     pub fn load(dir: &Path, dim: usize) -> Result<Self> {
         // seq -> (compiled .mlmodelc, portable .mlpackage)
         let mut found: BTreeMap<usize, (Option<PathBuf>, Option<PathBuf>)> = BTreeMap::new();
-        for entry in std::fs::read_dir(dir)
-            .with_context(|| format!("reading CoreML model dir {}", dir.display()))?
-        {
-            let path = entry?.path();
-            let Some(seq) = bucket_seq_of(&path) else {
-                continue;
-            };
-            let slot = found.entry(seq).or_default();
-            match path.extension().and_then(|e| e.to_str()) {
-                Some("mlmodelc") => slot.0 = Some(path),
-                Some("mlpackage") => slot.1 = Some(path),
-                _ => {}
-            }
+        collect_buckets(dir, &mut found)
+            .with_context(|| format!("reading CoreML model dir {}", dir.display()))?;
+        let compiled_dir = dir.join("compiled");
+        if compiled_dir.is_dir() {
+            collect_buckets(&compiled_dir, &mut found)
+                .with_context(|| format!("reading {}", compiled_dir.display()))?;
         }
         if found.is_empty() {
             return Err(UnsupportedRequest::new(format!(
@@ -151,6 +145,28 @@ impl CoreMlEncoder {
             read_f32(&arr)
         }
     }
+}
+
+/// Scan one directory for `seq-<N>` bucket models, recording each into `found`
+/// keyed by sequence length: `.mlmodelc` in the compiled slot, `.mlpackage` in
+/// the package slot.
+fn collect_buckets(
+    dir: &Path,
+    found: &mut BTreeMap<usize, (Option<PathBuf>, Option<PathBuf>)>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(seq) = bucket_seq_of(&path) else {
+            continue;
+        };
+        let slot = found.entry(seq).or_default();
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("mlmodelc") => slot.0 = Some(path),
+            Some("mlpackage") => slot.1 = Some(path),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Parse a `seq-<N>.mlpackage` / `seq-<N>.mlmodelc` name into its bucket

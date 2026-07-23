@@ -153,8 +153,8 @@ kohagi --device coreml --coreml-model-id <user>/ruri-v3-130m-coreml < texts.json
 ```
 
 A `.mlpackage` is compiled to a `.mlmodelc` when loaded, which costs a few
-seconds per bucket on every run. To skip that, convert with `--compiled` (emits
-a `seq-<N>.mlmodelc` beside each package) and ship both: kohagi then loads the
+seconds per bucket on every run. To skip that, convert with `--compiled` (also
+emits `compiled/seq-<N>.mlmodelc`) and ship both: kohagi then loads the
 `.mlmodelc` directly and falls back to compiling the `.mlpackage` only if the
 compiled form is missing or fails to load (e.g. built for a different OS). When
 a Hub repo carries both forms, only the preferred one is downloaded — the

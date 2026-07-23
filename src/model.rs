@@ -536,11 +536,13 @@ fn fetch_coreml_from_hub(repo: &str, prefer: CoreMlForm) -> Result<PathBuf> {
         .context("downloaded config.json has no parent directory")
 }
 
-/// Parse the bucket length and form from a repo path whose first component is
-/// `seq-<N>.mlmodelc` or `seq-<N>.mlpackage`.
+/// Parse the bucket length and form from a repo path like
+/// `seq-<N>.mlpackage/...` or `compiled/seq-<N>.mlmodelc/...` (the leading
+/// `compiled/` is where converted repos group the compiled bundles).
 #[cfg(feature = "coreml")]
 fn coreml_bucket_form(rfilename: &str) -> Option<(usize, &str)> {
-    let first = rfilename.split('/').next()?;
+    let rel = rfilename.strip_prefix("compiled/").unwrap_or(rfilename);
+    let first = rel.split('/').next()?;
     let (stem, ext) = first.rsplit_once('.')?;
     if ext != "mlmodelc" && ext != "mlpackage" {
         return None;
@@ -696,9 +698,10 @@ mod coreml_tests {
 
         let get = |f: &str, p: CoreMlForm| coreml_wanted(f, p, &forms);
 
-        // Prefer compiled: take the .mlmodelc for 512, but the only form (pkg) for 128.
+        // Compiled bundles live under compiled/. Prefer compiled: take the
+        // .mlmodelc for 512, but the only form (pkg) for 128.
         assert!(get(
-            "seq-512.mlmodelc/weights/weight.bin",
+            "compiled/seq-512.mlmodelc/weights/weight.bin",
             CoreMlForm::Compiled
         ));
         assert!(!get("seq-512.mlpackage/Data/x", CoreMlForm::Compiled));
@@ -707,7 +710,7 @@ mod coreml_tests {
         // Prefer package: take the .mlpackage for 512.
         assert!(get("seq-512.mlpackage/Data/x", CoreMlForm::Package));
         assert!(!get(
-            "seq-512.mlmodelc/weights/weight.bin",
+            "compiled/seq-512.mlmodelc/weights/weight.bin",
             CoreMlForm::Package
         ));
 

@@ -12,6 +12,10 @@ tokenizer and config:
       seq-512.mlpackage
       tokenizer.json
       config.json
+      compiled/                 # only with --compiled
+        seq-128.mlmodelc
+        seq-256.mlmodelc
+        seq-512.mlmodelc
 
 Point kohagi at it locally:
 
@@ -125,11 +129,13 @@ def main():
         if args.compiled:
             from coremltools.models.utils import compile_model
 
-            mlmodelc = args.out_dir / f"seq-{seq}.mlmodelc"
+            compiled_dir = args.out_dir / "compiled"
+            compiled_dir.mkdir(exist_ok=True)
+            mlmodelc = compiled_dir / f"seq-{seq}.mlmodelc"
             if mlmodelc.exists():
                 shutil.rmtree(mlmodelc)
             shutil.copytree(compile_model(str(out)), mlmodelc)
-            print(f"  compiled {mlmodelc.name}")
+            print(f"  compiled compiled/{mlmodelc.name}")
 
     # Copy tokenizer.json and config.json next to the buckets, from the HF cache.
     from huggingface_hub import hf_hub_download
