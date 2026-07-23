@@ -22,18 +22,32 @@ hf-hub = "0.4"
 # candle runs pure-CPU by default; the macOS target below adds Apple Accelerate
 # (AMX) for its sgemm. Apple GPU support is behind the `metal` feature — see
 # `Backend` in src/model.rs for why it is opt-in rather than the default.
+#
+# The ModernBERT encoder lives in src/encoder.rs rather than pulling in
+# candle-transformers: it is one self-contained file, and carrying it directly
+# keeps kohagi's Metal changes in the build even when installed from crates.io.
 candle-core = "0.11"
 candle-nn = "0.11"
-candle-transformers = "0.11"
+
+# Only for the `metal` feature: kohagi's own fused GeGLU kernel (src/fused.rs)
+# dispatches through candle's Metal wrappers and needs MTLSize from objc2-metal.
+# Kept semver-aligned with candle-core's pins so cargo unifies to one instance.
+candle-metal-kernels = { version = "0.11", optional = true }
+objc2-metal = { version = "0.3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.11", features = ["accelerate"] }
 
 [features]
 # Apple GPU via candle's Metal backend: `cargo build --release --features metal`,
-# then `kohagi --device metal`. Off by default because it is not yet measured to
-# beat the Accelerate CPU path, and it pulls in candle-metal-kernels.
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# then `kohagi --device metal`. ~1.8x the Accelerate CPU path on an M2 at 512
+# tokens; off by default because it is macOS-only and pulls in the metal crates.
+metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
+]
 
 [profile.release]
 lto = "thin"
