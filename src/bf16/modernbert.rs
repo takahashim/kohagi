@@ -64,9 +64,10 @@ fn banding_pays(seq: usize, window: usize) -> bool {
 /// Apply a bf16 `Linear` to a tensor whose last dimension is the Linear's
 /// input width, flattening the leading dimensions into GEMM rows.
 ///
-/// Each call copies the tensor out to a `Vec<f32>` and the result back.
-/// Profiling puts that at ~3% of the forward — the GEMM dominates — so it is
-/// not worth the complexity of borrowing candle's storage directly.
+/// Each call copies the tensor out to a `Vec<f32>`; the result goes back
+/// without a copy, since `from_vec` takes ownership. Profiling puts the copies
+/// across every `apply` in a forward at 0.6% of it — the GEMM dominates — so
+/// it is not worth the complexity of borrowing candle's storage directly.
 fn apply(lin: &Bf16Linear, x: &Tensor) -> Result<Tensor> {
     let dims = x.dims().to_vec();
     debug_assert_eq!(*dims.last().unwrap(), lin.k);

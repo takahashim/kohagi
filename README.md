@@ -228,7 +228,7 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 ```
 
 - モデルは初回には Hugging Face Hub から自動ダウンロードします (`--model-path`/`--tokenizer-path` でオフライン運用も可)
-- x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では `--precision bf16` で 1.5〜1.9 倍高速化します(cosine ≈ 0.99999、既定は f32。精度は若干落ちます)
+- x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では `--precision bf16` で 2 倍強高速化します(短文 2.2 倍、512 トークン 2.1 倍、cosine ≈ 0.99999、既定は f32。精度は若干落ちます)
 - Apple Silicon では `--features metal` でビルドすると `--device metal` が使え、512トークンで CPU の約1.8倍で動きます(出力は f32 のまま変わりません)
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
 - メモリ使用量は入力サイズによらず一定になるようにしました (チャンク処理+attention 予算キャップ)

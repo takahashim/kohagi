@@ -31,6 +31,12 @@ use crate::config::CoreMlForm;
 use crate::errors::UnsupportedRequest;
 
 /// Attention-scratch budget per forward, in `rows * seq^2` elements.
+///
+/// It bounds memory, but it also lands on the fastest setting: at 512 tokens
+/// it allows 2 rows, and 240 512-token texts encode in 20.0s there against
+/// 22.4s at 1 row, 25.3s at 4 and 27.5s at 8 (bf16, median of five
+/// interleaved runs). Wider forwards spill the score matrix out of cache
+/// without buying any parallelism, since the rows already run in parallel.
 const ATTN_BUDGET: usize = 2 * 512 * 512;
 
 /// Same budget for the GPU, which runs one stream of wide forwards rather than
@@ -92,11 +98,13 @@ pub enum Precision {
     /// Full f32 — matches the PyTorch reference, works everywhere.
     #[default]
     F32,
-    /// The four projection `Linear`s in bf16 (see [`crate::bf16`]). Measured
-    /// on an 8-core Zen 4: 1.9× faster on short texts, 1.5× on 512-token
-    /// ones, at cosine ≈ 0.99999 against f32 — and it halves the memory the
-    /// weights occupy. Requires x86_64 with AVX512-BF16 (Zen 4, Sapphire
-    /// Rapids or newer); [`Embedder::load`] fails clearly elsewhere.
+    /// The four projection `Linear`s in bf16, plus the vectorized softmax,
+    /// GeGLU and sliding-window attention that come with them (see
+    /// [`crate::bf16`]). Measured on an 8-core Zen 4: 2.2× faster on short
+    /// texts, 2.1× on 512-token ones, at cosine ≈ 0.99999 against f32 — and it
+    /// halves the memory the weights occupy. Requires x86_64 with AVX512-BF16
+    /// (Zen 4, Sapphire Rapids or newer); [`Embedder::load`] fails clearly
+    /// elsewhere.
     Bf16,
 }
 
@@ -537,10 +545,11 @@ impl Weights {
     /// The bf16 GEMM is single-threaded by design, so all parallelism comes
     /// from having many forwards in flight; coarse ones load-balance badly
     /// because the last wave leaves cores idle, and they waste more padding.
-    /// Measured on 1200 short texts, 8-core Zen 4: 4 rows 5.3s, 8 → 5.6s,
-    /// 16 → 6.3s, 64 → 8.4s (2 rows is 5.5s — past the sweet spot, per-call
-    /// overhead starts to show). The budget already caps long inputs below
-    /// this, so it only bites on short ones.
+    /// Too fine and per-call overhead takes over instead. Measured on 1200
+    /// short texts, 8-core Zen 4, median of five interleaved runs: 2 rows
+    /// 4.64s, 4 → 4.30s, 8 → 4.26s, 16 → 4.55s. 4 and 8 are a tie within the
+    /// run-to-run spread; either side of them is not. The budget already caps
+    /// long inputs below this, so it only bites on short ones.
     ///
     /// The f32 path needs no such limit: candle's gemm is internally
     /// efficient on wider batches.
