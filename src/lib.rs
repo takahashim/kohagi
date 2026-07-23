@@ -32,11 +32,11 @@ pub mod bf16;
 #[cfg(feature = "coreml")]
 mod coreml;
 mod encoder;
+mod errors;
 mod fused;
 mod model;
 pub mod stdio;
 
 pub use batch::Pooling;
-pub use model::{
-    Backend, CoreMlForm, Embedder, ModelSource, Options, Precision, UnsupportedRequest,
-};
+pub use errors::UnsupportedRequest;
+pub use model::{Backend, CoreMlForm, Embedder, ModelSource, Options, Precision};

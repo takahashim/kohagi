@@ -4,20 +4,25 @@
 //! bucketed batches), the ANE wants one thing: a *fixed-shape, batch=1*
 //! forward. Batching collapses ANE throughput by ~18x, and flexible
 //! (enumerated) input shapes disable the ANE compute plan entirely. So this
-//! backend loads a **set of
-//! pre-converted, fixed-length models** — one `seq-<N>.mlpackage` per bucket
-//! length, e.g. `seq-128 / seq-256 / seq-512` — and routes each text to the smallest
-//! bucket that fits, padded to that exact length, one row per prediction.
+//! backend loads a **set of pre-converted, fixed-length models** — one
+//! `seq-<N>.mlpackage` per bucket length, e.g. `seq-128 / seq-256 / seq-512` —
+//! and routes each text to the smallest bucket that fits, padded to that exact
+//! length, one row per prediction.
 //!
 //! Everything else — tokenization, prefixing, pooling, L2 normalization — stays
 //! in Rust, exactly as for the candle paths; CoreML only replaces the encoder
 //! forward. Output therefore matches the candle path to fp16 rounding
 //! (cosine ~0.99999).
 //!
+//! This module runs the loaded models; [`provision`] handles getting them onto
+//! disk (Hub download) and into memory (locate + compile + load).
+//!
 //! [`ModernBert`]: crate::encoder::ModernBert
 
+mod provision;
+
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use half::f16;
@@ -25,12 +30,14 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::AllocAnyThread;
 use objc2_core_ml::{
-    MLComputeUnits, MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel,
-    MLModelConfiguration, MLMultiArray, MLMultiArrayDataType,
+    MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel, MLMultiArray,
+    MLMultiArrayDataType,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
+use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 
-use crate::model::UnsupportedRequest;
+use crate::UnsupportedRequest;
+
+pub use provision::fetch_from_hub;
 
 /// One loaded fixed-length model plus the sequence length it was compiled for.
 struct Bucket {
@@ -53,17 +60,16 @@ impl CoreMlEncoder {
     /// Layout: portable `seq-<N>.mlpackage` bundles sit at the top level, and a
     /// bucket may additionally ship a compiled `seq-<N>.mlmodelc` under
     /// `compiled/` (a flat `.mlmodelc` at the top level is also accepted). When
-    /// both forms are present we prefer the `.mlmodelc` (no per-run compile) and
-    /// fall back to compiling the `.mlpackage` only if the compiled form is
-    /// missing or fails to load — e.g. it was built for a different OS.
-    pub fn load(dir: &Path, dim: usize) -> Result<Self> {
+    /// both forms are present [`provision::load_bucket`] prefers the `.mlmodelc`
+    /// and falls back to compiling the `.mlpackage`.
+    pub fn load(dir: &std::path::Path, dim: usize) -> Result<Self> {
         // seq -> (compiled .mlmodelc, portable .mlpackage)
         let mut found: BTreeMap<usize, (Option<PathBuf>, Option<PathBuf>)> = BTreeMap::new();
-        collect_buckets(dir, &mut found)
+        provision::collect_buckets(dir, &mut found)
             .with_context(|| format!("reading CoreML model dir {}", dir.display()))?;
         let compiled_dir = dir.join("compiled");
         if compiled_dir.is_dir() {
-            collect_buckets(&compiled_dir, &mut found)
+            provision::collect_buckets(&compiled_dir, &mut found)
                 .with_context(|| format!("reading {}", compiled_dir.display()))?;
         }
         if found.is_empty() {
@@ -78,7 +84,7 @@ impl CoreMlEncoder {
         // BTreeMap iterates in ascending seq order, so buckets end up sorted.
         let mut buckets = Vec::new();
         for (seq, (compiled, package)) in found {
-            let model = load_bucket(seq, compiled.as_deref(), package.as_deref())?;
+            let model = provision::load_bucket(seq, compiled.as_deref(), package.as_deref())?;
             buckets.push(Bucket { seq, model });
         }
         Ok(Self { buckets, dim })
@@ -113,8 +119,8 @@ impl CoreMlEncoder {
         // SAFETY: single-threaded use; arrays and feature provider live for the
         // duration of the prediction call.
         unsafe {
-            let ids_arr = i32_multiarray(seq, ids);
-            let mask_arr = i32_multiarray(seq, mask);
+            let ids_arr = i32_multiarray(seq, ids)?;
+            let mask_arr = i32_multiarray(seq, mask)?;
             let ids_fv = MLFeatureValue::featureValueWithMultiArray(&ids_arr);
             let mask_fv = MLFeatureValue::featureValueWithMultiArray(&mask_arr);
 
@@ -147,154 +153,8 @@ impl CoreMlEncoder {
     }
 }
 
-/// Scan one directory for `seq-<N>` bucket models, recording each into `found`
-/// keyed by sequence length: `.mlmodelc` in the compiled slot, `.mlpackage` in
-/// the package slot.
-fn collect_buckets(
-    dir: &Path,
-    found: &mut BTreeMap<usize, (Option<PathBuf>, Option<PathBuf>)>,
-) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        let Some(seq) = bucket_seq_of(&path) else {
-            continue;
-        };
-        let slot = found.entry(seq).or_default();
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("mlmodelc") => slot.0 = Some(path),
-            Some("mlpackage") => slot.1 = Some(path),
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// Parse a `seq-<N>.mlpackage` / `seq-<N>.mlmodelc` name into its bucket
-/// length. `.mlpackage` is the portable artifact we distribute; `.mlmodelc` is
-/// its already-compiled form, accepted so a local dir can hold either.
-fn bucket_seq_of(path: &Path) -> Option<usize> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("mlpackage") | Some("mlmodelc") => {}
-        _ => return None,
-    }
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .and_then(|s| s.strip_prefix("seq-"))
-        .and_then(|n| n.parse::<usize>().ok())
-}
-
-/// Load one bucket, preferring the compiled `.mlmodelc` and falling back to the
-/// portable `.mlpackage`. At least one of the two is `Some` (the caller only
-/// inserts a bucket when it finds a file).
-fn load_bucket(
-    seq: usize,
-    compiled: Option<&Path>,
-    package: Option<&Path>,
-) -> Result<Retained<MLModel>> {
-    if let Some(c) = compiled {
-        match load_model(c) {
-            Ok(model) => return Ok(model),
-            Err(e) if package.is_some() => {
-                eprintln!(
-                    "kohagi: seq-{seq}.mlmodelc did not load ({e:#}); \
-                     compiling seq-{seq}.mlpackage instead"
-                );
-            }
-            Err(e) => return Err(e).with_context(|| format!("loading {}", c.display())),
-        }
-    }
-    let package = package.expect("load_bucket called with neither model form");
-    load_model(package).with_context(|| format!("loading {}", package.display()))
-}
-
-/// Load one model, pinned to CPU+ANE. A `.mlpackage` is compiled to a
-/// (temporary) `.mlmodelc` first; a `.mlmodelc` is loaded directly.
-fn load_model(path: &Path) -> Result<Retained<MLModel>> {
-    let compiled;
-    let target = if path.extension().and_then(|e| e.to_str()) == Some("mlpackage") {
-        compiled = compile_package(path)?;
-        compiled.as_path()
-    } else {
-        path
-    };
-    unsafe {
-        let url = file_url(target)?;
-        let config = MLModelConfiguration::new();
-        config.setComputeUnits(MLComputeUnits::CPUAndNeuralEngine);
-        MLModel::modelWithContentsOfURL_configuration_error(&url, &config)
-            .map_err(|e| anyhow::anyhow!("loading {}: {e}", path.display()))
-    }
-}
-
-/// A `file://` URL for a local path.
-unsafe fn file_url(path: &Path) -> Result<Retained<NSURL>> {
-    Ok(NSURL::fileURLWithPath(&NSString::from_str(
-        path.to_str().context("model path is not valid UTF-8")?,
-    )))
-}
-
-/// Compile a `.mlpackage` to a `.mlmodelc` and return its (temporary) path.
-///
-/// The Hugging Face cache stores a package as a tree of symlinks into its blob
-/// store, which the CoreML compiler cannot follow — it fails with a spurious
-/// "file doesn't exist". So if the direct compile fails we retry from a
-/// dereferenced, symlink-free copy.
-fn compile_package(pkg: &Path) -> Result<PathBuf> {
-    if let Ok(out) = compile_at(pkg) {
-        return Ok(out);
-    }
-    let staging = unique_temp_dir("kohagi-coreml-src");
-    std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
-    let name = pkg.file_name().context("model path has no file name")?;
-    let copy = staging.join(name);
-    let result = copy_deref(pkg, &copy)
-        .with_context(|| format!("dereferencing {}", pkg.display()))
-        .and_then(|()| compile_at(&copy).with_context(|| format!("compiling {}", pkg.display())));
-    let _ = std::fs::remove_dir_all(&staging);
-    result
-}
-
-/// One `compileModelAtURL:` call; returns the compiled model's path.
-fn compile_at(pkg: &Path) -> Result<PathBuf> {
-    unsafe {
-        let src = file_url(pkg)?;
-        // The async compileModelAtURL:completionHandler: is the current API, but
-        // the synchronous one is simpler and fine for a batch CLI.
-        #[allow(deprecated)]
-        let compiled =
-            MLModel::compileModelAtURL_error(&src).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let path = compiled.path().context("compiled model URL has no path")?;
-        Ok(PathBuf::from(path.to_string()))
-    }
-}
-
-/// Recursively copy `src` to `dst`, following symlinks so the result has no
-/// links — turns a symlinked HF-cache package into a real one the compiler can
-/// read.
-fn copy_deref(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if src.is_dir() {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            copy_deref(&entry.path(), &dst.join(entry.file_name()))?;
-        }
-        Ok(())
-    } else {
-        std::fs::copy(src, dst).map(|_| ())
-    }
-}
-
-/// A process-unique path under the system temp dir (a per-process counter is
-/// enough — one process compiles a handful of buckets).
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), n))
-}
-
 /// Build a `[1, seq]` Int32 MLMultiArray from `i64` token ids/mask.
-unsafe fn i32_multiarray(seq: usize, values: &[i64]) -> Retained<MLMultiArray> {
+unsafe fn i32_multiarray(seq: usize, values: &[i64]) -> Result<Retained<MLMultiArray>> {
     let dims = [NSNumber::new_isize(1), NSNumber::new_isize(seq as isize)];
     let shape = NSArray::from_retained_slice(&dims);
     let arr = MLMultiArray::initWithShape_dataType_error(
@@ -302,7 +162,7 @@ unsafe fn i32_multiarray(seq: usize, values: &[i64]) -> Retained<MLMultiArray> {
         &shape,
         MLMultiArrayDataType::Int32,
     )
-    .expect("allocate MLMultiArray");
+    .map_err(|e| anyhow::anyhow!("allocating a {seq}-wide MLMultiArray: {e}"))?;
     // `dataPointer` is deprecated in favour of the block-based getBytes API, but
     // it is correct for the contiguous arrays we allocate here, and avoids the
     // RcBlock ceremony. Revisit if a future objc2-core-ml drops it.
@@ -311,7 +171,7 @@ unsafe fn i32_multiarray(seq: usize, values: &[i64]) -> Retained<MLMultiArray> {
     for (i, &v) in values.iter().enumerate() {
         *ptr.add(i) = v as i32;
     }
-    arr
+    Ok(arr)
 }
 
 /// Copy an output MLMultiArray into a flat `Vec<f32>`, converting from whatever

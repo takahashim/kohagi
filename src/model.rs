@@ -27,6 +27,7 @@ use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
 use crate::batch::{l2_normalize, load_tokenizer, pool_row, tokenize_bucket, BatchInput, Pooling};
+use crate::errors::UnsupportedRequest;
 
 /// Attention-scratch budget per forward, in `rows * seq^2` elements.
 const ATTN_BUDGET: usize = 2 * 512 * 512;
@@ -134,29 +135,6 @@ pub enum CoreMlForm {
     /// versions. Falls back to the `.mlmodelc` for buckets that only ship one.
     Package,
 }
-
-/// A request the CoreML backend cannot serve — built without the `coreml`
-/// feature, wrong model source, or a `--max-seq-length` beyond the largest
-/// converted bucket. Carried as its own type so the CLI can map it to a
-/// dedicated exit code (3) instead of the generic fatal (1), letting callers
-/// distinguish "retry on --device cpu" from a real failure. There is no
-/// automatic fallback: backend choice is the caller's job.
-#[derive(Debug)]
-pub struct UnsupportedRequest(pub String);
-
-impl UnsupportedRequest {
-    pub(crate) fn new(msg: impl Into<String>) -> Self {
-        Self(msg.into())
-    }
-}
-
-impl std::fmt::Display for UnsupportedRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for UnsupportedRequest {}
 
 /// Knobs for [`Embedder::load`]. `Default` matches Ruri v3.
 #[derive(Clone, Copy)]
@@ -266,7 +244,9 @@ impl Embedder {
     fn load_coreml(source: &ModelSource, opts: Options) -> Result<Self> {
         let dir = match source {
             ModelSource::CoreMl { dir } => dir.clone(),
-            ModelSource::CoreMlHub { repo } => fetch_coreml_from_hub(repo, opts.coreml_form)?,
+            ModelSource::CoreMlHub { repo } => {
+                crate::coreml::fetch_from_hub(repo, opts.coreml_form)?
+            }
             _ => {
                 return Err(UnsupportedRequest::new(
                     "`--device coreml` needs a CoreML model directory (`--coreml-dir`) \
@@ -381,10 +361,10 @@ impl Embedder {
         // multiplies scratch memory; Metal runs wide forwards back to back
         // instead, and gets its parallelism inside each one.
         let per_unit: Vec<Result<PooledRows>> = match self.opts.backend {
+            Backend::Cpu => worker_pool()?.install(|| units.par_iter().map(run).collect()),
             Backend::Metal => units.iter().map(run).collect(),
-            // CoreML never reaches embed_candle; treat anything non-Metal as
-            // the CPU fan-out.
-            _ => worker_pool()?.install(|| units.par_iter().map(run).collect()),
+            // embed() dispatches CoreML to embed_coreml, so it never arrives here.
+            Backend::CoreML => unreachable!("CoreML uses embed_coreml, not embed_candle"),
         };
 
         let mut rows_out: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
@@ -486,93 +466,6 @@ fn fetch_from_hub(repo: &str) -> Result<(PathBuf, PathBuf)> {
     get("config.json")?; // lands next to the weights in the cache
     let tokenizer = get("tokenizer.json")?;
     Ok((model, tokenizer))
-}
-
-/// Download a CoreML model repo into the HF cache and return the snapshot dir.
-///
-/// A repo may ship, per bucket, a compiled `.mlmodelc`, a portable
-/// `.mlpackage`, or both. To avoid downloading the redundant form when both are
-/// present, we fetch only the preferred one for each bucket (`prefer`), falling
-/// back to the other when a bucket ships just one. `config.json` and
-/// `tokenizer.json` are always fetched; other repo files are skipped.
-#[cfg(feature = "coreml")]
-fn fetch_coreml_from_hub(repo: &str, prefer: CoreMlForm) -> Result<PathBuf> {
-    let api = hf_hub::api::sync::Api::new().context("initializing Hugging Face Hub client")?;
-    let handle = api.model(repo.to_string());
-    let info = handle
-        .info()
-        .with_context(|| format!("querying {repo} on the Hugging Face Hub"))?;
-
-    // First pass: which forms does each bucket ship? (extension of the top
-    // path component, e.g. `seq-128.mlmodelc/weights/weight.bin`).
-    let mut forms: std::collections::BTreeMap<usize, (bool, bool)> = Default::default();
-    for sibling in &info.siblings {
-        if let Some((seq, ext)) = coreml_bucket_form(&sibling.rfilename) {
-            let seen = forms.entry(seq).or_default();
-            match ext {
-                "mlmodelc" => seen.0 = true,
-                "mlpackage" => seen.1 = true,
-                _ => {}
-            }
-        }
-    }
-
-    // Second pass: download config/tokenizer and only the chosen form's files.
-    for sibling in &info.siblings {
-        let f = &sibling.rfilename;
-        if coreml_wanted(f, prefer, &forms) {
-            handle
-                .get(f)
-                .with_context(|| format!("fetching {f} from {repo}"))?;
-        }
-    }
-
-    let config = handle
-        .get("config.json")
-        .with_context(|| format!("{repo} has no config.json"))?;
-    config
-        .parent()
-        .map(Path::to_path_buf)
-        .context("downloaded config.json has no parent directory")
-}
-
-/// Parse the bucket length and form from a repo path like
-/// `seq-<N>.mlpackage/...` or `compiled/seq-<N>.mlmodelc/...` (the leading
-/// `compiled/` is where converted repos group the compiled bundles).
-#[cfg(feature = "coreml")]
-fn coreml_bucket_form(rfilename: &str) -> Option<(usize, &str)> {
-    let rel = rfilename.strip_prefix("compiled/").unwrap_or(rfilename);
-    let first = rel.split('/').next()?;
-    let (stem, ext) = first.rsplit_once('.')?;
-    if ext != "mlmodelc" && ext != "mlpackage" {
-        return None;
-    }
-    let seq = stem.strip_prefix("seq-")?.parse().ok()?;
-    Some((seq, ext))
-}
-
-/// Whether to download a given repo file: `config.json` / `tokenizer.json`
-/// always, and for each bucket only the preferred form (or the other one if the
-/// bucket ships just that). `forms` maps seq -> (has .mlmodelc, has .mlpackage).
-#[cfg(feature = "coreml")]
-fn coreml_wanted(
-    rfilename: &str,
-    prefer: CoreMlForm,
-    forms: &std::collections::BTreeMap<usize, (bool, bool)>,
-) -> bool {
-    match coreml_bucket_form(rfilename) {
-        Some((seq, ext)) => {
-            let (has_compiled, has_package) = forms.get(&seq).copied().unwrap_or_default();
-            let chosen = match prefer {
-                CoreMlForm::Compiled if has_compiled => "mlmodelc",
-                CoreMlForm::Compiled => "mlpackage",
-                CoreMlForm::Package if has_package => "mlpackage",
-                CoreMlForm::Package => "mlmodelc",
-            };
-            ext == chosen
-        }
-        None => rfilename == "config.json" || rfilename == "tokenizer.json",
-    }
 }
 
 fn load_weights(
@@ -684,40 +577,4 @@ fn worker_pool() -> Result<rayon::ThreadPool> {
         .num_threads(n)
         .build()
         .context("building rayon pool")
-}
-
-#[cfg(all(test, feature = "coreml"))]
-mod coreml_tests {
-    use super::*;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn selective_download_picks_one_form_when_both_exist() {
-        // A repo shipping both forms of seq-512 and only a package for seq-128.
-        let forms = BTreeMap::from([(512usize, (true, true)), (128usize, (false, true))]);
-
-        let get = |f: &str, p: CoreMlForm| coreml_wanted(f, p, &forms);
-
-        // Compiled bundles live under compiled/. Prefer compiled: take the
-        // .mlmodelc for 512, but the only form (pkg) for 128.
-        assert!(get(
-            "compiled/seq-512.mlmodelc/weights/weight.bin",
-            CoreMlForm::Compiled
-        ));
-        assert!(!get("seq-512.mlpackage/Data/x", CoreMlForm::Compiled));
-        assert!(get("seq-128.mlpackage/Data/x", CoreMlForm::Compiled));
-
-        // Prefer package: take the .mlpackage for 512.
-        assert!(get("seq-512.mlpackage/Data/x", CoreMlForm::Package));
-        assert!(!get(
-            "compiled/seq-512.mlmodelc/weights/weight.bin",
-            CoreMlForm::Package
-        ));
-
-        // Metadata is always fetched; unrelated repo chrome is not.
-        assert!(get("config.json", CoreMlForm::Compiled));
-        assert!(get("tokenizer.json", CoreMlForm::Compiled));
-        assert!(!get("README.md", CoreMlForm::Compiled));
-        assert!(!get(".gitattributes", CoreMlForm::Compiled));
-    }
 }
