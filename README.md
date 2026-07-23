@@ -129,8 +129,9 @@ Building with `--features metal` adds an Apple GPU backend. On an M2 it runs
 about 1.8× faster than the Accelerate CPU path — measured on 512-token
 batches — with f32 output unchanged (worst `1 - cosine` 9e-13 against CPU).
 
-This needs the patched candle in [`vendor/`](vendor/README.md), so it is off by
-default and only applies when building from this repository.
+The speedups live in kohagi's own copy of the ModernBERT encoder
+([`src/encoder.rs`](src/encoder.rs)), so they apply to any build, including
+`cargo install`. It is off by default only because it is macOS-only.
 
 ### `--precision bf16` on AVX512-BF16 CPUs
 

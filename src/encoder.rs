@@ -1,20 +1,29 @@
-//! ModernBERT
+//! The ModernBERT encoder.
 //!
-//! ModernBERT is a modernized bidirectional encoder-only Transformer model.
-//! - [Arxiv](https://arxiv.org/abs/2412.13663) "Smarter, Better, Faster, Longer: A Modern Bidirectional Encoder for Fast, Memory Efficient, and Long Context Finetuning and Inference"
-//! - Upstream [GitHub repo](https://github.com/AnswerDotAI/ModernBERT).
-//! - See modernbert in [candle-examples](https://github.com/huggingface/candle/tree/main/candle-examples/) for runnable code
+//! Lifted from candle-transformers 0.11.0 (`src/models/modernbert.rs`, MIT OR
+//! Apache-2.0) and modified for kohagi. The original file has no dependency on
+//! the rest of candle-transformers, so carrying this one file is lighter than
+//! vendoring the whole crate to patch it — and it removes the `[patch.crates-io]`
+//! that would otherwise be dropped on publish, taking the Metal speedups with
+//! it.
 //!
+//! The changes are all Metal wins that leave f32 output unchanged: the fused
+//! softmax kernel, SDPA with a view mask, a fused LayerNorm, and a per-backend
+//! QKV layout that keeps q/k/v as views. See git history for the reasoning and
+//! measurements. The upstream candle bugs these route around (Metal sdpa
+//! ignoring a non-zero start offset, and its unenforced contiguity
+//! precondition) are why the QKV layout is split per backend.
+//!
+//! ModernBERT: <https://arxiv.org/abs/2412.13663>.
 
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{
-    embedding, linear, linear_no_bias, ops::{softmax, softmax_last_dim}, Embedding, LayerNorm,
-    Linear, Module, VarBuilder,
+    embedding, linear_no_bias, ops::softmax_last_dim, Embedding, LayerNorm, Linear, Module,
+    VarBuilder,
 };
 use serde::Deserialize;
 
 use core::f32;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -31,24 +40,6 @@ pub struct Config {
     pub global_rope_theta: f64,
     pub local_attention: usize,
     pub local_rope_theta: f64,
-    #[serde(default)]
-    #[serde(flatten)]
-    pub classifier_config: Option<ClassifierConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Copy, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ClassifierPooling {
-    #[default]
-    CLS,
-    MEAN,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct ClassifierConfig {
-    pub id2label: HashMap<String, String>,
-    pub label2id: HashMap<String, String>,
-    pub classifier_pooling: ClassifierPooling,
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +149,12 @@ impl ModernBertAttention {
     fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let xs = hidden_states.clone();
         let (b, seq_len, d) = xs.dims3()?;
-        let heads = (b, seq_len, self.num_attention_heads, self.attention_head_size);
+        let heads = (
+            b,
+            seq_len,
+            self.num_attention_heads,
+            self.attention_head_size,
+        );
         // Both arms end at [b, heads, seq, dim], but they get there differently
         // and rotate in different layouts to avoid materializing on the way.
         let (q, k, v) = match &self.qkv {
@@ -201,18 +197,13 @@ impl ModernBertAttention {
             // and softmax of that is NaN. The explicit path hides it — pooling
             // skips padded positions — but the fused kernel lets the NaN reach
             // the whole row.
-            let mask = attention_mask
-                .clamp(-60f32, 0f32)?
-                .broadcast_as((mb, self.num_attention_heads, ms, mk))?;
-            candle_nn::ops::sdpa(
-                &q,
-                &k,
-                &v,
-                Some(&mask),
-                false,
-                scale as f32,
-                1.0,
-            )?
+            let mask = attention_mask.clamp(-60f32, 0f32)?.broadcast_as((
+                mb,
+                self.num_attention_heads,
+                ms,
+                mk,
+            ))?;
+            candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
         } else {
             // The CPU matmul cannot consume the transposed views, and there is
             // no sdpa to hand them to, so materialize here rather than paying
@@ -232,7 +223,6 @@ impl ModernBertAttention {
         Ok(xs)
     }
 }
-
 
 /// ModernBERT's norms have no bias, and `layer_norm_no_bias` routes to
 /// candle's generic multi-pass implementation. Handing it an explicit zero
@@ -271,11 +261,7 @@ impl ModernBertMLP {
         let wi_gate = Linear::new(w.narrow(0, 0, inter)?.contiguous()?, None);
         let wi_up = Linear::new(w.narrow(0, inter, inter)?.contiguous()?, None);
         let wo = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("Wo"))?;
-        Ok(Self {
-            wi_gate,
-            wi_up,
-            wo,
-        })
+        Ok(Self { wi_gate, wi_up, wo })
     }
 }
 
@@ -347,53 +333,6 @@ impl ModernBertLayer {
     }
 }
 
-#[derive(Clone)]
-pub struct ModernBertHead {
-    dense: Linear,
-    norm: LayerNorm,
-}
-
-impl ModernBertHead {
-    fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let dense = linear_no_bias(config.hidden_size, config.hidden_size, vb.pp("dense"))?;
-        let norm = layer_norm_fused(config.hidden_size, config.layer_norm_eps, vb.pp("norm"))?;
-        Ok(Self { dense, norm })
-    }
-}
-
-impl Module for ModernBertHead {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = xs.apply(&self.dense)?.gelu_erf()?.apply(&self.norm)?;
-        Ok(xs)
-    }
-}
-
-#[derive(Clone)]
-pub struct ModernBertDecoder {
-    decoder: Linear,
-}
-
-impl ModernBertDecoder {
-    fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        // The decoder weights are tied with the embeddings layer weights
-        let decoder_weights = vb.get(
-            (config.vocab_size, config.hidden_size),
-            "model.embeddings.tok_embeddings.weight",
-        )?;
-        let decoder_bias = vb.get(config.vocab_size, "decoder.bias")?;
-        let decoder = Linear::new(decoder_weights, Some(decoder_bias));
-        Ok(Self { decoder })
-    }
-}
-
-impl Module for ModernBertDecoder {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = xs.apply(&self.decoder)?;
-        Ok(xs)
-    }
-}
-
-// Global attention mask calculated from padded token inputs
 fn prepare_4d_attention_mask(
     mask: &Tensor,
     dtype: DType,
@@ -510,107 +449,6 @@ impl ModernBert {
             xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask)?;
         }
         let xs = xs.apply(&self.final_norm)?;
-        Ok(xs)
-    }
-}
-
-// ModernBERT for the fill-mask task
-#[derive(Clone)]
-pub struct ModernBertForMaskedLM {
-    model: ModernBert,
-    decoder: ModernBertDecoder,
-    head: ModernBertHead,
-}
-
-impl ModernBertForMaskedLM {
-    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let model = ModernBert::load(vb.clone(), config)?;
-        let decoder = ModernBertDecoder::load(vb.clone(), config)?;
-        let head = ModernBertHead::load(vb.pp("head"), config)?;
-        Ok(Self {
-            model,
-            decoder,
-            head,
-        })
-    }
-
-    pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        let xs = self
-            .model
-            .forward(xs, mask)?
-            .apply(&self.head)?
-            .apply(&self.decoder)?;
-        Ok(xs)
-    }
-}
-
-#[derive(Clone)]
-pub struct ModernBertClassifier {
-    classifier: Linear,
-}
-
-impl ModernBertClassifier {
-    fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        // The decoder weights are tied with the embeddings layer weights
-        let classifier = linear(
-            config.hidden_size,
-            config
-                .classifier_config
-                .as_ref()
-                .map(|cc| cc.id2label.len())
-                .unwrap_or_default(),
-            vb.pp("classifier"),
-        )?;
-        Ok(Self { classifier })
-    }
-}
-
-impl Module for ModernBertClassifier {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = xs.apply(&self.classifier)?;
-        softmax(&xs, D::Minus1)
-    }
-}
-
-#[derive(Clone)]
-pub struct ModernBertForSequenceClassification {
-    model: ModernBert,
-    head: ModernBertHead,
-    classifier: ModernBertClassifier,
-    classifier_pooling: ClassifierPooling,
-}
-
-impl ModernBertForSequenceClassification {
-    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let model = ModernBert::load(vb.clone(), config)?;
-        let classifier = ModernBertClassifier::load(vb.clone(), config)?;
-        let head = ModernBertHead::load(vb.pp("head"), config)?;
-        Ok(Self {
-            model,
-            head,
-            classifier,
-            classifier_pooling: config
-                .classifier_config
-                .as_ref()
-                .map(|cc| cc.classifier_pooling)
-                .unwrap_or_default(),
-        })
-    }
-
-    pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        let output = self.model.forward(xs, mask)?;
-        let last_hidden_state = match self.classifier_pooling {
-            ClassifierPooling::CLS => output.i((.., 0, ..))?.contiguous()?,
-            ClassifierPooling::MEAN => {
-                let unsqueezed_mask = &mask.unsqueeze(D::Minus1)?.to_dtype(DType::F32)?;
-                let sum_output = output.broadcast_mul(unsqueezed_mask)?.sum(1)?;
-                sum_output.broadcast_div(&mask.sum_keepdim(1)?.to_dtype(DType::F32)?)?
-            }
-        };
-        let xs = self
-            .head
-            .forward(&last_hidden_state)?
-            .apply(&self.classifier)?;
         Ok(xs)
     }
 }

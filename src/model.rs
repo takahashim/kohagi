@@ -19,10 +19,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::encoder::{Config, ModernBert};
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::modernbert::{Config, ModernBert};
 use rayon::prelude::*;
 use tokenizers::Tokenizer;
 

@@ -1,1 +1,4 @@
 /target
+
+# Python bytecode from the example scripts
+__pycache__/
