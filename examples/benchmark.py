@@ -41,8 +41,14 @@ BASE = [
 
 
 def synth(kind: str, n: int) -> list[str]:
-    """Short is ~60 tokens; long overflows 512 so every record hits the cap."""
-    reps = 2 if kind == "short" else 20
+    """Short is ~30 tokens; long overflows 512 so every record hits the cap.
+
+    These are ruri-v3 tokenizer counts. Japanese packs several characters per
+    token, so reaching the 512 cap takes more repetitions than an English
+    reader might expect — long throughput is dominated by the quadratic
+    attention cost only when the records genuinely fill the window.
+    """
+    reps = 2 if kind == "short" else 60
     return [
         "".join(BASE[(i + k) % len(BASE)] for k in range(reps)) + f"（整理番号{i}）"
         for i in range(n)

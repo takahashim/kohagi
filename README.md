@@ -126,8 +126,8 @@ Sentence Transformers on the same corpus and settings; see
 ### `--device metal` on Apple Silicon
 
 Building with `--features metal` adds an Apple GPU backend. On an M2 it runs
-512-token batches about 1.2× faster than the Accelerate CPU path, with f32
-output unchanged (worst `1 - cosine` 9e-13 against CPU).
+about 1.8× faster than the Accelerate CPU path — measured on 512-token
+batches — with f32 output unchanged (worst `1 - cosine` 9e-13 against CPU).
 
 This needs the patched candle in [`vendor/`](vendor/README.md), so it is off by
 default and only applies when building from this repository.
@@ -179,7 +179,7 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 
 - モデルは初回には Hugging Face Hub から自動ダウンロードします (`--model-path`/`--tokenizer-path` でオフライン運用も可)
 - x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では `--precision bf16` で 1.5〜1.9 倍高速化します(cosine ≈ 0.99999、既定は f32。精度は若干落ちます)
-- Apple Silicon では `--features metal` でビルドすると `--device metal` が使え、CPU の約1.2倍で動きます(出力は f32 のまま変わりません)
+- Apple Silicon では `--features metal` でビルドすると `--device metal` が使え、512トークンで CPU の約1.8倍で動きます(出力は f32 のまま変わりません)
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
 - メモリ使用量は入力サイズによらず一定になるようにしました (チャンク処理+attention 予算キャップ)
 - 入出力の契約・exit code(0/2/1)は [PROTOCOL.md](PROTOCOL.md) を参照してください。

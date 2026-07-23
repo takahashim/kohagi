@@ -143,38 +143,41 @@ Useful flags: `--kind short|long`, `--count`, `--runs`, `--device cpu|mps|cuda`,
 
 ### Measured on an Apple M2
 
-8 cores, 16 GB, macOS 26.3, `ruri-v3-130m` f32, median of three runs. 1200
-short texts (~60 tokens) or 240 long ones (truncated to 512).
+8 cores, 16 GB, macOS 26.3, `ruri-v3-130m` f32 on the CPU, median of three
+runs. 1200 short texts (~30 tokens) or 240 long ones that fill the 512-token
+window. kohagi here is the default CPU backend, not `--device metal`.
 
 | | kohagi | torch/cpu | torch/mps |
 |---|---:|---:|---:|
-| startup + model load | 0.3–2 s | 8.9 s | 9.2–9.7 s |
-| encode, short | 10.2 s | 8.5 s | 4.4 s |
-| encode, long | 12.0 s | 15.4 s | 7.7 s |
-| **total, short** | 10.5 s | 17.4 s | 13.7 s |
-| **total, long** | 13.7 s | 24.7 s | 17.5 s |
+| startup + model load | 0.3–0.9 s | 3–4 s | 3–5 s |
+| encode, short | 7.2 s | 8.9 s | 4.2 s |
+| encode, long | 31.5 s | 36.9 s | 24.3 s |
+| **total, short** | 7.5 s | 11.7 s | 7.4 s |
+| **total, long** | 32.3 s | 40.7 s | 28.6 s |
 
-Absolute figures drifted by up to 30% across sessions on this laptop as it
-warmed up, so treat the ratios as the result and the seconds as indicative.
-Run it yourself before making a decision on it.
+Absolute figures drift substantially across sessions on this laptop as it
+warms up, and torch's load time depends on whether the model is already in the
+OS file cache. Treat the ratios as the result and the seconds as indicative,
+and run it yourself before making a decision on it.
 
 Two things the table says:
 
-- **On CPU, compute is a wash** — within about 15% either way, direction
-  depending on length. Accelerate and PyTorch are calling comparable sgemm,
-  which is the expected outcome, not a surprising one.
-- **The end-to-end win is startup, not throughput.** Torch spends ~9 seconds
+- **On CPU, compute is a wash** — kohagi is within about 15% of torch/cpu
+  either way. Accelerate and PyTorch call comparable sgemm, which is the
+  expected outcome, not a surprising one.
+- **The end-to-end win is startup.** torch spends several seconds loading
   before embedding anything; kohagi spends well under one. That gap is what
-  makes a per-invocation subprocess practical.
+  makes a per-invocation subprocess practical, and it is why kohagi ties
+  torch/mps on short totals despite the GPU being twice as fast at the encode.
 
 ### Where kohagi loses
 
-On MPS, torch computes long texts roughly 1.6× faster (7.7 s vs 12.0 s) — an
-Apple GPU against candle's CPU path, since candle 0.10 has no Metal kernels
-for ModernBERT's rotary embeddings. kohagi still wins end to end here, but
-only because the 9-second load swamps it, and that lead is finite: at this
-per-text gap the two cross over somewhere around 400–500 long texts, after
-which a warm torch/mps process is simply faster.
+At the encode itself, torch/mps is roughly twice as fast — it runs on the
+Apple GPU while the table's kohagi column is the CPU. On long totals it already
+comes out ahead (28.6 s vs 32.3 s), because at 512 tokens the compute gap
+outgrows kohagi's startup lead. A `--features metal` build closes most of that
+(see the top-level README), but a warm, long-lived torch/mps service still
+out-throughputs a process spawned per batch once the corpus is large enough.
 
 So the honest framing is not "kohagi is faster than PyTorch". It is that
 kohagi has nothing to amortize. If you spawn a process per batch — a rake
