@@ -114,7 +114,7 @@ The CLI is built on the same API, and its `main.rs` is ~100 lines.
 
 ## Performance notes
 
-* CPU by default, via Apple Accelerate on macOS, which performs within about 20% of PyTorch with equivalent output. On Linux there is no BLAS in the build at all — candle's pure-Rust `gemm` does the matrix multiplies, which is why `--precision bf16` is where the Linux throughput story is.
+* CPU by default, via Apple Accelerate on macOS, which performs within about 20% of PyTorch with equivalent output. Linux links no BLAS at all — candle's pure-Rust `gemm` does the matrix multiplies — so `--precision bf16` is where the Linux throughput is.
 * Batches run in parallel across physical CPU cores. Set `RAYON_NUM_THREADS` to override the default; additional threads may improve throughput at the cost of memory.
 * `--max-seq-length` has the largest effect on throughput because attention cost grows quadratically with sequence length.
 
@@ -131,11 +131,9 @@ batches — with f32 output unchanged (worst `1 - cosine` 9e-13 against CPU).
 
 The changes live in kohagi's own copy of the ModernBERT encoder
 ([`src/encoder.rs`](src/encoder.rs)), so any build carries them, including
-`cargo install`. On CPU they are close to neutral in wall-clock — the
-difference measured smaller than the run-to-run noise on a Zen 4 Linux box —
-so treat them as what makes the Metal path win rather than as a CPU speedup.
-What CPU builds do get is a lower peak RSS, from combining the two attention
-masks once per forward instead of in each of the 13 local layers.
+`cargo install`. They are what makes the Metal path win rather than a CPU
+speedup: on CPU the difference measured smaller than the run-to-run noise,
+though peak RSS does drop.
 
 ### `--device coreml` on the Apple Neural Engine
 
@@ -162,36 +160,28 @@ kohagi --device coreml --coreml-model-id takahashim/ruri-v3-130m-coreml < texts.
 On Zen 4 (Sapphire Rapids) and newer CPUs, `--precision bf16` uses `bf16` for projection layers while keeping normalization, softmax, and attention scores in `f32`.
 
 Measured on a Ryzen 7 8745H (Zen 4, 8 cores) running Linux, `ruri-v3-130m`,
-median of three runs of `examples/benchmark.py --precision bf16 --skip-torch`.
-Times are totals, including startup and model load; peak RSS is from
-`/usr/bin/time -v`.
+median of five runs alternating between the two precisions
+(`examples/benchmark.py --precision bf16 --skip-torch` produces the times;
+peak RSS is from `/usr/bin/time -v`). Times are totals, including startup and
+model load. The f32 column drifts a few percent between sessions, so read the
+ratios rather than the seconds.
 
 | Input                    |    f32 |              bf16 |          Peak RSS |
 | ------------------------ | -----: | ----------------: | ----------------: |
-| 1200 short (~30 tokens)  | 11.0 s |  **4.9 s** (2.2×) | 1.30 GB → 0.87 GB |
-| 240 long (512 tokens)    | 45.0 s | **21.6 s** (2.1×) | 1.36 GB → 1.01 GB |
+| 1200 short (~30 tokens)  | 11.2 s |  **4.9 s** (2.3×) | 1.19 GB → 0.87 GB |
+| 240 long (512 tokens)    | 44.2 s | **22.2 s** (2.0×) | 1.31 GB → 1.06 GB |
 
-Less than half of that is the bf16 arithmetic. Profiling a 512-token forward
-put 28% of it in the attention mask and softmax and another 10% in the GELU —
-both f32, and both spent in candle evaluating a transcendental one element at
-a time (`SoftmaxLastDim::cpu_fwd` and `UnaryOpT for Erf`). bf16 builds run
-those through kohagi's own AVX-512 kernels instead,
-[`src/bf16/softmax.rs`](src/bf16/softmax.rs) and
-[`src/bf16/geglu.rs`](src/bf16/geglu.rs), worth 1.37× at 512 tokens on their
-own.
+Less than half of that is the bf16 arithmetic. The rest comes from two things
+a bf16 build also gets, both still f32: AVX-512 kernels for the softmax and
+the GELU, which candle evaluates one element at a time
+([`src/bf16/softmax.rs`](src/bf16/softmax.rs),
+[`src/bf16/geglu.rs`](src/bf16/geglu.rs)), and skipping the three quarters of
+the score matrix that ruri-v3's sliding-window layers mask off anyway. What
+stays f32 and unfused is the `q·kᵀ` and `att·v` matmuls, which is why the
+long row gains less than the short one.
 
-The other structural win is that 12 of ruri-v3's 19 layers attend only within
-a 128-token window, so at 512 tokens three quarters of what they were
-computing was masked off again immediately. Those layers now walk the band in
-query blocks, for a further 1.11×. The dropped entries are worth `exp` of the
-mask floor — about 1e-38 against a normalizer of at least 1 — so the output is
-bit-identical either way.
-
-What is left of the gap between the two rows is the `q·kᵀ` and `att·v`
-matmuls, which stay in f32 and grow quadratically with sequence length.
-
-bf16 pays about a second more at load, converting the weights, which matters
-if you spawn a process per small batch.
+bf16 also pays about a second more at load, converting the weights, which
+matters if you spawn a process per small batch.
 
 The resulting embeddings remain very close to f32 output, with cosine similarity around 0.99999, but they are not bit-identical.
 
@@ -228,7 +218,7 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 ```
 
 - モデルは初回には Hugging Face Hub から自動ダウンロードします (`--model-path`/`--tokenizer-path` でオフライン運用も可)
-- x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では `--precision bf16` で 2 倍強高速化します(短文 2.2 倍、512 トークン 2.1 倍、cosine ≈ 0.99999、既定は f32。精度は若干落ちます)
+- x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では `--precision bf16` で約 2 倍高速化します(短文 2.3 倍、512 トークン 2.0 倍、cosine ≈ 0.99999、既定は f32。精度は若干落ちます)
 - Apple Silicon では `--features metal` でビルドすると `--device metal` が使え、512トークンで CPU の約1.8倍で動きます(出力は f32 のまま変わりません)
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
 - メモリ使用量は入力サイズによらず一定になるようにしました (チャンク処理+attention 予算キャップ)

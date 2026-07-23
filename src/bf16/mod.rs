@@ -20,8 +20,8 @@
 //! quarters of a 512-token score matrix is masked off. That one is exactly
 //! equivalent, down to the bit.
 //!
-//! On short texts this is ~2.2× faster than the f32 path at cosine ≈ 0.99999,
-//! and ~2.1× at 512 tokens, where the attention matmuls still run in f32.
+//! On short texts this is ~2.3× faster than the f32 path at cosine ≈ 0.99999,
+//! and ~2.0× at 512 tokens, where the attention matmuls still run in f32.
 //! Both the module and the CPU features are checked before use: non-x86_64
 //! builds skip this module entirely, [`gemm::supported`] gates it at load
 //! time, and both elementwise kernels fall back to scalar rows when AVX-512

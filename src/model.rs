@@ -100,8 +100,8 @@ pub enum Precision {
     F32,
     /// The four projection `Linear`s in bf16, plus the vectorized softmax,
     /// GeGLU and sliding-window attention that come with them (see
-    /// [`crate::bf16`]). Measured on an 8-core Zen 4: 2.2× faster on short
-    /// texts, 2.1× on 512-token ones, at cosine ≈ 0.99999 against f32 — and it
+    /// [`crate::bf16`]). Measured on an 8-core Zen 4: 2.3× faster on short
+    /// texts, 2.0× on 512-token ones, at cosine ≈ 0.99999 against f32 — and it
     /// halves the memory the weights occupy. Requires x86_64 with AVX512-BF16
     /// (Zen 4, Sapphire Rapids or newer); [`Embedder::load`] fails clearly
     /// elsewhere.
