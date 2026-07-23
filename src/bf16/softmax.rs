@@ -19,7 +19,7 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-use super::simd::{exp512, has_avx512f};
+use super::simd::{exp512, Avx512};
 
 /// Floor on the exponent, which disposes of the `NaN` a fully-masked query row
 /// would otherwise produce: every entry is `-inf`, so `x - max` is
@@ -117,7 +117,7 @@ pub fn masked_softmax(scores: &mut [f32], mask: &[f32], rows: usize, heads: usiz
     debug_assert_eq!(mask.len(), rows * b.seq * b.seq);
     debug_assert!(b.q0 + b.queries <= b.seq && b.k0 + b.keys <= b.seq);
 
-    let simd = has_avx512f();
+    let simd = Avx512::detect();
     for r in 0..rows {
         for h in 0..heads {
             for i in 0..b.queries {
@@ -132,12 +132,12 @@ pub fn masked_softmax(scores: &mut [f32], mask: &[f32], rows: usize, heads: usiz
 }
 
 /// One query row. `simd` is threaded in rather than re-detected per row.
-fn row(s: &mut [f32], m: &[f32], simd: bool) {
+fn row(s: &mut [f32], m: &[f32], simd: Option<Avx512>) {
     debug_assert_eq!(s.len(), m.len());
     #[cfg(target_arch = "x86_64")]
-    if simd {
-        // SAFETY: guarded by the caller's feature check; the kernel reads
-        // exactly `s.len()` floats from each pointer.
+    if simd.is_some() {
+        // SAFETY: the `Avx512` token exists only where detection found the
+        // instructions; the kernel reads exactly `s.len()` floats per pointer.
         unsafe { row_avx512(s.as_mut_ptr(), m.as_ptr(), s.len()) };
         return;
     }
@@ -255,7 +255,7 @@ mod tests {
         let want = reference(&s, &m);
 
         let mut got = s.clone();
-        row(&mut got, &m, has_avx512f());
+        row(&mut got, &m, Avx512::detect());
         got.iter()
             .zip(&want)
             .map(|(g, w)| (*g as f64 - w).abs())
@@ -277,10 +277,13 @@ mod tests {
         let s: Vec<f32> = (0..seq).map(|i| ((i % 37) as f32 - 18.0) * 0.7).collect();
         let m = vec![0.0f32; seq];
 
+        let Some(avx512) = Avx512::detect() else {
+            return;
+        };
         let mut simd = s.clone();
-        row(&mut simd, &m, true);
+        row(&mut simd, &m, Some(avx512));
         let mut scalar = s.clone();
-        row(&mut scalar, &m, false);
+        row(&mut scalar, &m, None);
 
         let worst = simd
             .iter()
@@ -295,13 +298,16 @@ mod tests {
     #[test]
     fn fully_masked_row_stays_finite() {
         let seq = 512;
-        for simd in [true, false] {
+        // Whichever paths this CPU has: the token is `None` without AVX-512,
+        // so the vector arm is simply not exercised there.
+        for simd in [Avx512::detect(), None] {
             let mut s = vec![0.5f32; seq];
             let m = vec![f32::NEG_INFINITY; seq];
             row(&mut s, &m, simd);
             assert!(
                 s.iter().all(|v| v.is_finite()),
-                "simd={simd}: row contains NaN or inf"
+                "simd={}: row contains NaN or inf",
+                simd.is_some()
             );
         }
     }

@@ -8,16 +8,30 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Whether the elementwise kernels ([`super::softmax`], [`super::geglu`]) can
-/// take their vector path. They fall back to scalar rows when this is false.
-pub fn has_avx512f() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::is_x86_feature_detected!("avx512f")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
+/// Proof that this CPU has AVX-512F, and the only way to reach the vector
+/// path of the elementwise kernels ([`super::softmax`], [`super::geglu`]).
+///
+/// The kernels are `unsafe` behind a runtime feature check, and the check used
+/// to travel to them as a plain `bool`. A caller could then get it wrong, and
+/// one did: a test passed `true` unconditionally and ran AVX-512 on whatever
+/// CPU it landed on, which is fine on a developer box with the instructions
+/// and an illegal instruction on CI without them. A token that only
+/// [`Avx512::detect`] can produce makes asking for an unavailable path
+/// unexpressible rather than merely documented.
+#[derive(Clone, Copy)]
+pub struct Avx512(());
+
+impl Avx512 {
+    /// `Some` on a CPU that can run the vector kernels; callers fall back to
+    /// scalar rows on `None`.
+    pub fn detect() -> Option<Self> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx512f") {
+                return Some(Self(()));
+            }
+        }
+        None
     }
 }
 
@@ -26,7 +40,7 @@ pub fn has_avx512f() -> bool {
 pub fn has_avx512bf16() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        has_avx512f() && std::is_x86_feature_detected!("avx512bf16")
+        Avx512::detect().is_some() && std::is_x86_feature_detected!("avx512bf16")
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -44,7 +58,8 @@ pub fn has_avx512bf16() -> bool {
 ///
 /// # Safety
 ///
-/// The caller must have checked [`has_avx512f`].
+/// The caller must hold an [`Avx512`] token, or otherwise be inside a
+/// function that already enables the feature.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub unsafe fn exp512(x: __m512) -> __m512 {
@@ -88,7 +103,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn exp512_matches_libm() {
-        if !has_avx512f() {
+        if Avx512::detect().is_none() {
             return;
         }
         let mut worst = 0.0f64;

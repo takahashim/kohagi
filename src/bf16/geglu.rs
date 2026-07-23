@@ -21,7 +21,7 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-use super::simd::{exp512, has_avx512f};
+use super::simd::{exp512, Avx512};
 
 /// `gelu(x) = 0.5·x·(1 + erf(x/√2))`, so this scales the argument.
 const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
@@ -42,7 +42,7 @@ const A: [f32; 5] = [
 pub fn geglu(wide: &[f32], rows: usize, inter: usize) -> Vec<f32> {
     debug_assert_eq!(wide.len(), rows * 2 * inter);
     let mut out = vec![0.0f32; rows * inter];
-    let simd = has_avx512f();
+    let simd = Avx512::detect();
     for r in 0..rows {
         let base = r * 2 * inter;
         let gate = &wide[base..base + inter];
@@ -50,9 +50,10 @@ pub fn geglu(wide: &[f32], rows: usize, inter: usize) -> Vec<f32> {
         let dst = &mut out[r * inter..(r + 1) * inter];
 
         #[cfg(target_arch = "x86_64")]
-        if simd {
-            // SAFETY: guarded by the feature check; all three slices are
-            // `inter` long, which is what the kernel reads and writes.
+        if simd.is_some() {
+            // SAFETY: the `Avx512` token exists only where detection found the
+            // instructions; all three slices are `inter` long, which is what the
+            // kernel reads and writes.
             unsafe { row_avx512(gate.as_ptr(), up.as_ptr(), dst.as_mut_ptr(), inter) };
             continue;
         }
@@ -176,7 +177,7 @@ mod tests {
 
     #[test]
     fn simd_and_scalar_agree() {
-        if !has_avx512f() {
+        if Avx512::detect().is_none() {
             return;
         }
         let (rows, inter) = (1usize, 512usize);
