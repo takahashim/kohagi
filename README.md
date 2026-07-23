@@ -133,6 +133,26 @@ The speedups live in kohagi's own copy of the ModernBERT encoder
 ([`src/encoder.rs`](src/encoder.rs)), so they apply to any build, including
 `cargo install`. It is off by default only because it is macOS-only.
 
+### `--device coreml` on the Apple Neural Engine
+
+Build with `--features coreml` to enable the Core ML backend for the Apple
+Neural Engine (ANE). On an M2, it is about 4× faster than Metal at 512
+tokens, with cosine similarity of approximately 0.99999 against the CPU
+output. For short inputs, the multicore CPU backend may still be faster.
+
+
+Run a local converted model with:
+
+```bash
+kohagi --device coreml --coreml-dir models/ruri-v3-130m-coreml < texts.jsonl
+```
+
+Or load the same directory layout from Hugging Face Hub:
+
+```bash
+kohagi --device coreml --coreml-model-id takahashim/ruri-v3-130m-coreml < texts.jsonl
+```
+
 ### `--precision bf16` on AVX512-BF16 CPUs
 
 On Zen 4 (Sapphire Rapids) and newer CPUs, `--precision bf16` uses `bf16` for projection layers while keeping normalization, softmax, and attention scores in `f32`.

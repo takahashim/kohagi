@@ -2,14 +2,18 @@
 //! mode for quick checks. See PROTOCOL.md for the full contract.
 //!
 //! Exit codes: 0 = all input embedded, 2 = finished but some lines were
-//! skipped (see stderr), 1 = fatal (model load, I/O, bad flags).
+//! skipped (see stderr), 1 = fatal (model load, I/O, bad flags), 3 = the
+//! requested CoreML backend cannot serve this request (built without the
+//! feature, no `--coreml-dir`, or `--max-seq-length` beyond the largest
+//! converted bucket) — caught before any input is read, so the caller can
+//! retry on `--device cpu`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
-use kohagi::{stdio, Backend, Embedder, ModelSource, Options, Pooling, Precision};
+use kohagi::{stdio, Backend, CoreMlForm, Embedder, ModelSource, Options, Pooling, Precision};
 
 /// CLI spellings of the library enums, so `--help` lists the valid values and
 /// clap rejects anything else before we do any work.
@@ -29,12 +33,15 @@ enum PrecisionArg {
     Bf16,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum BackendArg {
     /// Apple Accelerate on macOS, candle's own gemm elsewhere.
     Cpu,
     /// Apple GPU. Needs a binary built with `--features metal`.
     Metal,
+    /// Apple Neural Engine. Needs a binary built with `--features coreml` and
+    /// `--coreml-dir` pointing at pre-converted fixed-shape models.
+    Coreml,
 }
 
 impl From<PoolingArg> for Pooling {
@@ -55,11 +62,29 @@ impl From<PrecisionArg> for Precision {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CoreMlFormArg {
+    /// Compiled `.mlmodelc` — no per-run compile (default).
+    Compiled,
+    /// Portable `.mlpackage` — compiled on load, robust across OS versions.
+    Package,
+}
+
+impl From<CoreMlFormArg> for CoreMlForm {
+    fn from(f: CoreMlFormArg) -> Self {
+        match f {
+            CoreMlFormArg::Compiled => CoreMlForm::Compiled,
+            CoreMlFormArg::Package => CoreMlForm::Package,
+        }
+    }
+}
+
 impl From<BackendArg> for Backend {
     fn from(b: BackendArg) -> Self {
         match b {
             BackendArg::Cpu => Backend::Cpu,
             BackendArg::Metal => Backend::Metal,
+            BackendArg::Coreml => Backend::CoreML,
         }
     }
 }
@@ -96,8 +121,25 @@ struct Args {
     precision: PrecisionArg,
     /// Device for the forward pass. metal requires a binary built with
     /// `--features metal`, and runs ~1.2x faster than cpu on Apple Silicon.
+    /// coreml (Apple Neural Engine) requires `--features coreml` and
+    /// `--coreml-dir`.
     #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
     device: BackendArg,
+    /// Directory of pre-converted CoreML models for `--device coreml`: one
+    /// `seq-<N>.mlpackage` per bucket length, plus tokenizer.json and
+    /// config.json. Produce one with scripts/convert_coreml.py.
+    #[arg(long)]
+    coreml_dir: Option<PathBuf>,
+    /// Hugging Face repo holding the CoreML models (same layout as
+    /// --coreml-dir), downloaded and cached on first use. Alternative to
+    /// --coreml-dir for `--device coreml`; --coreml-dir wins if both are set.
+    #[arg(long)]
+    coreml_model_id: Option<String>,
+    /// When a --coreml-model-id repo ships both forms of a bucket, which to
+    /// download: `compiled` (.mlmodelc, faster) or `package` (.mlpackage,
+    /// portable). Only the chosen form is fetched.
+    #[arg(long, value_enum, default_value_t = CoreMlFormArg::Compiled)]
+    coreml_prefer: CoreMlFormArg,
     /// Skip L2 normalization (normalized output is the default; unit vectors
     /// make dot product = cosine).
     #[arg(long)]
@@ -123,18 +165,33 @@ impl Args {
             batch_size: self.batch_size,
             precision: self.precision.into(),
             backend: self.device.into(),
+            coreml_form: self.coreml_prefer.into(),
         }
     }
 
     /// Where to load the model from, plus the name to show in the summary.
-    fn source(&self) -> (ModelSource, String) {
-        match (&self.model_path, &self.tokenizer_path) {
+    fn source(&self) -> anyhow::Result<(ModelSource, String)> {
+        // CoreML loads pre-converted fixed-shape models — a local directory or
+        // a Hub repo — not safetensors.
+        if self.device == BackendArg::Coreml {
+            if let Some(dir) = self.coreml_dir.clone() {
+                let label = label_of(&dir);
+                return Ok((ModelSource::CoreMl { dir }, label));
+            }
+            if let Some(repo) = self.coreml_model_id.clone() {
+                let label = repo.clone();
+                return Ok((ModelSource::CoreMlHub { repo }, label));
+            }
+            return Err(kohagi::UnsupportedRequest(
+                "`--device coreml` requires `--coreml-dir <DIR>` or `--coreml-model-id <REPO>`"
+                    .to_string(),
+            )
+            .into());
+        }
+        let out = match (&self.model_path, &self.tokenizer_path) {
             // clap's `requires` guarantees these two arrive together.
             (Some(model), Some(tokenizer)) => {
-                let label = model.file_name().map_or_else(
-                    || model.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                );
+                let label = label_of(model);
                 let source = ModelSource::Files {
                     model: model.clone(),
                     tokenizer: tokenizer.clone(),
@@ -147,8 +204,17 @@ impl Args {
                 };
                 (source, self.model_id.clone())
             }
-        }
+        };
+        Ok(out)
     }
+}
+
+/// A short display label for a model path: its file name, or the full path.
+fn label_of(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 /// `--text` mode: embed the arguments and print the same JSONL that stdio
@@ -175,7 +241,7 @@ fn embed_arguments(args: &Args, source: &ModelSource) -> anyhow::Result<()> {
 
 /// Returns the number of skipped input lines (0 in `--text` mode).
 fn run(args: Args) -> anyhow::Result<usize> {
-    let (source, label) = args.source();
+    let (source, label) = args.source()?;
 
     if !args.text.is_empty() {
         embed_arguments(&args, &source)?;
@@ -192,7 +258,13 @@ fn main() -> ExitCode {
         Ok(_) => ExitCode::from(2),
         Err(e) => {
             eprintln!("kohagi: error: {e:#}");
-            ExitCode::FAILURE
+            // A CoreML-unsupported request gets its own code so callers can
+            // tell "retry on --device cpu" apart from a genuine failure.
+            if e.chain().any(|c| c.is::<kohagi::UnsupportedRequest>()) {
+                ExitCode::from(3)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
