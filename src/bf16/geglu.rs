@@ -21,6 +21,8 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+use super::simd::{exp512, has_avx512f};
+
 /// `gelu(x) = 0.5·x·(1 + erf(x/√2))`, so this scales the argument.
 const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
@@ -35,23 +37,12 @@ const A: [f32; 5] = [
     1.061_405_4,
 ];
 
-fn avx512() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::is_x86_feature_detected!("avx512f")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
-}
-
 /// Reduce `wide` — `[rows, 2·inter]`, gate half then up half — to
 /// `[rows, inter]` holding `gelu(gate) · up`.
 pub fn geglu(wide: &[f32], rows: usize, inter: usize) -> Vec<f32> {
     debug_assert_eq!(wide.len(), rows * 2 * inter);
     let mut out = vec![0.0f32; rows * inter];
-    let simd = avx512();
+    let simd = has_avx512f();
     for r in 0..rows {
         let base = r * 2 * inter;
         let gate = &wide[base..base + inter];
@@ -129,7 +120,7 @@ unsafe fn gelu16(x: __m512) -> __m512 {
         poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(*a));
     }
     // `exp(-z²)` is never positive, which is the range `exp512` is built for.
-    let decay = super::softmax::exp512(_mm512_mul_ps(_mm512_sub_ps(_mm512_setzero_ps(), z), z));
+    let decay = exp512(_mm512_mul_ps(_mm512_sub_ps(_mm512_setzero_ps(), z), z));
     // `erfc(|x|/√2)`, in [0, 1]. See `gelu_scalar` for why this and not `erf`.
     let ec = _mm512_mul_ps(_mm512_mul_ps(poly, t), decay);
     let positive = _mm512_cmp_ps_mask::<_CMP_GT_OQ>(x, _mm512_setzero_ps());
@@ -185,7 +176,7 @@ mod tests {
 
     #[test]
     fn simd_and_scalar_agree() {
-        if !avx512() {
+        if !has_avx512f() {
             return;
         }
         let (rows, inter) = (1usize, 512usize);

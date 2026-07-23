@@ -19,6 +19,8 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+use super::simd::{exp512, has_avx512f};
+
 /// Floor on the exponent, which disposes of the `NaN` a fully-masked query row
 /// would otherwise produce: every entry is `-inf`, so `x - max` is
 /// `-inf - -inf`. Clamping turns that row into a uniform distribution instead.
@@ -35,28 +37,6 @@ use std::arch::x86_64::*;
 /// contributor.
 const EXP_FLOOR: f32 = -87.0;
 
-/// Whether the fused kernel can run on this CPU.
-fn avx512() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::is_x86_feature_detected!("avx512f")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
-}
-
-/// Softmax `scores` in place, adding `mask` first.
-///
-/// `scores` is `[rows, heads, seq, seq]`; `mask` is `[rows, seq, seq]`, the
-/// additive bias every head shares. Rows of `scores` are the last axis, so
-/// each `(row, head, query)` triple owns one contiguous `seq`-float span.
-pub fn masked_softmax(scores: &mut [f32], mask: &[f32], rows: usize, heads: usize, seq: usize) {
-    debug_assert_eq!(scores.len(), rows * heads * seq * seq);
-    masked_softmax_block(scores, mask, rows, heads, Block::full(seq));
-}
-
 /// Which slice of the score matrix a call covers.
 ///
 /// A sliding-window layer only needs a band, and [`super::modernbert`] walks
@@ -64,13 +44,17 @@ pub fn masked_softmax(scores: &mut [f32], mask: &[f32], rows: usize, heads: usiz
 /// `keys` columns starting at `k0`. The scores for that block are their own
 /// contiguous `[rows, heads, queries, keys]` buffer, but the mask is still the
 /// full `[rows, seq, seq]` one, so it is indexed with `seq` as the row stride.
-#[derive(Clone, Copy)]
+///
+/// The fields are read-only from outside; [`Block::full`] and [`Block::band`]
+/// are the two shapes that exist, and the second is where the arithmetic that
+/// makes banding correct lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Block {
-    pub seq: usize,
-    pub q0: usize,
-    pub queries: usize,
-    pub k0: usize,
-    pub keys: usize,
+    pub(super) seq: usize,
+    pub(super) q0: usize,
+    pub(super) queries: usize,
+    pub(super) k0: usize,
+    pub(super) keys: usize,
 }
 
 impl Block {
@@ -84,15 +68,56 @@ impl Block {
             keys: seq,
         }
     }
+
+    /// The keys a block of queries can reach through a sliding window of
+    /// half-width `window`.
+    ///
+    /// Query `q0 + i` attends `[q0 + i - window, q0 + i + window]`, so the
+    /// block as a whole needs the union of those, clamped to the sequence.
+    /// Covering every open key is what lets the caller drop the rest of the
+    /// row: whatever this leaves out is masked shut, and contributes `exp` of
+    /// the mask floor rather than anything f32 can hold.
+    pub fn band(seq: usize, q0: usize, queries: usize, window: usize) -> Self {
+        debug_assert!(queries > 0 && q0 + queries <= seq);
+        let k0 = q0.saturating_sub(window);
+        let last = (q0 + queries - 1 + window).min(seq - 1);
+        Self {
+            seq,
+            q0,
+            queries,
+            k0,
+            keys: last + 1 - k0,
+        }
+    }
+
+    /// How many queries this block covers, for the caller sizing its buffers.
+    pub fn queries(&self) -> usize {
+        self.queries
+    }
+
+    /// Where the block's keys start, and how many there are.
+    pub fn keys(&self) -> (usize, usize) {
+        (self.k0, self.keys)
+    }
+
+    /// Where the block's queries start.
+    pub fn q0(&self) -> usize {
+        self.q0
+    }
 }
 
-/// [`masked_softmax`] over one block of the score matrix.
-pub fn masked_softmax_block(scores: &mut [f32], mask: &[f32], rows: usize, heads: usize, b: Block) {
+/// Softmax `scores` in place, adding `mask` first.
+///
+/// `scores` is the block's own contiguous `[rows, heads, queries, keys]`
+/// buffer; `mask` is the full `[rows, seq, seq]` additive bias every head
+/// shares. Rows of both are the last axis, so each `(row, head, query)` triple
+/// owns one contiguous span in each.
+pub fn masked_softmax(scores: &mut [f32], mask: &[f32], rows: usize, heads: usize, b: Block) {
     debug_assert_eq!(scores.len(), rows * heads * b.queries * b.keys);
     debug_assert_eq!(mask.len(), rows * b.seq * b.seq);
     debug_assert!(b.q0 + b.queries <= b.seq && b.k0 + b.keys <= b.seq);
 
-    let simd = avx512();
+    let simd = has_avx512f();
     for r in 0..rows {
         for h in 0..heads {
             for i in 0..b.queries {
@@ -139,47 +164,6 @@ fn row_scalar(s: &mut [f32], m: &[f32]) {
     for s in s.iter_mut() {
         *s /= sum;
     }
-}
-
-/// `exp` for 16 lanes: `exp(x) = 2^n · exp(r)`, with `n = round(x·log2 e)` and
-/// `r = x - n·ln2` split hi/lo (Cody-Waite) so the reduction stays exact. The
-/// polynomial is Cephes' `expf`, accurate to about 1 ulp.
-///
-/// Callers pass `x ≤ 0`, so no overflow path is needed and `scalef` handles
-/// the underflow tail. [`super::geglu`] reuses it for `exp(-z²)`, which is
-/// also never positive.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub(super) unsafe fn exp512(x: __m512) -> __m512 {
-    // 355/512, written as the quotient because it has to be *exactly*
-    // representable: the point of the split is that `n · LN2_HI` is exact, so
-    // only the tiny `LN2_LO` term carries rounding.
-    const LN2_HI: f32 = 355.0 / 512.0;
-    const LN2_LO: f32 = -2.121_944_4e-4;
-    const P: [f32; 6] = [
-        1.987_569_1e-4,
-        1.398_199_9e-3,
-        8.333_452e-3,
-        4.166_579_6e-2,
-        1.666_666_5e-1,
-        0.5,
-    ];
-
-    let n = _mm512_roundscale_ps::<0>(_mm512_mul_ps(x, _mm512_set1_ps(std::f32::consts::LOG2_E)));
-    let r = _mm512_fnmadd_ps(n, _mm512_set1_ps(LN2_HI), x);
-    let r = _mm512_fnmadd_ps(n, _mm512_set1_ps(LN2_LO), r);
-
-    let mut y = _mm512_set1_ps(P[0]);
-    for p in &P[1..] {
-        y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(*p));
-    }
-    // y·r² + r + 1
-    y = _mm512_fmadd_ps(
-        y,
-        _mm512_mul_ps(r, r),
-        _mm512_add_ps(r, _mm512_set1_ps(1.0)),
-    );
-    _mm512_scalef_ps(y, n)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -271,7 +255,7 @@ mod tests {
         let want = reference(&s, &m);
 
         let mut got = s.clone();
-        row(&mut got, &m, avx512());
+        row(&mut got, &m, has_avx512f());
         got.iter()
             .zip(&want)
             .map(|(g, w)| (*g as f64 - w).abs())
@@ -336,7 +320,7 @@ mod tests {
         for j in 1..seq {
             m[seq * seq + j] = f32::NEG_INFINITY;
         }
-        masked_softmax(&mut s, &m, rows, heads, seq);
+        masked_softmax(&mut s, &m, rows, heads, Block::full(seq));
 
         for r in 0..rows {
             for h in 0..heads {
@@ -393,7 +377,7 @@ mod candle_parity {
         };
 
         let mut got = scores;
-        masked_softmax(&mut got, &mask, rows, heads, seq);
+        masked_softmax(&mut got, &mask, rows, heads, Block::full(seq));
 
         let worst = got
             .iter()
@@ -403,47 +387,6 @@ mod candle_parity {
         assert!(worst < 1e-7, "worst absolute difference {worst:e}");
     }
 }
-
-#[cfg(test)]
-mod exp_accuracy {
-    use super::*;
-
-    /// Sweep the whole argument range the softmax can hand `exp512` and
-    /// compare against libm, which is what candle's scalar path uses.
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn exp512_matches_libm() {
-        if !avx512() {
-            return;
-        }
-        let mut worst = 0.0f64;
-        let mut worst_at = 0.0f32;
-        let mut x = EXP_FLOOR;
-        while x <= 0.0 {
-            let want = x.exp() as f64;
-            let mut lanes = [0.0f32; 16];
-            // SAFETY: guarded by the avx512 check above.
-            let got = unsafe {
-                let v = exp512(_mm512_set1_ps(x));
-                _mm512_storeu_ps(lanes.as_mut_ptr(), v);
-                lanes[0] as f64
-            };
-            if want > 0.0 {
-                let rel = ((got - want) / want).abs();
-                if rel > worst {
-                    worst = rel;
-                    worst_at = x;
-                }
-            }
-            x += 0.0009765625; // 1/1024, so the sweep hits exact binary points
-        }
-        assert!(
-            worst < 1e-6,
-            "worst relative error {worst:e} at x = {worst_at}"
-        );
-    }
-}
-
 #[cfg(test)]
 mod block_tests {
     use super::*;
@@ -472,12 +415,12 @@ mod block_tests {
         }
 
         let mut full = scores.clone();
-        masked_softmax(&mut full, &mask, rows, heads, seq);
+        masked_softmax(&mut full, &mask, rows, heads, Block::full(seq));
 
         // One block of 16 queries, against exactly the keys they can reach.
         let (q0, queries) = (16usize, 16usize);
-        let k0 = q0 - w;
-        let keys = (q0 + queries - 1 + w + 1) - k0;
+        let b = Block::band(seq, q0, queries, w);
+        let (k0, keys) = b.keys();
         let mut block = vec![0.0f32; rows * heads * queries * keys];
         for r in 0..rows {
             for h in 0..heads {
@@ -488,19 +431,7 @@ mod block_tests {
                 }
             }
         }
-        masked_softmax_block(
-            &mut block,
-            &mask,
-            rows,
-            heads,
-            Block {
-                seq,
-                q0,
-                queries,
-                k0,
-                keys,
-            },
-        );
+        masked_softmax(&mut block, &mask, rows, heads, b);
 
         for r in 0..rows {
             for h in 0..heads {
@@ -514,5 +445,67 @@ mod block_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    /// The band must contain every key the window leaves open for every query
+    /// in the block, and nothing is required beyond that. This is the whole
+    /// correctness argument for computing a band instead of a full row, so it
+    /// is checked exhaustively over the shapes rather than spot-checked.
+    #[test]
+    fn covers_every_key_the_window_opens() {
+        for seq in [1usize, 5, 32, 64, 129, 512] {
+            for window in [0usize, 1, 8, 64, 600] {
+                for size in [1usize, 3, 32] {
+                    for q0 in (0..seq).step_by(size) {
+                        let queries = size.min(seq - q0);
+                        let b = Block::band(seq, q0, queries, window);
+                        let (k0, keys) = b.keys();
+
+                        assert!(
+                            k0 + keys <= seq,
+                            "seq {seq} w {window} q0 {q0}: past the end"
+                        );
+                        for i in 0..queries {
+                            let q = q0 + i;
+                            let lo = q.saturating_sub(window);
+                            let hi = (q + window).min(seq - 1);
+                            assert!(
+                                k0 <= lo && hi < k0 + keys,
+                                "seq {seq} w {window} q0 {q0}: query {q} wants {lo}..={hi}, \
+                                 block has {k0}..{}",
+                                k0 + keys
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A window wide enough to span the sequence degenerates to the full row,
+    /// which is what makes `banding_pays` in `super::modernbert` a pure
+    /// optimization rather than a correctness switch.
+    #[test]
+    fn a_window_spanning_the_sequence_is_the_full_row() {
+        let seq = 32;
+        assert_eq!(Block::band(seq, 0, seq, seq), Block::full(seq));
+    }
+
+    /// The first and last blocks are the ones that clamp, and an off-by-one in
+    /// either direction would silently drop a key.
+    #[test]
+    fn clamps_at_both_ends() {
+        let (seq, w) = (100usize, 10usize);
+        // At the start there is nothing to the left to reach for.
+        assert_eq!(Block::band(seq, 0, 8, w).keys(), (0, 8 + w));
+        // In the middle both sides are open.
+        assert_eq!(Block::band(seq, 50, 8, w).keys(), (40, 8 + 2 * w));
+        // At the end the right side runs out.
+        assert_eq!(Block::band(seq, 92, 8, w).keys(), (82, 18));
     }
 }

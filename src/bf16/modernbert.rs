@@ -29,7 +29,7 @@ use candle_nn::{embedding, layer_norm_no_bias, Embedding, LayerNorm, VarBuilder}
 
 use super::geglu;
 use super::gemm::Bf16Linear;
-use super::softmax;
+use super::softmax::{self, Block};
 
 /// Queries per block in the sliding-window attention path.
 ///
@@ -154,68 +154,62 @@ impl Attention {
 
         let ctx = match window {
             Some(w) if banding_pays(seq, w) => self.banded(&q, &k, &v, attn_mask, w)?,
-            _ => self.dense(&q, &k, &v, attn_mask)?,
+            _ => self.attend(&q, &k, &v, attn_mask, Block::full(seq))?,
         };
 
         let xs = ctx.transpose(1, 2)?.reshape((b, seq, d))?;
         apply(&self.proj, &xs)
     }
 
-    /// Every query against every key: `[b, heads, seq, dim]` in and out.
-    fn dense(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: &[f32]) -> Result<Tensor> {
-        let (b, _, seq, _) = q.dims4()?;
-        let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+    /// Attention over one block of the score matrix: the queries `block`
+    /// names, against the keys it names, returning their `[b, heads, queries,
+    /// dim]` context.
+    ///
+    /// This is the whole of attention — [`Block::full`] makes it the dense
+    /// case, so the banded path is not a second implementation of it.
+    fn attend(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: &[f32],
+        block: Block,
+    ) -> Result<Tensor> {
+        let b = q.dim(0)?;
+        let (k0, keys) = block.keys();
+        let queries = block.queries();
+
+        let qb = q.narrow(2, block.q0(), queries)?;
+        let kb = k.narrow(2, k0, keys)?;
+        let vb = v.narrow(2, k0, keys)?;
+
+        let att = qb.matmul(&kb.transpose(D::Minus2, D::Minus1)?)?;
 
         // The mask add and the softmax are fused (see `super::softmax`), which
         // is why the mask arrives as a flat `[b, seq, seq]` slice rather than a
         // tensor to broadcast against.
         let mut scores = att.flatten_all()?.to_vec1::<f32>()?;
-        softmax::masked_softmax(&mut scores, mask, b, self.num_heads, seq);
-        let att = Tensor::from_vec(scores, (b, self.num_heads, seq, seq), q.device())?;
-        att.matmul(v).map_err(Into::into)
+        softmax::masked_softmax(&mut scores, mask, b, self.num_heads, block);
+        let att = Tensor::from_vec(scores, (b, self.num_heads, queries, keys), q.device())?;
+
+        att.matmul(&vb).map_err(Into::into)
     }
 
     /// The same result for a sliding-window layer, without computing the
     /// three quarters of the score matrix the window masks off.
     ///
-    /// Queries are walked in blocks of [`Q_BLOCK`]; a block starting at `qs`
-    /// can only reach keys in `[qs - w, qs + Q_BLOCK - 1 + w]`, so each block
-    /// is a small dense attention over that key span. The masked entries the
-    /// dense path would have computed contribute `exp` of the mask floor —
-    /// around 1e-38 against a normalizer of at least 1 — so dropping them
-    /// moves the result by far less than f32 can represent.
+    /// Queries are walked in blocks of [`Q_BLOCK`], each a small dense
+    /// attention over the keys that block can reach ([`Block::band`]). The
+    /// masked entries the dense path would have computed contribute `exp` of
+    /// the mask floor — around 1e-38 against a normalizer of at least 1 — so
+    /// dropping them moves the result by far less than f32 can represent.
     fn banded(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: &[f32], w: usize) -> Result<Tensor> {
-        let (b, _, seq, _) = q.dims4()?;
+        let seq = q.dim(2)?;
         let mut blocks = Vec::with_capacity(seq.div_ceil(Q_BLOCK));
-
         for q0 in (0..seq).step_by(Q_BLOCK) {
-            let queries = Q_BLOCK.min(seq - q0);
-            let k0 = q0.saturating_sub(w);
-            let keys = (q0 + queries - 1 + w + 1).min(seq) - k0;
-
-            let qb = q.narrow(2, q0, queries)?;
-            let kb = k.narrow(2, k0, keys)?;
-            let vb = v.narrow(2, k0, keys)?;
-
-            let att = qb.matmul(&kb.transpose(D::Minus2, D::Minus1)?)?;
-            let mut scores = att.flatten_all()?.to_vec1::<f32>()?;
-            softmax::masked_softmax_block(
-                &mut scores,
-                mask,
-                b,
-                self.num_heads,
-                softmax::Block {
-                    seq,
-                    q0,
-                    queries,
-                    k0,
-                    keys,
-                },
-            );
-            let att = Tensor::from_vec(scores, (b, self.num_heads, queries, keys), q.device())?;
-            blocks.push(att.matmul(&vb)?);
+            let block = Block::band(seq, q0, Q_BLOCK.min(seq - q0), w);
+            blocks.push(self.attend(q, k, v, mask, block)?);
         }
-
         Tensor::cat(&blocks, 2).map_err(Into::into)
     }
 }
@@ -261,8 +255,10 @@ struct Layer {
     /// Absent on the first layer, which reuses the embedding norm.
     attn_norm: Option<LayerNorm>,
     mlp_norm: LayerNorm,
-    /// Whether this layer attends only within a sliding window.
-    uses_local: bool,
+    /// The sliding window's half-width, or `None` if this layer attends
+    /// globally. Fixed by the config at load time, so the attention path never
+    /// has to be told which kind of layer it is running in.
+    window: Option<usize>,
 }
 
 impl Layer {
@@ -270,7 +266,7 @@ impl Layer {
         vb: VarBuilder,
         cfg: &Config,
         rotary: Arc<RotaryEmbedding>,
-        uses_local: bool,
+        window: Option<usize>,
     ) -> Result<Self> {
         Ok(Self {
             attn: Attention::load(vb.pp("attn"), cfg, rotary)?,
@@ -278,17 +274,11 @@ impl Layer {
             attn_norm: layer_norm_no_bias(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("attn_norm"))
                 .ok(),
             mlp_norm: layer_norm_no_bias(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("mlp_norm"))?,
-            uses_local,
+            window,
         })
     }
 
-    fn forward(
-        &self,
-        xs: &Tensor,
-        global_mask: &[f32],
-        local_mask: &[f32],
-        window: usize,
-    ) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, global_mask: &[f32], local_mask: &[f32]) -> Result<Tensor> {
         let residual = xs.clone();
         let mut h = xs.clone();
         if let Some(norm) = &self.attn_norm {
@@ -297,12 +287,11 @@ impl Layer {
         // `local_mask` already holds `global + local`, combined once in
         // forward_batch — every local layer would otherwise redo the identical
         // broadcast_add, and all but the first are redundant.
-        let (mask, window) = if self.uses_local {
-            (local_mask, Some(window))
-        } else {
-            (global_mask, None)
+        let mask = match self.window {
+            Some(_) => local_mask,
+            None => global_mask,
         };
-        let xs = (residual + self.attn.forward(&h, mask, window)?)?;
+        let xs = (residual + self.attn.forward(&h, mask, self.window)?)?;
         let mlp_out = self.mlp.forward(&xs.apply(&self.mlp_norm)?)?;
         Ok((xs + mlp_out)?)
     }
@@ -342,7 +331,9 @@ pub struct Bf16ModernBert {
     norm: LayerNorm,
     layers: Vec<Layer>,
     final_norm: LayerNorm,
-    local_attention: usize,
+    /// Half of the config's `local_attention`, which is the only form any
+    /// caller wants: the distance a sliding-window query reaches either way.
+    half_window: usize,
     device: Device,
 }
 
@@ -366,10 +357,11 @@ impl Bf16ModernBert {
         let global_rot = Arc::new(RotaryEmbedding::new(cfg, cfg.global_rope_theta, &device)?);
         let local_rot = Arc::new(RotaryEmbedding::new(cfg, cfg.local_rope_theta, &device)?);
 
+        let half_window = cfg.local_attention / 2;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for id in 0..cfg.num_hidden_layers {
-            let uses_local = id % cfg.global_attn_every_n_layers != 0;
-            let rot = if uses_local {
+            let window = (id % cfg.global_attn_every_n_layers != 0).then_some(half_window);
+            let rot = if window.is_some() {
                 local_rot.clone()
             } else {
                 global_rot.clone()
@@ -378,7 +370,7 @@ impl Bf16ModernBert {
                 vb.pp(format!("layers.{id}")),
                 cfg,
                 rot,
-                uses_local,
+                window,
             )?);
         }
         let final_norm =
@@ -389,7 +381,7 @@ impl Bf16ModernBert {
             norm,
             layers,
             final_norm,
-            local_attention: cfg.local_attention,
+            half_window,
             device,
         })
     }
@@ -413,13 +405,13 @@ impl Bf16ModernBert {
         // each of the local layers — and both are handed to the fused softmax
         // as plain slices, so the conversion happens once per forward too.
         let global_mask = padding_bias(&mask)?;
-        let sliding = sliding_window_bias(seq, self.local_attention / 2, &self.device)?;
+        let sliding = sliding_window_bias(seq, self.half_window, &self.device)?;
         let local_mask = global_mask.broadcast_add(&sliding)?;
         let global_mask = global_mask.flatten_all()?.to_vec1::<f32>()?;
         let local_mask = local_mask.flatten_all()?.to_vec1::<f32>()?;
         let mut xs = ids.apply(&self.embeddings)?.apply(&self.norm)?;
         for layer in &self.layers {
-            xs = layer.forward(&xs, &global_mask, &local_mask, self.local_attention / 2)?;
+            xs = layer.forward(&xs, &global_mask, &local_mask)?;
         }
         let out = xs.apply(&self.final_norm)?;
 

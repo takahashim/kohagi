@@ -30,6 +30,7 @@
 pub mod geglu;
 pub mod gemm;
 pub mod modernbert;
+pub mod simd;
 pub mod softmax;
 
 pub use gemm::supported;
