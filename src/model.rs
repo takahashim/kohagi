@@ -27,6 +27,7 @@ use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
 use crate::batch::{l2_normalize, load_tokenizer, pool_row, tokenize_bucket, BatchInput, Pooling};
+use crate::config::CoreMlForm;
 use crate::errors::UnsupportedRequest;
 
 /// Attention-scratch budget per forward, in `rows * seq^2` elements.
@@ -120,20 +121,6 @@ pub enum Backend {
     /// Runs batch=1 per bucket length; unsupported requests fail fast with
     /// [`UnsupportedRequest`] rather than falling back. See [`crate::coreml`].
     CoreML,
-}
-
-/// Which converted form to download when a CoreML Hub repo ships both a
-/// compiled `.mlmodelc` and a portable `.mlpackage` for a bucket. Only affects
-/// [`ModelSource::CoreMlHub`] downloads — a local dir loads whatever is there.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum CoreMlForm {
-    /// The compiled `.mlmodelc` — no per-run compile. Falls back to the
-    /// `.mlpackage` for buckets that only ship one.
-    #[default]
-    Compiled,
-    /// The portable `.mlpackage` — compiled on load, but robust across OS
-    /// versions. Falls back to the `.mlmodelc` for buckets that only ship one.
-    Package,
 }
 
 /// Knobs for [`Embedder::load`]. `Default` matches Ruri v3.

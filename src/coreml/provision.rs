@@ -16,7 +16,7 @@ use objc2::rc::Retained;
 use objc2_core_ml::{MLComputeUnits, MLModel, MLModelConfiguration};
 use objc2_foundation::{NSString, NSURL};
 
-use crate::model::CoreMlForm;
+use crate::config::CoreMlForm;
 
 /// A bucket's two possible on-disk forms: the compiled `.mlmodelc` and the
 /// portable `.mlpackage`.

@@ -8,7 +8,7 @@
 //! converted bucket) — caught before any input is read, so the caller can
 //! retry on `--device cpu`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
@@ -175,10 +175,7 @@ impl Args {
         // a Hub repo — not safetensors.
         if self.device == BackendArg::Coreml {
             if let Some(dir) = self.coreml_dir.clone() {
-                let label = dir.file_name().map_or_else(
-                    || dir.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                );
+                let label = label_of(&dir);
                 return Ok((ModelSource::CoreMl { dir }, label));
             }
             if let Some(repo) = self.coreml_model_id.clone() {
@@ -194,10 +191,7 @@ impl Args {
         let out = match (&self.model_path, &self.tokenizer_path) {
             // clap's `requires` guarantees these two arrive together.
             (Some(model), Some(tokenizer)) => {
-                let label = model.file_name().map_or_else(
-                    || model.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                );
+                let label = label_of(model);
                 let source = ModelSource::Files {
                     model: model.clone(),
                     tokenizer: tokenizer.clone(),
@@ -213,6 +207,14 @@ impl Args {
         };
         Ok(out)
     }
+}
+
+/// A short display label for a model path: its file name, or the full path.
+fn label_of(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 /// `--text` mode: embed the arguments and print the same JSONL that stdio

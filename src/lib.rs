@@ -29,6 +29,7 @@
 mod batch;
 #[cfg(target_arch = "x86_64")]
 pub mod bf16;
+mod config;
 #[cfg(feature = "coreml")]
 mod coreml;
 mod encoder;
@@ -38,5 +39,6 @@ mod model;
 pub mod stdio;
 
 pub use batch::Pooling;
+pub use config::CoreMlForm;
 pub use errors::UnsupportedRequest;
-pub use model::{Backend, CoreMlForm, Embedder, ModelSource, Options, Precision};
+pub use model::{Backend, Embedder, ModelSource, Options, Precision};
