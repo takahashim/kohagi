@@ -18,10 +18,10 @@
 
 use std::sync::Arc;
 
+use crate::encoder::Config;
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{embedding, layer_norm_no_bias, ops::softmax, Embedding, LayerNorm, VarBuilder};
-use candle_transformers::models::modernbert::Config;
 
 use super::gemm::Bf16Linear;
 

@@ -2,6 +2,7 @@
 
 - [`parity_check.py`](parity_check.py) — verify kohagi against the
   sentence-transformers / PyTorch reference.
+- [`benchmark.py`](benchmark.py) — time kohagi against that same reference.
 - [`rails_open3.rb`](rails_open3.rb) — drive kohagi's stdio protocol from
   Ruby/Rails, the pattern any language can copy.
 
@@ -31,8 +32,24 @@ OK: worst 1-cos 5.760e-12 < 1e-09
 
 It exits non-zero on failure (threshold `1e-9` for f32, `1e-3` for bf16), so
 it works as a regression test. Useful flags: `--model-id`, `--prefix`,
-`--max-seq-length`, `--precision`, and `--texts FILE` to use your own corpus
-(one text per line).
+`--max-seq-length`, `--precision`, `--pooling`, and `--texts FILE` to use your
+own corpus (one text per line).
+
+`--pooling` defaults to `model`, meaning each side uses the checkpoint's own
+`1_Pooling` config. Passing `mean` or `cls` forces that mode on both sides,
+which is the only way to exercise a mode the model was not published with —
+ruri-v3 ships as mean, so `--pooling cls` is what covers kohagi's CLS path.
+Both were checked on ruri-v3-130m over 400 mixed-length texts:
+
+| pooling | mean `1 - cosine` | worst |
+|---|---:|---:|
+| mean | 2.9e-13 | 1.7e-12 |
+| cls | 6.6e-13 | 2.1e-12 |
+
+Note that kohagi's own default is `--pooling mean` regardless of what the
+checkpoint says, so a CLS model such as `Alibaba-NLP/gte-modernbert-base`
+needs `--pooling cls` passed explicitly or the vectors will be wrong in a way
+nothing warns you about.
 
 ### What "matching" means
 
@@ -99,6 +116,74 @@ does).
 The elementwise maximum difference does not have this problem — subtracting
 two nearby floats is exact — so it is the more informative number when you
 only have f32 tooling.
+
+---
+
+## `benchmark.py` — how fast, and against what
+
+```bash
+pip install sentence-transformers
+python examples/benchmark.py --kohagi ./target/release/kohagi --kind long
+```
+
+```console
+                   load   encode    total
+kohagi            1.73s   12.00s   13.73s
+torch/mps         9.74s    7.65s   17.51s
+```
+
+Both sides are pinned to kohagi's defaults — mean pooling, L2 normalize,
+`max_seq_length` 512, batch size 64 — and torch runs in a fresh subprocess so
+it pays interpreter startup the same way a real batch job would. Timing it
+in-process would let Python's module cache serve the second
+`import sentence_transformers` for free and hide about 3 seconds.
+
+Useful flags: `--kind short|long`, `--count`, `--runs`, `--device cpu|mps|cuda`,
+`--texts FILE`, `--skip-torch`.
+
+### Measured on an Apple M2
+
+8 cores, 16 GB, macOS 26.3, `ruri-v3-130m` f32 on the CPU, median of three
+runs. 1200 short texts (~30 tokens) or 240 long ones that fill the 512-token
+window. kohagi here is the default CPU backend, not `--device metal`.
+
+| | kohagi | torch/cpu | torch/mps |
+|---|---:|---:|---:|
+| startup + model load | 0.3–0.9 s | 3–4 s | 3–5 s |
+| encode, short | 7.2 s | 8.9 s | 4.2 s |
+| encode, long | 31.5 s | 36.9 s | 24.3 s |
+| **total, short** | 7.5 s | 11.7 s | 7.4 s |
+| **total, long** | 32.3 s | 40.7 s | 28.6 s |
+
+Absolute figures drift substantially across sessions on this laptop as it
+warms up, and torch's load time depends on whether the model is already in the
+OS file cache. Treat the ratios as the result and the seconds as indicative,
+and run it yourself before making a decision on it.
+
+Two things the table says:
+
+- **On CPU, compute is a wash** — kohagi is within about 15% of torch/cpu
+  either way. Accelerate and PyTorch call comparable sgemm, which is the
+  expected outcome, not a surprising one.
+- **The end-to-end win is startup.** torch spends several seconds loading
+  before embedding anything; kohagi spends well under one. That gap is what
+  makes a per-invocation subprocess practical, and it is why kohagi ties
+  torch/mps on short totals despite the GPU being twice as fast at the encode.
+
+### Where kohagi loses
+
+At the encode itself, torch/mps is roughly twice as fast — it runs on the
+Apple GPU while the table's kohagi column is the CPU. On long totals it already
+comes out ahead (28.6 s vs 32.3 s), because at 512 tokens the compute gap
+outgrows kohagi's startup lead. A `--features metal` build closes most of that
+(see the top-level README), but a warm, long-lived torch/mps service still
+out-throughputs a process spawned per batch once the corpus is large enough.
+
+So the honest framing is not "kohagi is faster than PyTorch". It is that
+kohagi has nothing to amortize. If you spawn a process per batch — a rake
+task, a cron job, a queue worker handling a few hundred records — that is the
+number that matters. If you run a long-lived Python service that loads the
+model once and embeds continuously, torch on MPS will out-throughput it.
 
 ---
 

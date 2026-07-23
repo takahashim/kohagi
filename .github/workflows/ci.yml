@@ -27,6 +27,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
+      # The Metal backend (src/fused.rs, the encoder's Metal paths) is macOS-only
+      # and compiles out otherwise, so nothing above ever type-checks it. Lint it
+      # on the macOS runner. It cannot run — GitHub's macOS runners have no GPU —
+      # so this builds and lints but does not execute the kernel.
+      - if: runner.os == 'macOS'
+        run: cargo clippy --locked --all-targets --features metal -- -D warnings
 
   # Release binaries: Apple Silicon macOS and x86_64 Linux. Uploaded as
   # artifacts on every push; attached to the GitHub Release on v* tags.

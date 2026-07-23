@@ -31,7 +31,7 @@ import subprocess
 import sys
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, models
 
 SAMPLE_TEXTS = [
     "瑠璃も玻璃も照らせば光る",
@@ -49,6 +49,13 @@ def main() -> int:
     p.add_argument("--prefix", default="検索文書: ")
     p.add_argument("--max-seq-length", type=int, default=512)
     p.add_argument("--precision", default="f32", choices=["f32", "bf16"])
+    p.add_argument(
+        "--pooling",
+        default="model",
+        choices=["model", "mean", "cls"],
+        help="'model' uses the checkpoint's own 1_Pooling config on both sides; "
+        "'mean'/'cls' force that mode on both sides instead",
+    )
     p.add_argument("--texts", help="file with one text per line (default: built-in samples)")
     args = p.parse_args()
 
@@ -61,16 +68,16 @@ def main() -> int:
     stdin = "".join(
         json.dumps({"id": i, "text": t}, ensure_ascii=False) + "\n" for i, t in enumerate(texts)
     )
-    proc = subprocess.run(
-        [
-            args.kohagi,
-            "--model-id", args.model_id,
-            "--prefix", args.prefix,
-            "--max-seq-length", str(args.max_seq_length),
-            "--precision", args.precision,
-        ],
-        input=stdin, capture_output=True, text=True,
-    )
+    cmd = [
+        args.kohagi,
+        "--model-id", args.model_id,
+        "--prefix", args.prefix,
+        "--max-seq-length", str(args.max_seq_length),
+        "--precision", args.precision,
+    ]
+    if args.pooling != "model":
+        cmd += ["--pooling", args.pooling]
+    proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
     if proc.returncode == 1:
         sys.stderr.write(proc.stderr)
         return 1
@@ -78,7 +85,15 @@ def main() -> int:
     mine = np.array([got[i] for i in range(len(texts))], dtype=np.float64)
 
     # --- the reference -------------------------------------------------------
-    model = SentenceTransformer(args.model_id)
+    if args.pooling == "model":
+        model = SentenceTransformer(args.model_id)
+    else:
+        # Rebuild the stack so the pooling mode is ours rather than the
+        # checkpoint's, which is the only way to exercise a mode the model was
+        # not published with.
+        body = models.Transformer(args.model_id, max_seq_length=args.max_seq_length)
+        head = models.Pooling(body.get_word_embedding_dimension(), pooling_mode=args.pooling)
+        model = SentenceTransformer(modules=[body, head])
     model.max_seq_length = args.max_seq_length  # match kohagi's truncation
     ref = model.encode(
         [args.prefix + t for t in texts],
@@ -90,6 +105,7 @@ def main() -> int:
     cos = (ref * mine).sum(1) / (np.linalg.norm(ref, axis=1) * np.linalg.norm(mine, axis=1))
     worst = 1 - cos.min()
     print(f"model      : {args.model_id} ({ref.shape[1]} dims, {args.precision})")
+    print(f"pooling    : {args.pooling}")
     print(f"texts      : {len(texts)}")
     print(f"mean 1-cos : {1 - cos.mean():.3e}")
     print(f"worst 1-cos: {worst:.3e}")
