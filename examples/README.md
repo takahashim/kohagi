@@ -73,8 +73,14 @@ between kohagi and PyTorch is roughly five orders of magnitude smaller than
 what the storage format can hold — it disappears the moment you save it.
 
 `--precision bf16` is a deliberate tradeoff and sits well above this, at
-`1 - cosine ≈ 2e-5` (worst 9e-5). Still negligible for ranking, but it is a
+`1 - cosine ≈ 2e-6` (worst 2e-5). Still negligible for ranking, but it is a
 real difference rather than rounding.
+
+Measured against kohagi's own f32 output over 120 short and 120 long texts,
+which is the same comparison to within the `1e-12` that separates kohagi's f32
+from PyTorch. The figure used to be an order of magnitude larger; fusing the
+mask into the softmax removed a rounding step that the separate `broadcast_add`
+had been introducing.
 
 ### Three settings that must match
 

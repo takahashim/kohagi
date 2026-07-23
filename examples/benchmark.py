@@ -61,6 +61,8 @@ def time_kohagi(binary: str, texts: list[str], args) -> dict:
         for i, t in enumerate(texts)
     )
     cmd = [binary, "--model-id", args.model_id, "--max-seq-length", str(args.max_seq_length)]
+    if args.precision != "f32":
+        cmd += ["--precision", args.precision]
 
     # A 2-record run is almost entirely startup plus model load, so it
     # isolates the fixed cost that the full run also pays.
@@ -120,6 +122,13 @@ def main() -> int:
     p.add_argument("--runs", type=int, default=3)
     p.add_argument("--texts", help="file with one text per line")
     p.add_argument("--device", default="cpu", help="PyTorch device: cpu, mps, cuda")
+    p.add_argument(
+        "--precision",
+        choices=["f32", "bf16"],
+        default="f32",
+        help="kohagi's --precision; bf16 needs an AVX512-BF16 CPU. torch stays f32, "
+        "so a bf16 run compares kohagi against itself, not against the reference.",
+    )
     p.add_argument("--skip-torch", action="store_true")
     args = p.parse_args()
 
@@ -129,7 +138,7 @@ def main() -> int:
     else:
         texts = synth(args.kind, args.count or (1200 if args.kind == "short" else 240))
 
-    print(f"model      : {args.model_id}")
+    print(f"model      : {args.model_id} ({args.precision})")
     print(f"texts      : {len(texts)} ({args.texts or args.kind})")
     print(f"runs       : {args.runs} (median reported)\n")
 

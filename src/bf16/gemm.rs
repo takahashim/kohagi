@@ -38,14 +38,7 @@ pub const NC_COLS: usize = 256;
 
 /// Whether this CPU has the instructions the kernel needs.
 pub fn supported() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bf16")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
+    super::simd::has_avx512bf16()
 }
 
 /// Convert activations `X[rows, cols]` to row-major bf16, padding columns to a
