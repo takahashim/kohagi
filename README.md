@@ -135,37 +135,23 @@ The speedups live in kohagi's own copy of the ModernBERT encoder
 
 ### `--device coreml` on the Apple Neural Engine
 
-Building with `--features coreml` adds an Apple Neural Engine (ANE) backend via
-CoreML. On an M2 it runs about **4× faster than the Metal path at 512 tokens** —
-Ruri v3's retrieval sweet spot — at cosine ≈ 0.99999 against the CPU output.
-Short texts still favour the multicore CPU path, so this is a specialised
-fast path rather than a universal upgrade.
+Build with `--features coreml` to enable the Core ML backend for the Apple
+Neural Engine (ANE). On an M2, it is about 4× faster than Metal at 512
+tokens, with cosine similarity of approximately 0.99999 against the CPU
+output. For short inputs, the multicore CPU backend may still be faster.
 
-The ANE needs a *fixed-shape, batch=1* model, so it cannot run arbitrary
-safetensors. Convert the model first with
-[`scripts/convert_coreml.py`](scripts/convert_coreml.py), which emits one
-`seq-<N>.mlpackage` per bucket length plus `tokenizer.json` and `config.json`:
+
+Run a local converted model with:
 
 ```bash
 kohagi --device coreml --coreml-dir models/ruri-v3-130m-coreml < texts.jsonl
-# or, from a Hugging Face repo holding the same layout:
-kohagi --device coreml --coreml-model-id <user>/ruri-v3-130m-coreml < texts.jsonl
 ```
 
-A `.mlpackage` is compiled to a `.mlmodelc` when loaded, which costs a few
-seconds per bucket on every run. To skip that, convert with `--compiled` (also
-emits `compiled/seq-<N>.mlmodelc`) and ship both: kohagi then loads the
-`.mlmodelc` directly and falls back to compiling the `.mlpackage` only if the
-compiled form is missing or fails to load (e.g. built for a different OS). When
-a Hub repo carries both forms, only the preferred one is downloaded — the
-compiled form by default, or the package with `--coreml-prefer package`.
+Or load the same directory layout from Hugging Face Hub:
 
-Tokenization, prefixing, pooling, and normalization stay in Rust; CoreML only
-replaces the encoder forward, so the output matches the CPU path. Because the
-ANE only has the bucket lengths that were converted, requests it cannot serve
-(built without the feature, no model given, or `--max-seq-length` beyond the
-largest bucket) fail fast at startup with **exit code 3** — no automatic
-fallback, so a caller can catch it and retry on `--device cpu`.
+```bash
+kohagi --device coreml --coreml-model-id takahashim/ruri-v3-130m-coreml < texts.jsonl
+```
 
 ### `--precision bf16` on AVX512-BF16 CPUs
 
