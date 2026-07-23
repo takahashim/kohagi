@@ -1468,11 +1468,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "candle-metal-kernels",
  "candle-nn",
  "clap",
  "half",
  "hf-hub",
  "num_cpus",
+ "objc2-metal",
  "rayon",
  "serde",
  "serde_json",

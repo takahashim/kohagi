@@ -30,6 +30,7 @@ mod batch;
 #[cfg(target_arch = "x86_64")]
 pub mod bf16;
 mod encoder;
+mod fused;
 mod model;
 pub mod stdio;
 

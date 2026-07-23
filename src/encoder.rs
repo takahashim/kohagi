@@ -235,15 +235,18 @@ fn layer_norm_fused(size: usize, eps: f64, vb: VarBuilder) -> Result<LayerNorm> 
     Ok(LayerNorm::new(weight, bias, eps))
 }
 
+/// How the `Wi` projection is stored, which differs by backend — see
+/// [`ModernBertMLP::load`].
+#[derive(Clone)]
+enum Wi {
+    Wide(Linear),
+    Split { gate: Linear, up: Linear },
+}
+
 #[derive(Clone)]
 pub struct ModernBertMLP {
-    // Wi is stored pre-split. A single Wi followed by chunk(2, last) leaves both
-    // halves as strided views, and elementwise work on those runs 6-8x slower on
-    // Metal than on contiguous memory — enough that the GeGLU costs more than
-    // both GEMMs. Splitting the weight once at load makes each half its own
-    // tensor, so gelu and the product stay contiguous.
-    wi_gate: Linear,
-    wi_up: Linear,
+    wi: Wi,
+    inter: usize,
     wo: Linear,
 }
 
@@ -254,22 +257,35 @@ impl ModernBertMLP {
             config.intermediate_size * 2,
             vb.pp("Wi"),
         )?;
-        // Linear weights are [out, in]; the chunk this replaces split the
-        // output axis, so the same split applies to rows here.
-        let w = wi.weight();
         let inter = config.intermediate_size;
-        let wi_gate = Linear::new(w.narrow(0, 0, inter)?.contiguous()?, None);
-        let wi_up = Linear::new(w.narrow(0, inter, inter)?.contiguous()?, None);
+        let wi = if vb.device().is_metal() {
+            // Metal keeps Wi wide: one matmul, and the fused kernel reads both
+            // halves of [tokens, 2*inter] straight out. Splitting would add a
+            // second matmul and a chunk copy for no gain there.
+            Wi::Wide(wi)
+        } else {
+            // Linear weights are [out, in]; the fused Wi concatenates gate and
+            // up along the output axis, so the split is by rows. The CPU has no
+            // fused kernel and its elementwise path is slower on the strided
+            // views a chunk would leave, so it takes two contiguous matmuls.
+            let w = wi.weight();
+            Wi::Split {
+                gate: Linear::new(w.narrow(0, 0, inter)?.contiguous()?, None),
+                up: Linear::new(w.narrow(0, inter, inter)?.contiguous()?, None),
+            }
+        };
         let wo = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("Wo"))?;
-        Ok(Self { wi_gate, wi_up, wo })
+        Ok(Self { wi, inter, wo })
     }
 }
 
 impl Module for ModernBertMLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = xs.apply(&self.wi_gate)?;
-        let up = xs.apply(&self.wi_up)?;
-        (gate.gelu_erf()? * up)?.apply(&self.wo) // GeGLU
+        let gated = match &self.wi {
+            Wi::Wide(wi) => crate::fused::geglu(&xs.apply(wi)?, self.inter)?,
+            Wi::Split { gate, up } => (xs.apply(gate)?.gelu_erf()? * xs.apply(up)?)?,
+        };
+        gated.apply(&self.wo)
     }
 }
 
@@ -320,8 +336,11 @@ impl ModernBertLayer {
             xs = xs.apply(norm)?;
         }
 
+        // `local_attention_mask` already holds `global + local` (combined once
+        // in ModernBert::forward, since every local layer would otherwise redo
+        // the same broadcast_add — 12 of 13 of them redundant).
         let attention_mask = if self.uses_local_attention {
-            &global_attention_mask.broadcast_add(local_attention_mask)?
+            local_attention_mask
         } else {
             global_attention_mask
         };
@@ -442,8 +461,12 @@ impl ModernBert {
         let seq_len = xs.shape().dims()[1];
         let global_attention_mask =
             prepare_4d_attention_mask(mask, DType::F32, None)?.to_device(xs.device())?;
-        let local_attention_mask =
+        // Combined once here rather than in each of the 13 local layers: the
+        // sliding-window mask and the padding mask are identical across layers,
+        // so their sum is too.
+        let sliding =
             get_local_attention_mask(seq_len, self.local_attention_size / 2, xs.device())?;
+        let local_attention_mask = global_attention_mask.broadcast_add(&sliding)?;
         let mut xs = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
         for layer in self.layers.iter() {
             xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask)?;
