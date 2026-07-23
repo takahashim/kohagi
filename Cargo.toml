@@ -39,7 +39,7 @@ objc2-metal = { version = "0.3", optional = true }
 # Only for the `coreml` feature: drives the Apple Neural Engine through CoreML
 # instead of candle. macOS-only (kept as plain optional deps, like the metal
 # crates above, since they only build when the feature is enabled). See
-# src/coreml.rs and notes/coreml-feasibility.md.
+# src/coreml.rs.
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true, features = [
     "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue", "NSError",
@@ -65,7 +65,7 @@ metal = [
 
 # Apple Neural Engine via CoreML: `cargo build --release --features coreml`,
 # then `kohagi --device coreml --coreml-dir <dir>`. macOS-only. Runs pre-
-# converted, fixed-shape ModernBERT models (batch=1) — see notes/coreml-*.md.
+# converted, fixed-shape ModernBERT models (batch=1) — see src/coreml.rs.
 coreml = [
     "dep:objc2",
     "dep:objc2-foundation",

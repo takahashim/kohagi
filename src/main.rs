@@ -109,10 +109,15 @@ struct Args {
     #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
     device: BackendArg,
     /// Directory of pre-converted CoreML models for `--device coreml`: one
-    /// `seq-<N>.mlmodelc` per bucket length, plus tokenizer.json and
-    /// config.json. See notes/coreml-feasibility.md.
+    /// `seq-<N>.mlpackage` per bucket length, plus tokenizer.json and
+    /// config.json. Produce one with scripts/convert_coreml.py.
     #[arg(long)]
     coreml_dir: Option<PathBuf>,
+    /// Hugging Face repo holding the CoreML models (same layout as
+    /// --coreml-dir), downloaded and cached on first use. Alternative to
+    /// --coreml-dir for `--device coreml`; --coreml-dir wins if both are set.
+    #[arg(long)]
+    coreml_model_id: Option<String>,
     /// Skip L2 normalization (normalized output is the default; unit vectors
     /// make dot product = cosine).
     #[arg(long)]
@@ -143,18 +148,25 @@ impl Args {
 
     /// Where to load the model from, plus the name to show in the summary.
     fn source(&self) -> anyhow::Result<(ModelSource, String)> {
-        // CoreML loads a directory of fixed-shape models, not safetensors.
+        // CoreML loads pre-converted fixed-shape models — a local directory or
+        // a Hub repo — not safetensors.
         if self.device == BackendArg::Coreml {
-            let dir = self.coreml_dir.clone().ok_or_else(|| {
-                kohagi::UnsupportedRequest(
-                    "`--device coreml` requires `--coreml-dir <DIR>`".to_string(),
-                )
-            })?;
-            let label = dir.file_name().map_or_else(
-                || dir.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            return Ok((ModelSource::CoreMl { dir }, label));
+            if let Some(dir) = self.coreml_dir.clone() {
+                let label = dir.file_name().map_or_else(
+                    || dir.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                return Ok((ModelSource::CoreMl { dir }, label));
+            }
+            if let Some(repo) = self.coreml_model_id.clone() {
+                let label = repo.clone();
+                return Ok((ModelSource::CoreMlHub { repo }, label));
+            }
+            return Err(kohagi::UnsupportedRequest(
+                "`--device coreml` requires `--coreml-dir <DIR>` or `--coreml-model-id <REPO>`"
+                    .to_string(),
+            )
+            .into());
         }
         let out = match (&self.model_path, &self.tokenizer_path) {
             // clap's `requires` guarantees these two arrive together.

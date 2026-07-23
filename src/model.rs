@@ -74,9 +74,14 @@ pub enum ModelSource {
     /// `config.json` expected next to the weights. No network access.
     Files { model: PathBuf, tokenizer: PathBuf },
     /// A directory of pre-converted CoreML models for [`Backend::CoreML`]:
-    /// one `seq-<N>.mlmodelc` per bucket length, plus `tokenizer.json` and
+    /// one `seq-<N>.mlpackage` per bucket length, plus `tokenizer.json` and
     /// `config.json`. Only valid with `--device coreml`.
     CoreMl { dir: PathBuf },
+    /// A Hugging Face Hub repo holding the same CoreML layout (the
+    /// `seq-<N>.mlpackage` buckets plus `tokenizer.json` / `config.json`),
+    /// downloaded into the standard HF cache. Only valid with `--device
+    /// coreml`.
+    CoreMlHub { repo: String },
 }
 
 /// Numeric precision of the forward pass.
@@ -205,9 +210,9 @@ impl Embedder {
         let (model_path, tokenizer_path) = match source {
             ModelSource::Files { model, tokenizer } => (model.clone(), tokenizer.clone()),
             ModelSource::Hub { repo } => fetch_from_hub(repo)?,
-            ModelSource::CoreMl { .. } => {
+            ModelSource::CoreMl { .. } | ModelSource::CoreMlHub { .. } => {
                 return Err(UnsupportedRequest::new(
-                    "a CoreML model directory needs `--device coreml`",
+                    "a CoreML model source needs `--device coreml`",
                 )
                 .into())
             }
@@ -243,10 +248,12 @@ impl Embedder {
     #[cfg(feature = "coreml")]
     fn load_coreml(source: &ModelSource, opts: Options) -> Result<Self> {
         let dir = match source {
-            ModelSource::CoreMl { dir } => dir,
+            ModelSource::CoreMl { dir } => dir.clone(),
+            ModelSource::CoreMlHub { repo } => fetch_coreml_from_hub(repo)?,
             _ => {
                 return Err(UnsupportedRequest::new(
-                    "`--device coreml` needs a CoreML model directory (`--coreml-dir`)",
+                    "`--device coreml` needs a CoreML model directory (`--coreml-dir`) \
+                     or Hub repo (`--coreml-model-id`)",
                 )
                 .into())
             }
@@ -254,7 +261,7 @@ impl Embedder {
 
         let config: Config = read_config(&dir.join("config.json"))?;
         let dim = config.hidden_size;
-        let encoder = crate::coreml::CoreMlEncoder::load(dir, dim)?;
+        let encoder = crate::coreml::CoreMlEncoder::load(&dir, dim)?;
 
         // The ANE only has the bucket lengths that were converted. Every input
         // is truncated to max_seq_length, so if that fits the largest bucket
@@ -462,6 +469,32 @@ fn fetch_from_hub(repo: &str) -> Result<(PathBuf, PathBuf)> {
     get("config.json")?; // lands next to the weights in the cache
     let tokenizer = get("tokenizer.json")?;
     Ok((model, tokenizer))
+}
+
+/// Download a CoreML model repo (the `seq-<N>.mlpackage` buckets plus
+/// `tokenizer.json` / `config.json`) into the HF cache and return the snapshot
+/// directory. Each `.mlpackage` is a directory of files, so we fetch every
+/// sibling and let the cache reconstruct the tree — `config.json`'s parent is
+/// the common root.
+#[cfg(feature = "coreml")]
+fn fetch_coreml_from_hub(repo: &str) -> Result<PathBuf> {
+    let api = hf_hub::api::sync::Api::new().context("initializing Hugging Face Hub client")?;
+    let handle = api.model(repo.to_string());
+    let info = handle
+        .info()
+        .with_context(|| format!("querying {repo} on the Hugging Face Hub"))?;
+    for sibling in &info.siblings {
+        handle
+            .get(&sibling.rfilename)
+            .with_context(|| format!("fetching {} from {repo}", sibling.rfilename))?;
+    }
+    let config = handle
+        .get("config.json")
+        .with_context(|| format!("{repo} has no config.json"))?;
+    config
+        .parent()
+        .map(Path::to_path_buf)
+        .context("downloaded config.json has no parent directory")
 }
 
 fn load_weights(

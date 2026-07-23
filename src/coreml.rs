@@ -3,10 +3,10 @@
 //! Unlike the CPU and Metal paths (which run candle's [`ModernBert`] over
 //! bucketed batches), the ANE wants one thing: a *fixed-shape, batch=1*
 //! forward. Batching collapses ANE throughput by ~18x, and flexible
-//! (enumerated) input shapes disable the ANE compute plan entirely (see
-//! `notes/coreml-feasibility.md`). So this backend loads a **set of
-//! pre-converted, fixed-length models** — one `.mlmodelc` per bucket length,
-//! e.g. `seq-128 / seq-256 / seq-512` — and routes each text to the smallest
+//! (enumerated) input shapes disable the ANE compute plan entirely. So this
+//! backend loads a **set of
+//! pre-converted, fixed-length models** — one `seq-<N>.mlpackage` per bucket
+//! length, e.g. `seq-128 / seq-256 / seq-512` — and routes each text to the smallest
 //! bucket that fits, padded to that exact length, one row per prediction.
 //!
 //! Everything else — tokenization, prefixing, pooling, L2 normalization — stays
@@ -46,8 +46,8 @@ pub struct CoreMlEncoder {
 }
 
 impl CoreMlEncoder {
-    /// Load every `seq-<N>.mlmodelc` in `dir`, pinned to the Neural Engine.
-    /// `dim` is the model's hidden size (from `config.json`).
+    /// Load every `seq-<N>.mlpackage` (or `.mlmodelc`) in `dir`, pinned to the
+    /// Neural Engine. `dim` is the model's hidden size (from `config.json`).
     pub fn load(dir: &Path, dim: usize) -> Result<Self> {
         let mut buckets = Vec::new();
         for entry in std::fs::read_dir(dir)
@@ -63,8 +63,8 @@ impl CoreMlEncoder {
         }
         if buckets.is_empty() {
             return Err(UnsupportedRequest::new(format!(
-                "no `seq-<N>.mlmodelc` bucket models found in {} — CoreML needs \
-                 pre-converted fixed-shape models (see notes/coreml-feasibility.md)",
+                "no `seq-<N>.mlpackage` bucket models found in {} — CoreML needs \
+                 pre-converted fixed-shape models (see scripts/convert_coreml.py)",
                 dir.display()
             ))
             .into());
@@ -136,10 +136,13 @@ impl CoreMlEncoder {
     }
 }
 
-/// Parse a `seq-<N>.mlmodelc` directory name into its bucket length.
+/// Parse a `seq-<N>.mlpackage` / `seq-<N>.mlmodelc` name into its bucket
+/// length. `.mlpackage` is the portable artifact we distribute; `.mlmodelc` is
+/// its already-compiled form, accepted so a local dir can hold either.
 fn bucket_seq_of(path: &Path) -> Option<usize> {
-    if path.extension().and_then(|e| e.to_str()) != Some("mlmodelc") {
-        return None;
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("mlpackage") | Some("mlmodelc") => {}
+        _ => return None,
     }
     path.file_stem()
         .and_then(|s| s.to_str())
@@ -147,15 +150,29 @@ fn bucket_seq_of(path: &Path) -> Option<usize> {
         .and_then(|n| n.parse::<usize>().ok())
 }
 
-/// Load one compiled `.mlmodelc`, pinned to CPU+ANE.
+/// Load one model, pinned to CPU+ANE. A `.mlpackage` is compiled to a
+/// (temporary) `.mlmodelc` first; a `.mlmodelc` is loaded directly.
 fn load_model(path: &Path) -> Result<Retained<MLModel>> {
     unsafe {
-        let url = NSURL::fileURLWithPath(&NSString::from_str(
+        let src = NSURL::fileURLWithPath(&NSString::from_str(
             path.to_str().context("model path is not valid UTF-8")?,
         ));
+        // MLModel can only open a compiled .mlmodelc; compile packages on load.
+        let compiled;
+        let url = if path.extension().and_then(|e| e.to_str()) == Some("mlpackage") {
+            // The async compileModelAtURL:completionHandler: is the current API,
+            // but the synchronous one is simpler and fine for a batch CLI.
+            #[allow(deprecated)]
+            let c = MLModel::compileModelAtURL_error(&src)
+                .map_err(|e| anyhow::anyhow!("compiling {}: {e}", path.display()))?;
+            compiled = c;
+            &*compiled
+        } else {
+            &*src
+        };
         let config = MLModelConfiguration::new();
         config.setComputeUnits(MLComputeUnits::CPUAndNeuralEngine);
-        MLModel::modelWithContentsOfURL_configuration_error(&url, &config)
+        MLModel::modelWithContentsOfURL_configuration_error(url, &config)
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }

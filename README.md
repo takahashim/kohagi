@@ -133,6 +133,32 @@ The speedups live in kohagi's own copy of the ModernBERT encoder
 ([`src/encoder.rs`](src/encoder.rs)), so they apply to any build, including
 `cargo install`. It is off by default only because it is macOS-only.
 
+### `--device coreml` on the Apple Neural Engine
+
+Building with `--features coreml` adds an Apple Neural Engine (ANE) backend via
+CoreML. On an M2 it runs about **4× faster than the Metal path at 512 tokens** —
+Ruri v3's retrieval sweet spot — at cosine ≈ 0.99999 against the CPU output.
+Short texts still favour the multicore CPU path, so this is a specialised
+fast path rather than a universal upgrade.
+
+The ANE needs a *fixed-shape, batch=1* model, so it cannot run arbitrary
+safetensors. Convert the model first with
+[`scripts/convert_coreml.py`](scripts/convert_coreml.py), which emits one
+`seq-<N>.mlpackage` per bucket length plus `tokenizer.json` and `config.json`:
+
+```bash
+kohagi --device coreml --coreml-dir models/ruri-v3-130m-coreml < texts.jsonl
+# or, from a Hugging Face repo holding the same layout:
+kohagi --device coreml --coreml-model-id <user>/ruri-v3-130m-coreml < texts.jsonl
+```
+
+Tokenization, prefixing, pooling, and normalization stay in Rust; CoreML only
+replaces the encoder forward, so the output matches the CPU path. Because the
+ANE only has the bucket lengths that were converted, requests it cannot serve
+(built without the feature, no model given, or `--max-seq-length` beyond the
+largest bucket) fail fast at startup with **exit code 3** — no automatic
+fallback, so a caller can catch it and retry on `--device cpu`.
+
 ### `--precision bf16` on AVX512-BF16 CPUs
 
 On Zen 4 (Sapphire Rapids) and newer CPUs, `--precision bf16` uses `bf16` for projection layers while keeping normalization, softmax, and attention scores in `f32`.
