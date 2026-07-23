@@ -2,9 +2,11 @@
 //!
 //! Structurally a port of candle-transformers' `modernbert.rs`, with the four
 //! projection `Linear`s — attention `Wqkv` and `Wo`, MLP `Wi` and `Wo` — run
-//! through the bf16 kernel in [`super::gemm`]. Everything else (embeddings,
-//! LayerNorm, rotary embeddings, attention scores, softmax, GeGLU, residuals)
-//! stays f32 in candle.
+//! through the bf16 kernel in [`super::gemm`]. Two more stages leave candle
+//! without changing precision: the attention mask and softmax fuse into
+//! [`super::softmax`], and the GELU gate into [`super::geglu`], both f32 in
+//! and f32 out. Everything else (embeddings, LayerNorm, rotary embeddings,
+//! attention scores, residuals) is candle's.
 //!
 //! That split mirrors what `torch.autocast(bf16)` does, and it is why accuracy
 //! holds up: the reduced-precision inputs only affect the projections, and
@@ -12,18 +14,21 @@
 //! noise. End to end the embeddings land at cosine ≈ 0.99999 against the f32
 //! path — well inside the noise floor for retrieval ranking.
 //!
-//! Since only the projections change, this is *not* a general speedup: it wins
-//! on short inputs, where the projections dominate, and fades on long ones,
-//! where f32 attention (quadratic in sequence length) takes over.
+//! Since only the projections change precision, this is *not* a uniform
+//! speedup: it wins most on short inputs, where the projections dominate, and
+//! less on long ones, where the f32 attention matmuls — quadratic in sequence
+//! length — take over.
 
 use std::sync::Arc;
 
 use crate::encoder::Config;
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor, D};
-use candle_nn::{embedding, layer_norm_no_bias, ops::softmax, Embedding, LayerNorm, VarBuilder};
+use candle_nn::{embedding, layer_norm_no_bias, Embedding, LayerNorm, VarBuilder};
 
+use super::geglu;
 use super::gemm::Bf16Linear;
+use super::softmax;
 
 /// Apply a bf16 `Linear` to a tensor whose last dimension is the Linear's
 /// input width, flattening the leading dimensions into GEMM rows.
@@ -102,7 +107,7 @@ impl Attention {
         })
     }
 
-    fn forward(&self, xs: &Tensor, attn_mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, attn_mask: &[f32]) -> Result<Tensor> {
         let (b, seq, d) = xs.dims3()?;
         let qkv = apply(&self.qkv, xs)?
             .reshape((b, seq, 3, self.num_heads, self.head_size))?
@@ -113,7 +118,14 @@ impl Attention {
         // Scores, mask, and softmax stay f32 — the precision-sensitive part.
         let q = (q * (self.head_size as f64).powf(-0.5))?;
         let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-        let att = softmax(&att.broadcast_add(attn_mask)?, D::Minus1)?;
+
+        // The mask add and the softmax are fused (see `super::softmax`), which
+        // is why the mask arrives as a flat `[b, seq, seq]` slice rather than a
+        // tensor to broadcast against.
+        let mut scores = att.flatten_all()?.to_vec1::<f32>()?;
+        softmax::masked_softmax(&mut scores, attn_mask, b, self.num_heads, seq);
+        let att = Tensor::from_vec(scores, (b, self.num_heads, seq, seq), xs.device())?;
+
         let xs = att.matmul(&v)?.transpose(1, 2)?.reshape((b, seq, d))?;
         apply(&self.proj, &xs)
     }
@@ -133,11 +145,24 @@ impl Mlp {
     }
 
     /// GeGLU: `Wi` produces two halves, one gated by the other's GELU.
+    ///
+    /// Both GEMMs and the gating run on plain `Vec<f32>`, so the whole MLP
+    /// costs one copy in and one out. Going through tensors instead would
+    /// allocate three more `[tokens, inter]` intermediates per layer, for the
+    /// chunk, the GELU and the multiply.
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = apply(&self.wi, xs)?;
-        let chunks = xs.chunk(2, D::Minus1)?;
-        let gated = (chunks[0].gelu_erf()? * &chunks[1])?;
-        apply(&self.wo, &gated)
+        let dims = xs.dims().to_vec();
+        debug_assert_eq!(*dims.last().unwrap(), self.wi.k);
+        let rows: usize = dims[..dims.len() - 1].iter().product();
+
+        let xv = xs.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+        let wide = self.wi.forward(&xv, rows);
+        let gated = geglu::geglu(&wide, rows, self.wo.k);
+        let y = self.wo.forward(&gated, rows);
+
+        let mut out_dims = dims;
+        *out_dims.last_mut().unwrap() = self.wo.n;
+        Tensor::from_vec(y, out_dims, xs.device()).map_err(Into::into)
     }
 }
 
@@ -168,18 +193,21 @@ impl Layer {
         })
     }
 
-    fn forward(&self, xs: &Tensor, global_mask: &Tensor, local_mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, global_mask: &[f32], local_mask: &[f32]) -> Result<Tensor> {
         let residual = xs.clone();
         let mut h = xs.clone();
         if let Some(norm) = &self.attn_norm {
             h = h.apply(norm)?;
         }
+        // `local_mask` already holds `global + local`, combined once in
+        // forward_batch — every local layer would otherwise redo the identical
+        // broadcast_add, and all but the first are redundant.
         let mask = if self.uses_local {
-            global_mask.broadcast_add(local_mask)?
+            local_mask
         } else {
-            global_mask.clone()
+            global_mask
         };
-        let xs = (residual + self.attn.forward(&h, &mask)?)?;
+        let xs = (residual + self.attn.forward(&h, mask)?)?;
         let mlp_out = self.mlp.forward(&xs.apply(&self.mlp_norm)?)?;
         Ok((xs + mlp_out)?)
     }
@@ -285,8 +313,15 @@ impl Bf16ModernBert {
         let ids = Tensor::from_vec(ids_u, (batch, seq), &self.device)?;
         let mask = Tensor::from_vec(mask_u, (batch, seq), &self.device)?;
 
+        // The sliding-window bias and the padding bias are both identical
+        // across layers, so their sum is computed once here rather than in
+        // each of the local layers — and both are handed to the fused softmax
+        // as plain slices, so the conversion happens once per forward too.
         let global_mask = padding_bias(&mask)?;
-        let local_mask = sliding_window_bias(seq, self.local_attention / 2, &self.device)?;
+        let sliding = sliding_window_bias(seq, self.local_attention / 2, &self.device)?;
+        let local_mask = global_mask.broadcast_add(&sliding)?;
+        let global_mask = global_mask.flatten_all()?.to_vec1::<f32>()?;
+        let local_mask = local_mask.flatten_all()?.to_vec1::<f32>()?;
         let mut xs = ids.apply(&self.embeddings)?.apply(&self.norm)?;
         for layer in &self.layers {
             xs = layer.forward(&xs, &global_mask, &local_mask)?;
