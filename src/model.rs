@@ -45,6 +45,9 @@ fn rows_per_forward(seq: usize, backend: Backend) -> usize {
     let budget = match backend {
         Backend::Cpu => ATTN_BUDGET,
         Backend::Metal => METAL_ATTN_BUDGET,
+        // CoreML runs its own fixed-shape, batch=1 path (see embed_coreml) and
+        // never reaches the candle memory-budget splitter.
+        Backend::CoreML => unreachable!("CoreML does not use the candle attention budget"),
     };
     (budget / (seq * seq).max(1)).max(1)
 }
@@ -70,6 +73,10 @@ pub enum ModelSource {
     /// Local files: the safetensors weights and tokenizer.json, with
     /// `config.json` expected next to the weights. No network access.
     Files { model: PathBuf, tokenizer: PathBuf },
+    /// A directory of pre-converted CoreML models for [`Backend::CoreML`]:
+    /// one `seq-<N>.mlmodelc` per bucket length, plus `tokenizer.json` and
+    /// `config.json`. Only valid with `--device coreml`.
+    CoreMl { dir: PathBuf },
 }
 
 /// Numeric precision of the forward pass.
@@ -102,7 +109,35 @@ pub enum Backend {
     /// execution strategies (see [`Embedder::embed`]), so this is a fork of
     /// the pipeline rather than a drop-in swap.
     Metal,
+    /// Apple Neural Engine via CoreML. Requires the `coreml` cargo feature and
+    /// a [`ModelSource::CoreMl`] directory of pre-converted fixed-shape models.
+    /// Runs batch=1 per bucket length; unsupported requests fail fast with
+    /// [`UnsupportedRequest`] rather than falling back. See [`crate::coreml`].
+    CoreML,
 }
+
+/// A request the CoreML backend cannot serve — built without the `coreml`
+/// feature, wrong model source, or a `--max-seq-length` beyond the largest
+/// converted bucket. Carried as its own type so the CLI can map it to a
+/// dedicated exit code (3) instead of the generic fatal (1), letting callers
+/// distinguish "retry on --device cpu" from a real failure. There is no
+/// automatic fallback: backend choice is the caller's job.
+#[derive(Debug)]
+pub struct UnsupportedRequest(pub String);
+
+impl UnsupportedRequest {
+    pub(crate) fn new(msg: impl Into<String>) -> Self {
+        Self(msg.into())
+    }
+}
+
+impl std::fmt::Display for UnsupportedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for UnsupportedRequest {}
 
 /// Knobs for [`Embedder::load`]. `Default` matches Ruri v3.
 #[derive(Clone, Copy)]
@@ -139,11 +174,22 @@ enum Weights {
     Bf16(Arc<crate::bf16::Bf16ModernBert>),
 }
 
+/// The loaded forward-pass engine. The candle path (CPU/Metal) and the CoreML
+/// path use opposite execution strategies, so they are separate arms rather
+/// than a shared abstraction.
+enum Engine {
+    Candle {
+        weights: Weights,
+        device: Device,
+    },
+    #[cfg(feature = "coreml")]
+    CoreMl(crate::coreml::CoreMlEncoder),
+}
+
 /// A loaded ModernBERT sentence encoder. Cheap to share by reference; one
 /// instance can serve any number of `embed` calls.
 pub struct Embedder {
-    weights: Weights,
-    device: Device,
+    engine: Engine,
     tokenizer: Tokenizer,
     opts: Options,
     dim: usize,
@@ -151,19 +197,27 @@ pub struct Embedder {
 
 impl Embedder {
     pub fn load(source: &ModelSource, opts: Options) -> Result<Self> {
+        if opts.backend == Backend::CoreML {
+            return Self::load_coreml(source, opts);
+        }
+        // The candle path serves the Hub/Files sources; a CoreMl directory has
+        // no safetensors to load.
         let (model_path, tokenizer_path) = match source {
             ModelSource::Files { model, tokenizer } => (model.clone(), tokenizer.clone()),
             ModelSource::Hub { repo } => fetch_from_hub(repo)?,
+            ModelSource::CoreMl { .. } => {
+                return Err(UnsupportedRequest::new(
+                    "a CoreML model directory needs `--device coreml`",
+                )
+                .into())
+            }
         };
 
         let config_path = model_path
             .parent()
             .map(|d| d.join("config.json"))
             .context("model path has no parent dir for config.json")?;
-        let config_str = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("cannot read {}", config_path.display()))?;
-        let config: Config = serde_json::from_str(&config_str)
-            .with_context(|| format!("cannot parse {}", config_path.display()))?;
+        let config: Config = read_config(&config_path)?;
         let dim = config.hidden_size;
 
         // The bf16 path is a hand-written CPU GEMM (see `crate::bf16`), so it
@@ -177,12 +231,60 @@ impl Embedder {
         let weights = load_weights(&model_path, &config, &device, opts.precision)?;
         let tokenizer = load_tokenizer(&tokenizer_path, opts.max_seq_length)?;
         Ok(Self {
-            weights,
-            device,
+            engine: Engine::Candle { weights, device },
             tokenizer,
             opts,
             dim,
         })
+    }
+
+    /// Load the CoreML/ANE backend from a directory of fixed-shape models.
+    /// Every unsupported condition is caught here, before any input is read.
+    #[cfg(feature = "coreml")]
+    fn load_coreml(source: &ModelSource, opts: Options) -> Result<Self> {
+        let dir = match source {
+            ModelSource::CoreMl { dir } => dir,
+            _ => {
+                return Err(UnsupportedRequest::new(
+                    "`--device coreml` needs a CoreML model directory (`--coreml-dir`)",
+                )
+                .into())
+            }
+        };
+
+        let config: Config = read_config(&dir.join("config.json"))?;
+        let dim = config.hidden_size;
+        let encoder = crate::coreml::CoreMlEncoder::load(dir, dim)?;
+
+        // The ANE only has the bucket lengths that were converted. Every input
+        // is truncated to max_seq_length, so if that fits the largest bucket
+        // no individual row can overflow — one check covers the whole run.
+        if opts.max_seq_length > encoder.max_bucket() {
+            return Err(UnsupportedRequest::new(format!(
+                "--max-seq-length {} exceeds the largest converted CoreML bucket ({}); \
+                 lower it or convert a longer model",
+                opts.max_seq_length,
+                encoder.max_bucket()
+            ))
+            .into());
+        }
+
+        let tokenizer = load_tokenizer(&dir.join("tokenizer.json"), opts.max_seq_length)?;
+        Ok(Self {
+            engine: Engine::CoreMl(encoder),
+            tokenizer,
+            opts,
+            dim,
+        })
+    }
+
+    #[cfg(not(feature = "coreml"))]
+    fn load_coreml(_source: &ModelSource, _opts: Options) -> Result<Self> {
+        Err(UnsupportedRequest::new(
+            "this binary was built without CoreML support; rebuild with \
+             `cargo build --release --features coreml`",
+        )
+        .into())
     }
 
     /// The embedding dimension (`hidden_size` — 512 for ruri-v3-130m).
@@ -196,10 +298,26 @@ impl Embedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        match &self.engine {
+            Engine::Candle { weights, device } => self.embed_candle(texts, weights, device),
+            #[cfg(feature = "coreml")]
+            Engine::CoreMl(encoder) => self.embed_coreml(texts, encoder),
+        }
+    }
+
+    /// The candle (CPU/Metal) path: length-bucketed, padded batches split to a
+    /// memory budget and fanned across a thread pool (CPU) or run wide back to
+    /// back (Metal).
+    fn embed_candle(
+        &self,
+        texts: &[&str],
+        weights: &Weights,
+        device: &Device,
+    ) -> Result<Vec<Vec<f32>>> {
         let batches = tokenize_bucket(&self.tokenizer, texts, self.opts.batch_size)?;
 
         // Split each bucketed batch into forwards that fit the memory budget.
-        let limit = self.weights.max_rows_per_forward();
+        let limit = weights.max_rows_per_forward();
         let mut units: Vec<Unit> = Vec::new();
         for batch in &batches {
             let cap = rows_per_forward(batch.seq, self.opts.backend).min(limit);
@@ -211,8 +329,6 @@ impl Embedder {
             }
         }
 
-        let weights = &self.weights;
-        let device = &self.device;
         let pooling = self.opts.pooling;
         let run = |unit: &Unit| -> Result<PooledRows> {
             let (batch, seq) = (unit.batch, unit.batch.seq);
@@ -241,8 +357,10 @@ impl Embedder {
         // multiplies scratch memory; Metal runs wide forwards back to back
         // instead, and gets its parallelism inside each one.
         let per_unit: Vec<Result<PooledRows>> = match self.opts.backend {
-            Backend::Cpu => worker_pool()?.install(|| units.par_iter().map(run).collect()),
             Backend::Metal => units.iter().map(run).collect(),
+            // CoreML never reaches embed_candle; treat anything non-Metal as
+            // the CPU fan-out.
+            _ => worker_pool()?.install(|| units.par_iter().map(run).collect()),
         };
 
         let mut rows_out: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
@@ -253,6 +371,53 @@ impl Embedder {
                 }
                 rows_out[orig] = vec;
             }
+        }
+        Ok(rows_out)
+    }
+
+    /// The CoreML/ANE path: one fixed-shape, batch=1 forward per text, routed
+    /// to the smallest bucket that fits. Serial by design — the ANE is a single
+    /// shared engine, so a thread pool would only add contention.
+    #[cfg(feature = "coreml")]
+    fn embed_coreml(
+        &self,
+        texts: &[&str],
+        encoder: &crate::coreml::CoreMlEncoder,
+    ) -> Result<Vec<Vec<f32>>> {
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let dim = encoder.dim();
+        let pooling = self.opts.pooling;
+
+        let mut rows_out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        for enc in &encodings {
+            let ids = enc.get_ids();
+            let seq = encoder.bucket_for(ids.len()).ok_or_else(|| {
+                // Unreachable given the load-time max_seq_length check, but
+                // never silently truncate past what the model can do.
+                UnsupportedRequest::new(format!(
+                    "{} tokens exceed the largest CoreML bucket ({})",
+                    ids.len(),
+                    encoder.max_bucket()
+                ))
+            })?;
+
+            // Pad this row to the exact bucket length; zeros stay masked out.
+            let mut ids_pad = vec![0i64; seq];
+            let mut mask_pad = vec![0i64; seq];
+            for (t, (&id, &m)) in ids.iter().zip(enc.get_attention_mask()).enumerate() {
+                ids_pad[t] = id as i64;
+                mask_pad[t] = m as i64;
+            }
+
+            let hidden = encoder.forward(&ids_pad, &mask_pad, seq)?;
+            let mut vector = pool_row(&hidden, &mask_pad, dim, pooling);
+            if self.opts.normalize {
+                l2_normalize(&mut vector);
+            }
+            rows_out.push(vector);
         }
         Ok(rows_out)
     }
@@ -273,7 +438,16 @@ fn open_device(backend: Backend) -> Result<Device> {
             "this binary was built without Metal support; rebuild with \
              `cargo build --release --features metal`"
         ),
+        // CoreML is routed to its own loader before open_device is reached.
+        Backend::CoreML => unreachable!("CoreML backend does not use a candle Device"),
     }
+}
+
+/// Read and parse a `config.json`.
+fn read_config(path: &Path) -> Result<Config> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("cannot parse {}", path.display()))
 }
 
 /// Download (or reuse from the HF cache) the three files a model needs.

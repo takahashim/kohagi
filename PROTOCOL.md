@@ -64,6 +64,7 @@ kohagi: model=cl-nagoya/ruri-v3-130m dim=512 in=2141 out=2141 skipped=0
 | 0 | every record embedded (`skipped=0`). Empty input is also 0 — nothing to do is success, and the model is not even loaded. |
 | 2 | finished, but ≥1 line was skipped. Received output lines are all valid — consume them, then investigate stderr and resend the skipped records. |
 | 1 | fatal: model load failure, bad flags, I/O error. Output may be truncated at a line boundary (never mid-line). |
+| 3 | the requested CoreML backend (`--device coreml`) cannot serve this request: built without the `coreml` feature, no `--coreml-dir`, no converted bucket for `--max-seq-length`, or a missing model. Detected before any input is read, so no output is produced — the caller can retry on `--device cpu`. Only ever returned when `--device coreml` is passed. |
 
 ## Versioning
 

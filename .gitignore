@@ -2,3 +2,8 @@
 
 # Python bytecode from the example scripts
 __pycache__/
+
+# CoreML PoC build artifacts
+*.mlpackage
+*.mlmodelc
+notes/coreml-poc/.venv/

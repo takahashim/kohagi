@@ -29,10 +29,12 @@
 mod batch;
 #[cfg(target_arch = "x86_64")]
 pub mod bf16;
+#[cfg(feature = "coreml")]
+mod coreml;
 mod encoder;
 mod fused;
 mod model;
 pub mod stdio;
 
 pub use batch::Pooling;
-pub use model::{Backend, Embedder, ModelSource, Options, Precision};
+pub use model::{Backend, Embedder, ModelSource, Options, Precision, UnsupportedRequest};

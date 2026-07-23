@@ -2,7 +2,11 @@
 //! mode for quick checks. See PROTOCOL.md for the full contract.
 //!
 //! Exit codes: 0 = all input embedded, 2 = finished but some lines were
-//! skipped (see stderr), 1 = fatal (model load, I/O, bad flags).
+//! skipped (see stderr), 1 = fatal (model load, I/O, bad flags), 3 = the
+//! requested CoreML backend cannot serve this request (built without the
+//! feature, no `--coreml-dir`, or `--max-seq-length` beyond the largest
+//! converted bucket) — caught before any input is read, so the caller can
+//! retry on `--device cpu`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -29,12 +33,15 @@ enum PrecisionArg {
     Bf16,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum BackendArg {
     /// Apple Accelerate on macOS, candle's own gemm elsewhere.
     Cpu,
     /// Apple GPU. Needs a binary built with `--features metal`.
     Metal,
+    /// Apple Neural Engine. Needs a binary built with `--features coreml` and
+    /// `--coreml-dir` pointing at pre-converted fixed-shape models.
+    Coreml,
 }
 
 impl From<PoolingArg> for Pooling {
@@ -60,6 +67,7 @@ impl From<BackendArg> for Backend {
         match b {
             BackendArg::Cpu => Backend::Cpu,
             BackendArg::Metal => Backend::Metal,
+            BackendArg::Coreml => Backend::CoreML,
         }
     }
 }
@@ -96,8 +104,15 @@ struct Args {
     precision: PrecisionArg,
     /// Device for the forward pass. metal requires a binary built with
     /// `--features metal`, and runs ~1.2x faster than cpu on Apple Silicon.
+    /// coreml (Apple Neural Engine) requires `--features coreml` and
+    /// `--coreml-dir`.
     #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
     device: BackendArg,
+    /// Directory of pre-converted CoreML models for `--device coreml`: one
+    /// `seq-<N>.mlmodelc` per bucket length, plus tokenizer.json and
+    /// config.json. See notes/coreml-feasibility.md.
+    #[arg(long)]
+    coreml_dir: Option<PathBuf>,
     /// Skip L2 normalization (normalized output is the default; unit vectors
     /// make dot product = cosine).
     #[arg(long)]
@@ -127,8 +142,21 @@ impl Args {
     }
 
     /// Where to load the model from, plus the name to show in the summary.
-    fn source(&self) -> (ModelSource, String) {
-        match (&self.model_path, &self.tokenizer_path) {
+    fn source(&self) -> anyhow::Result<(ModelSource, String)> {
+        // CoreML loads a directory of fixed-shape models, not safetensors.
+        if self.device == BackendArg::Coreml {
+            let dir = self.coreml_dir.clone().ok_or_else(|| {
+                kohagi::UnsupportedRequest(
+                    "`--device coreml` requires `--coreml-dir <DIR>`".to_string(),
+                )
+            })?;
+            let label = dir.file_name().map_or_else(
+                || dir.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            return Ok((ModelSource::CoreMl { dir }, label));
+        }
+        let out = match (&self.model_path, &self.tokenizer_path) {
             // clap's `requires` guarantees these two arrive together.
             (Some(model), Some(tokenizer)) => {
                 let label = model.file_name().map_or_else(
@@ -147,7 +175,8 @@ impl Args {
                 };
                 (source, self.model_id.clone())
             }
-        }
+        };
+        Ok(out)
     }
 }
 
@@ -175,7 +204,7 @@ fn embed_arguments(args: &Args, source: &ModelSource) -> anyhow::Result<()> {
 
 /// Returns the number of skipped input lines (0 in `--text` mode).
 fn run(args: Args) -> anyhow::Result<usize> {
-    let (source, label) = args.source();
+    let (source, label) = args.source()?;
 
     if !args.text.is_empty() {
         embed_arguments(&args, &source)?;
@@ -192,7 +221,13 @@ fn main() -> ExitCode {
         Ok(_) => ExitCode::from(2),
         Err(e) => {
             eprintln!("kohagi: error: {e:#}");
-            ExitCode::FAILURE
+            // A CoreML-unsupported request gets its own code so callers can
+            // tell "retry on --device cpu" apart from a genuine failure.
+            if e.chain().any(|c| c.is::<kohagi::UnsupportedRequest>()) {
+                ExitCode::from(3)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
