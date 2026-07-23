@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
-use kohagi::{stdio, Backend, Embedder, ModelSource, Options, Pooling, Precision};
+use kohagi::{stdio, Backend, CoreMlForm, Embedder, ModelSource, Options, Pooling, Precision};
 
 /// CLI spellings of the library enums, so `--help` lists the valid values and
 /// clap rejects anything else before we do any work.
@@ -58,6 +58,23 @@ impl From<PrecisionArg> for Precision {
         match p {
             PrecisionArg::F32 => Precision::F32,
             PrecisionArg::Bf16 => Precision::Bf16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CoreMlFormArg {
+    /// Compiled `.mlmodelc` — no per-run compile (default).
+    Compiled,
+    /// Portable `.mlpackage` — compiled on load, robust across OS versions.
+    Package,
+}
+
+impl From<CoreMlFormArg> for CoreMlForm {
+    fn from(f: CoreMlFormArg) -> Self {
+        match f {
+            CoreMlFormArg::Compiled => CoreMlForm::Compiled,
+            CoreMlFormArg::Package => CoreMlForm::Package,
         }
     }
 }
@@ -118,6 +135,11 @@ struct Args {
     /// --coreml-dir for `--device coreml`; --coreml-dir wins if both are set.
     #[arg(long)]
     coreml_model_id: Option<String>,
+    /// When a --coreml-model-id repo ships both forms of a bucket, which to
+    /// download: `compiled` (.mlmodelc, faster) or `package` (.mlpackage,
+    /// portable). Only the chosen form is fetched.
+    #[arg(long, value_enum, default_value_t = CoreMlFormArg::Compiled)]
+    coreml_prefer: CoreMlFormArg,
     /// Skip L2 normalization (normalized output is the default; unit vectors
     /// make dot product = cosine).
     #[arg(long)]
@@ -143,6 +165,7 @@ impl Args {
             batch_size: self.batch_size,
             precision: self.precision.into(),
             backend: self.device.into(),
+            coreml_form: self.coreml_prefer.into(),
         }
     }
 

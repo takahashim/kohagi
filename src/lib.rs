@@ -37,4 +37,6 @@ mod model;
 pub mod stdio;
 
 pub use batch::Pooling;
-pub use model::{Backend, Embedder, ModelSource, Options, Precision, UnsupportedRequest};
+pub use model::{
+    Backend, CoreMlForm, Embedder, ModelSource, Options, Precision, UnsupportedRequest,
+};
