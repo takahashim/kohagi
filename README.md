@@ -168,17 +168,24 @@ Times are totals, including startup and model load; peak RSS is from
 
 | Input                    |    f32 |              bf16 |          Peak RSS |
 | ------------------------ | -----: | ----------------: | ----------------: |
-| 1200 short (~30 tokens)  | 11.2 s |  **4.9 s** (2.3×) | 1.27 GB → 0.87 GB |
-| 240 long (512 tokens)    | 44.1 s | **24.2 s** (1.8×) | 1.29 GB → 1.18 GB |
+| 1200 short (~30 tokens)  | 11.0 s |  **4.9 s** (2.2×) | 1.30 GB → 0.87 GB |
+| 240 long (512 tokens)    | 45.0 s | **21.6 s** (2.1×) | 1.36 GB → 1.01 GB |
 
-Only about half of that is the bf16 arithmetic. Profiling a 512-token forward
+Less than half of that is the bf16 arithmetic. Profiling a 512-token forward
 put 28% of it in the attention mask and softmax and another 10% in the GELU —
 both f32, and both spent in candle evaluating a transcendental one element at
 a time (`SoftmaxLastDim::cpu_fwd` and `UnaryOpT for Erf`). bf16 builds run
 those through kohagi's own AVX-512 kernels instead,
 [`src/bf16/softmax.rs`](src/bf16/softmax.rs) and
-[`src/bf16/geglu.rs`](src/bf16/geglu.rs), which is worth 1.37× at 512 tokens
-on its own.
+[`src/bf16/geglu.rs`](src/bf16/geglu.rs), worth 1.37× at 512 tokens on their
+own.
+
+The other structural win is that 12 of ruri-v3's 19 layers attend only within
+a 128-token window, so at 512 tokens three quarters of what they were
+computing was masked off again immediately. Those layers now walk the band in
+query blocks, for a further 1.11×. The dropped entries are worth `exp` of the
+mask floor — about 1e-38 against a normalizer of at least 1 — so the output is
+bit-identical either way.
 
 What is left of the gap between the two rows is the `q·kᵀ` and `att·v`
 matmuls, which stay in f32 and grow quadratically with sequence length.

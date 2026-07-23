@@ -17,7 +17,8 @@
 //! Since only the projections change precision, this is *not* a uniform
 //! speedup: it wins most on short inputs, where the projections dominate, and
 //! less on long ones, where the f32 attention matmuls — quadratic in sequence
-//! length — take over.
+//! length — take over. What claws some of that back is [`Attention::banded`],
+//! which computes only the band a sliding-window layer can attend to.
 
 use std::sync::Arc;
 
@@ -29,6 +30,36 @@ use candle_nn::{embedding, layer_norm_no_bias, Embedding, LayerNorm, VarBuilder}
 use super::geglu;
 use super::gemm::Bf16Linear;
 use super::softmax;
+
+/// Queries per block in the sliding-window attention path.
+///
+/// Each block reads `Q_BLOCK + 2w` keys to serve `Q_BLOCK` queries, so smaller
+/// blocks compute less of the score matrix — the limit as the block shrinks is
+/// the `2w + 1` keys a single query needs — but they mean more and narrower
+/// matmuls, each with its own narrow, copy and softmax call.
+///
+/// That tradeoff has an interior optimum, and it is not where the arithmetic
+/// alone would put it. Encode time on 240 512-token texts, median of five
+/// interleaved runs against a dense baseline of 22.4 s:
+///
+/// | `Q_BLOCK` | share of the dense score matrix | encode |
+/// |---:|---:|---:|
+/// | 16 | 28% | 22.7 s |
+/// | 32 | 31% | **20.3 s** |
+/// | 64 | 38% | 21.5 s |
+/// | 128 | 50% | 21.9 s |
+///
+/// 16 computes the least and finishes no faster than not banding at all.
+const Q_BLOCK: usize = 32;
+
+/// Whether walking the band beats computing the whole score matrix.
+///
+/// It cannot help once the window already spans the sequence, and near that
+/// point the block overhead outweighs what little is masked off, so this
+/// wants the band to be a real fraction of the row.
+fn banding_pays(seq: usize, window: usize) -> bool {
+    seq > 2 * (2 * window + 1)
+}
 
 /// Apply a bf16 `Linear` to a tensor whose last dimension is the Linear's
 /// input width, flattening the leading dimensions into GEMM rows.
@@ -107,7 +138,9 @@ impl Attention {
         })
     }
 
-    fn forward(&self, xs: &Tensor, attn_mask: &[f32]) -> Result<Tensor> {
+    /// `window` is the half-width of a sliding-window layer, or `None` for a
+    /// global one.
+    fn forward(&self, xs: &Tensor, attn_mask: &[f32], window: Option<usize>) -> Result<Tensor> {
         let (b, seq, d) = xs.dims3()?;
         let qkv = apply(&self.qkv, xs)?
             .reshape((b, seq, 3, self.num_heads, self.head_size))?
@@ -117,17 +150,72 @@ impl Attention {
 
         // Scores, mask, and softmax stay f32 — the precision-sensitive part.
         let q = (q * (self.head_size as f64).powf(-0.5))?;
+
+        let ctx = match window {
+            Some(w) if banding_pays(seq, w) => self.banded(&q, &k, &v, attn_mask, w)?,
+            _ => self.dense(&q, &k, &v, attn_mask)?,
+        };
+
+        let xs = ctx.transpose(1, 2)?.reshape((b, seq, d))?;
+        apply(&self.proj, &xs)
+    }
+
+    /// Every query against every key: `[b, heads, seq, dim]` in and out.
+    fn dense(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: &[f32]) -> Result<Tensor> {
+        let (b, _, seq, _) = q.dims4()?;
         let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
 
         // The mask add and the softmax are fused (see `super::softmax`), which
         // is why the mask arrives as a flat `[b, seq, seq]` slice rather than a
         // tensor to broadcast against.
         let mut scores = att.flatten_all()?.to_vec1::<f32>()?;
-        softmax::masked_softmax(&mut scores, attn_mask, b, self.num_heads, seq);
-        let att = Tensor::from_vec(scores, (b, self.num_heads, seq, seq), xs.device())?;
+        softmax::masked_softmax(&mut scores, mask, b, self.num_heads, seq);
+        let att = Tensor::from_vec(scores, (b, self.num_heads, seq, seq), q.device())?;
+        att.matmul(v).map_err(Into::into)
+    }
 
-        let xs = att.matmul(&v)?.transpose(1, 2)?.reshape((b, seq, d))?;
-        apply(&self.proj, &xs)
+    /// The same result for a sliding-window layer, without computing the
+    /// three quarters of the score matrix the window masks off.
+    ///
+    /// Queries are walked in blocks of [`Q_BLOCK`]; a block starting at `qs`
+    /// can only reach keys in `[qs - w, qs + Q_BLOCK - 1 + w]`, so each block
+    /// is a small dense attention over that key span. The masked entries the
+    /// dense path would have computed contribute `exp` of the mask floor —
+    /// around 1e-38 against a normalizer of at least 1 — so dropping them
+    /// moves the result by far less than f32 can represent.
+    fn banded(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: &[f32], w: usize) -> Result<Tensor> {
+        let (b, _, seq, _) = q.dims4()?;
+        let mut blocks = Vec::with_capacity(seq.div_ceil(Q_BLOCK));
+
+        for q0 in (0..seq).step_by(Q_BLOCK) {
+            let queries = Q_BLOCK.min(seq - q0);
+            let k0 = q0.saturating_sub(w);
+            let keys = (q0 + queries - 1 + w + 1).min(seq) - k0;
+
+            let qb = q.narrow(2, q0, queries)?;
+            let kb = k.narrow(2, k0, keys)?;
+            let vb = v.narrow(2, k0, keys)?;
+
+            let att = qb.matmul(&kb.transpose(D::Minus2, D::Minus1)?)?;
+            let mut scores = att.flatten_all()?.to_vec1::<f32>()?;
+            softmax::masked_softmax_block(
+                &mut scores,
+                mask,
+                b,
+                self.num_heads,
+                softmax::Block {
+                    seq,
+                    q0,
+                    queries,
+                    k0,
+                    keys,
+                },
+            );
+            let att = Tensor::from_vec(scores, (b, self.num_heads, queries, keys), q.device())?;
+            blocks.push(att.matmul(&vb)?);
+        }
+
+        Tensor::cat(&blocks, 2).map_err(Into::into)
     }
 }
 
@@ -193,7 +281,13 @@ impl Layer {
         })
     }
 
-    fn forward(&self, xs: &Tensor, global_mask: &[f32], local_mask: &[f32]) -> Result<Tensor> {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        global_mask: &[f32],
+        local_mask: &[f32],
+        window: usize,
+    ) -> Result<Tensor> {
         let residual = xs.clone();
         let mut h = xs.clone();
         if let Some(norm) = &self.attn_norm {
@@ -202,12 +296,12 @@ impl Layer {
         // `local_mask` already holds `global + local`, combined once in
         // forward_batch — every local layer would otherwise redo the identical
         // broadcast_add, and all but the first are redundant.
-        let mask = if self.uses_local {
-            local_mask
+        let (mask, window) = if self.uses_local {
+            (local_mask, Some(window))
         } else {
-            global_mask
+            (global_mask, None)
         };
-        let xs = (residual + self.attn.forward(&h, mask)?)?;
+        let xs = (residual + self.attn.forward(&h, mask, window)?)?;
         let mlp_out = self.mlp.forward(&xs.apply(&self.mlp_norm)?)?;
         Ok((xs + mlp_out)?)
     }
@@ -324,7 +418,7 @@ impl Bf16ModernBert {
         let local_mask = local_mask.flatten_all()?.to_vec1::<f32>()?;
         let mut xs = ids.apply(&self.embeddings)?.apply(&self.norm)?;
         for layer in &self.layers {
-            xs = layer.forward(&xs, &global_mask, &local_mask)?;
+            xs = layer.forward(&xs, &global_mask, &local_mask, self.local_attention / 2)?;
         }
         let out = xs.apply(&self.final_norm)?;
 

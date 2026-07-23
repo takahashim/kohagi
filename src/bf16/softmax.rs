@@ -54,15 +54,53 @@ fn avx512() -> bool {
 /// each `(row, head, query)` triple owns one contiguous `seq`-float span.
 pub fn masked_softmax(scores: &mut [f32], mask: &[f32], rows: usize, heads: usize, seq: usize) {
     debug_assert_eq!(scores.len(), rows * heads * seq * seq);
-    debug_assert_eq!(mask.len(), rows * seq * seq);
+    masked_softmax_block(scores, mask, rows, heads, Block::full(seq));
+}
+
+/// Which slice of the score matrix a call covers.
+///
+/// A sliding-window layer only needs a band, and [`super::modernbert`] walks
+/// it one query block at a time: `queries` rows starting at `q0`, against
+/// `keys` columns starting at `k0`. The scores for that block are their own
+/// contiguous `[rows, heads, queries, keys]` buffer, but the mask is still the
+/// full `[rows, seq, seq]` one, so it is indexed with `seq` as the row stride.
+#[derive(Clone, Copy)]
+pub struct Block {
+    pub seq: usize,
+    pub q0: usize,
+    pub queries: usize,
+    pub k0: usize,
+    pub keys: usize,
+}
+
+impl Block {
+    /// The whole matrix, which is what a global-attention layer wants.
+    pub fn full(seq: usize) -> Self {
+        Self {
+            seq,
+            q0: 0,
+            queries: seq,
+            k0: 0,
+            keys: seq,
+        }
+    }
+}
+
+/// [`masked_softmax`] over one block of the score matrix.
+pub fn masked_softmax_block(scores: &mut [f32], mask: &[f32], rows: usize, heads: usize, b: Block) {
+    debug_assert_eq!(scores.len(), rows * heads * b.queries * b.keys);
+    debug_assert_eq!(mask.len(), rows * b.seq * b.seq);
+    debug_assert!(b.q0 + b.queries <= b.seq && b.k0 + b.keys <= b.seq);
 
     let simd = avx512();
     for r in 0..rows {
         for h in 0..heads {
-            for i in 0..seq {
-                let s = ((r * heads + h) * seq + i) * seq;
-                let m = (r * seq + i) * seq;
-                row(&mut scores[s..s + seq], &mask[m..m + seq], simd);
+            for i in 0..b.queries {
+                let s = ((r * heads + h) * b.queries + i) * b.keys;
+                // Keys are the last axis of the mask too, so a block's slice of
+                // any one query row is contiguous — only the row stride differs.
+                let m = (r * b.seq + b.q0 + i) * b.seq + b.k0;
+                row(&mut scores[s..s + b.keys], &mask[m..m + b.keys], simd);
             }
         }
     }
@@ -403,5 +441,78 @@ mod exp_accuracy {
             worst < 1e-6,
             "worst relative error {worst:e} at x = {worst_at}"
         );
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    /// A block of the score matrix must come out exactly as the same entries
+    /// do when the whole matrix is softmaxed — provided the block covers every
+    /// key the mask leaves open for those queries, which is the precondition
+    /// the sliding-window path relies on.
+    #[test]
+    fn block_matches_the_full_matrix() {
+        let (rows, heads, seq) = (2usize, 3usize, 64usize);
+        let w = 8usize; // half-window
+        let scores: Vec<f32> = (0..rows * heads * seq * seq)
+            .map(|i| ((i * 2_654_435_761usize % 997) as f32 / 100.0) - 5.0)
+            .collect();
+        // Sliding-window mask: everything past the window is closed.
+        let mut mask = vec![0.0f32; rows * seq * seq];
+        for r in 0..rows {
+            for i in 0..seq {
+                for j in 0..seq {
+                    if j.abs_diff(i) > w {
+                        mask[(r * seq + i) * seq + j] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+        }
+
+        let mut full = scores.clone();
+        masked_softmax(&mut full, &mask, rows, heads, seq);
+
+        // One block of 16 queries, against exactly the keys they can reach.
+        let (q0, queries) = (16usize, 16usize);
+        let k0 = q0 - w;
+        let keys = (q0 + queries - 1 + w + 1) - k0;
+        let mut block = vec![0.0f32; rows * heads * queries * keys];
+        for r in 0..rows {
+            for h in 0..heads {
+                for i in 0..queries {
+                    let src = ((r * heads + h) * seq + q0 + i) * seq + k0;
+                    let dst = ((r * heads + h) * queries + i) * keys;
+                    block[dst..dst + keys].copy_from_slice(&scores[src..src + keys]);
+                }
+            }
+        }
+        masked_softmax_block(
+            &mut block,
+            &mask,
+            rows,
+            heads,
+            Block {
+                seq,
+                q0,
+                queries,
+                k0,
+                keys,
+            },
+        );
+
+        for r in 0..rows {
+            for h in 0..heads {
+                for i in 0..queries {
+                    let src = ((r * heads + h) * seq + q0 + i) * seq + k0;
+                    let dst = ((r * heads + h) * queries + i) * keys;
+                    for j in 0..keys {
+                        let (a, b) = (block[dst + j], full[src + j]);
+                        assert_eq!(a, b, "row {r} head {h} query {i} key {j}");
+                    }
+                }
+            }
+        }
     }
 }

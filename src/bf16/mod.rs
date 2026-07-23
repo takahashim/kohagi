@@ -15,8 +15,13 @@
 //! Opt in with `--precision bf16` (`Precision::Bf16`) — f32 stays the default
 //! everywhere so the same text yields the same vector on every machine.
 //!
-//! On short texts this is ~2.3× faster than the f32 path at cosine ≈ 0.99999,
-//! and ~1.8× at 512 tokens, where the attention matmuls still run in f32.
+//! [`modernbert`] also walks the band rather than the whole score matrix in
+//! the sliding-window layers, which is 12 of ruri-v3's 19 and where three
+//! quarters of a 512-token score matrix is masked off. That one is exactly
+//! equivalent, down to the bit.
+//!
+//! On short texts this is ~2.2× faster than the f32 path at cosine ≈ 0.99999,
+//! and ~2.1× at 512 tokens, where the attention matmuls still run in f32.
 //! Both the module and the CPU features are checked before use: non-x86_64
 //! builds skip this module entirely, [`gemm::supported`] gates it at load
 //! time, and both elementwise kernels fall back to scalar rows when AVX-512
