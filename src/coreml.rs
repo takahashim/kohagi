@@ -16,7 +16,7 @@
 //!
 //! [`ModernBert`]: crate::encoder::ModernBert
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use half::f16;
@@ -153,28 +153,87 @@ fn bucket_seq_of(path: &Path) -> Option<usize> {
 /// Load one model, pinned to CPU+ANE. A `.mlpackage` is compiled to a
 /// (temporary) `.mlmodelc` first; a `.mlmodelc` is loaded directly.
 fn load_model(path: &Path) -> Result<Retained<MLModel>> {
+    let compiled;
+    let target = if path.extension().and_then(|e| e.to_str()) == Some("mlpackage") {
+        compiled = compile_package(path)?;
+        compiled.as_path()
+    } else {
+        path
+    };
     unsafe {
-        let src = NSURL::fileURLWithPath(&NSString::from_str(
-            path.to_str().context("model path is not valid UTF-8")?,
-        ));
-        // MLModel can only open a compiled .mlmodelc; compile packages on load.
-        let compiled;
-        let url = if path.extension().and_then(|e| e.to_str()) == Some("mlpackage") {
-            // The async compileModelAtURL:completionHandler: is the current API,
-            // but the synchronous one is simpler and fine for a batch CLI.
-            #[allow(deprecated)]
-            let c = MLModel::compileModelAtURL_error(&src)
-                .map_err(|e| anyhow::anyhow!("compiling {}: {e}", path.display()))?;
-            compiled = c;
-            &*compiled
-        } else {
-            &*src
-        };
+        let url = file_url(target)?;
         let config = MLModelConfiguration::new();
         config.setComputeUnits(MLComputeUnits::CPUAndNeuralEngine);
-        MLModel::modelWithContentsOfURL_configuration_error(url, &config)
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        MLModel::modelWithContentsOfURL_configuration_error(&url, &config)
+            .map_err(|e| anyhow::anyhow!("loading {}: {e}", path.display()))
     }
+}
+
+/// A `file://` URL for a local path.
+unsafe fn file_url(path: &Path) -> Result<Retained<NSURL>> {
+    Ok(NSURL::fileURLWithPath(&NSString::from_str(
+        path.to_str().context("model path is not valid UTF-8")?,
+    )))
+}
+
+/// Compile a `.mlpackage` to a `.mlmodelc` and return its (temporary) path.
+///
+/// The Hugging Face cache stores a package as a tree of symlinks into its blob
+/// store, which the CoreML compiler cannot follow — it fails with a spurious
+/// "file doesn't exist". So if the direct compile fails we retry from a
+/// dereferenced, symlink-free copy.
+fn compile_package(pkg: &Path) -> Result<PathBuf> {
+    if let Ok(out) = compile_at(pkg) {
+        return Ok(out);
+    }
+    let staging = unique_temp_dir("kohagi-coreml-src");
+    std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
+    let name = pkg.file_name().context("model path has no file name")?;
+    let copy = staging.join(name);
+    let result = copy_deref(pkg, &copy)
+        .with_context(|| format!("dereferencing {}", pkg.display()))
+        .and_then(|()| compile_at(&copy).with_context(|| format!("compiling {}", pkg.display())));
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// One `compileModelAtURL:` call; returns the compiled model's path.
+fn compile_at(pkg: &Path) -> Result<PathBuf> {
+    unsafe {
+        let src = file_url(pkg)?;
+        // The async compileModelAtURL:completionHandler: is the current API, but
+        // the synchronous one is simpler and fine for a batch CLI.
+        #[allow(deprecated)]
+        let compiled =
+            MLModel::compileModelAtURL_error(&src).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let path = compiled.path().context("compiled model URL has no path")?;
+        Ok(PathBuf::from(path.to_string()))
+    }
+}
+
+/// Recursively copy `src` to `dst`, following symlinks so the result has no
+/// links — turns a symlinked HF-cache package into a real one the compiler can
+/// read.
+fn copy_deref(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_deref(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
+/// A process-unique path under the system temp dir (a per-process counter is
+/// enough — one process compiles a handful of buckets).
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), n))
 }
 
 /// Build a `[1, seq]` Int32 MLMultiArray from `i64` token ids/mask.
