@@ -134,7 +134,11 @@ pub enum Backend {
 /// Knobs for [`Embedder::load`]. `Default` matches Ruri v3.
 #[derive(Clone, Copy)]
 pub struct Options {
-    pub pooling: Pooling,
+    /// `None` (the default) takes the pooling from the checkpoint's
+    /// `1_Pooling/config.json`, falling back to mean with a warning when the
+    /// model publishes none. `Some(p)` forces `p`, warning if it disagrees
+    /// with what the checkpoint declares. See [`resolve_pooling`].
+    pub pooling: Option<Pooling>,
     /// L2-normalize each embedding (unit length, so dot = cosine).
     pub normalize: bool,
     /// Token-level truncation length. Ruri v3 accepts up to 8192 but was
@@ -151,7 +155,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            pooling: Pooling::Mean,
+            pooling: None,
             normalize: true,
             max_seq_length: 512,
             batch_size: 64,
@@ -187,6 +191,9 @@ pub struct Embedder {
     engine: Engine,
     tokenizer: Tokenizer,
     opts: Options,
+    /// Resolved from `opts.pooling` and the checkpoint's `1_Pooling` at load
+    /// time (see [`resolve_pooling`]), so `embed` never re-decides it.
+    pooling: Pooling,
     dim: usize,
 }
 
@@ -197,8 +204,10 @@ impl Embedder {
         }
         // The candle path serves the Hub/Files sources; a CoreMl directory has
         // no safetensors to load.
-        let (model_path, tokenizer_path) = match source {
-            ModelSource::Files { model, tokenizer } => (model.clone(), tokenizer.clone()),
+        let (model_path, tokenizer_path, detected_pooling) = match source {
+            ModelSource::Files { model, tokenizer } => {
+                (model.clone(), tokenizer.clone(), local_pooling(model))
+            }
             ModelSource::Hub { repo } => fetch_from_hub(repo)?,
             ModelSource::CoreMl { .. } | ModelSource::CoreMlHub { .. } => {
                 return Err(UnsupportedRequest::new(
@@ -207,6 +216,11 @@ impl Embedder {
                 .into())
             }
         };
+
+        let (pooling, note) = resolve_pooling(opts.pooling, detected_pooling);
+        if let Some(note) = note {
+            eprintln!("kohagi: {}", note.message());
+        }
 
         let config_path = model_path
             .parent()
@@ -229,6 +243,7 @@ impl Embedder {
             engine: Engine::Candle { weights, device },
             tokenizer,
             opts,
+            pooling,
             dim,
         })
     }
@@ -269,10 +284,20 @@ impl Embedder {
         }
 
         let tokenizer = load_tokenizer(&dir.join("tokenizer.json"), opts.max_seq_length)?;
+
+        let detected = std::fs::read_to_string(dir.join("1_Pooling").join("config.json"))
+            .ok()
+            .and_then(|s| pooling_from_st_config(&s));
+        let (pooling, note) = resolve_pooling(opts.pooling, detected);
+        if let Some(note) = note {
+            eprintln!("kohagi: {}", note.message());
+        }
+
         Ok(Self {
             engine: Engine::CoreMl(encoder),
             tokenizer,
             opts,
+            pooling,
             dim,
         })
     }
@@ -328,7 +353,7 @@ impl Embedder {
             }
         }
 
-        let pooling = self.opts.pooling;
+        let pooling = self.pooling;
         let run = |unit: &Unit| -> Result<PooledRows> {
             let (batch, seq) = (unit.batch, unit.batch.seq);
             // This unit's slice of the batch's `[batch, seq]` layout.
@@ -388,7 +413,7 @@ impl Embedder {
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
         let dim = encoder.dim();
-        let pooling = self.opts.pooling;
+        let pooling = self.pooling;
 
         let mut rows_out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         for enc in &encodings {
@@ -442,6 +467,87 @@ fn open_device(backend: Backend) -> Result<Device> {
     }
 }
 
+/// What a checkpoint's `1_Pooling/config.json` says its pooling is, or `None`
+/// when it publishes neither a cls nor a mean flag (or has no such file).
+///
+/// The sentence-transformers config sets one `pooling_mode_*` bool per mode.
+/// Only the two kohagi supports are read; a checkpoint pooling some other way
+/// (max, weighted mean) reads as `None`, the same as no file at all, which is
+/// the honest answer since kohagi cannot reproduce it.
+fn pooling_from_st_config(json: &str) -> Option<Pooling> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    if v.get("pooling_mode_cls_token")? == &serde_json::Value::Bool(true) {
+        Some(Pooling::Cls)
+    } else if v.get("pooling_mode_mean_tokens")? == &serde_json::Value::Bool(true) {
+        Some(Pooling::Mean)
+    } else {
+        None
+    }
+}
+
+/// Something worth telling the user about the pooling choice, from comparing
+/// what they asked for against what the checkpoint declares.
+#[derive(Debug, PartialEq, Eq)]
+enum PoolingNote {
+    /// The request disagrees with the checkpoint. The request still wins — the
+    /// user may know something — but a `--pooling cls` model run at the mean
+    /// default is silently wrong, so it is worth saying.
+    Mismatch { used: Pooling, declared: Pooling },
+    /// No `1_Pooling/config.json`: a reranker or a base LM rather than a
+    /// sentence encoder, most likely. The vectors will still be produced, and
+    /// may be near-useless.
+    NoConfig { used: Pooling },
+}
+
+impl PoolingNote {
+    fn message(&self) -> String {
+        let name = |p: Pooling| match p {
+            Pooling::Mean => "mean",
+            Pooling::Cls => "cls",
+        };
+        match self {
+            PoolingNote::Mismatch { used, declared } => format!(
+                "warning: using --pooling {} but the model declares {} pooling; \
+                 embeddings will be wrong if this is not deliberate",
+                name(*used),
+                name(*declared),
+            ),
+            PoolingNote::NoConfig { used } => format!(
+                "warning: model publishes no 1_Pooling/config.json, so it may not be a \
+                 sentence-embedding model (a reranker or base LM produces near-degenerate \
+                 vectors); pooling with {}",
+                name(*used),
+            ),
+        }
+    }
+}
+
+/// Decide the pooling to use, and whether to warn.
+///
+/// `requested` is `Some` only when the caller passed `--pooling` explicitly;
+/// `detected` is what the checkpoint's `1_Pooling` declares. A request always
+/// wins so a user can override a mislabeled checkpoint, but the mismatch is
+/// surfaced. With no request, the declared pooling is used silently — that is
+/// the point, so a cls model just works — and only a missing config warns.
+fn resolve_pooling(
+    requested: Option<Pooling>,
+    detected: Option<Pooling>,
+) -> (Pooling, Option<PoolingNote>) {
+    match (requested, detected) {
+        (Some(used), Some(declared)) if used != declared => {
+            (used, Some(PoolingNote::Mismatch { used, declared }))
+        }
+        (Some(used), _) => (used, None),
+        (None, Some(declared)) => (declared, None),
+        (None, None) => (
+            Pooling::Mean,
+            Some(PoolingNote::NoConfig {
+                used: Pooling::Mean,
+            }),
+        ),
+    }
+}
+
 /// Read and parse a `config.json`.
 fn read_config(path: &Path) -> Result<Config> {
     let text =
@@ -449,8 +555,9 @@ fn read_config(path: &Path) -> Result<Config> {
     serde_json::from_str(&text).with_context(|| format!("cannot parse {}", path.display()))
 }
 
-/// Download (or reuse from the HF cache) the three files a model needs.
-fn fetch_from_hub(repo: &str) -> Result<(PathBuf, PathBuf)> {
+/// Download (or reuse from the HF cache) the files a model needs, plus its
+/// declared pooling if the checkpoint ships one.
+fn fetch_from_hub(repo: &str) -> Result<(PathBuf, PathBuf, Option<Pooling>)> {
     let api = hf_hub::api::sync::Api::new().context("initializing Hugging Face Hub client")?;
     let repo = api.model(repo.to_string());
     let get = |f: &str| {
@@ -460,7 +567,22 @@ fn fetch_from_hub(repo: &str) -> Result<(PathBuf, PathBuf)> {
     let model = get("model.safetensors")?;
     get("config.json")?; // lands next to the weights in the cache
     let tokenizer = get("tokenizer.json")?;
-    Ok((model, tokenizer))
+    // Optional: many checkpoints ship it, rerankers and base LMs do not, and a
+    // 404 here is information rather than an error.
+    let pooling = repo
+        .get("1_Pooling/config.json")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| pooling_from_st_config(&s));
+    Ok((model, tokenizer, pooling))
+}
+
+/// The declared pooling of a local model, read from `1_Pooling/config.json`
+/// beside the weights if present.
+fn local_pooling(model_path: &Path) -> Option<Pooling> {
+    let cfg = model_path.parent()?.join("1_Pooling").join("config.json");
+    let text = std::fs::read_to_string(cfg).ok()?;
+    pooling_from_st_config(&text)
 }
 
 fn load_weights(
@@ -573,4 +695,81 @@ fn worker_pool() -> Result<rayon::ThreadPool> {
         .num_threads(n)
         .build()
         .context("building rayon pool")
+}
+
+#[cfg(test)]
+mod pooling_tests {
+    use super::*;
+
+    #[test]
+    fn reads_cls_and_mean_from_st_config() {
+        let cls = r#"{"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false}"#;
+        let mean = r#"{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}"#;
+        assert_eq!(pooling_from_st_config(cls), Some(Pooling::Cls));
+        assert_eq!(pooling_from_st_config(mean), Some(Pooling::Mean));
+    }
+
+    #[test]
+    fn unsupported_or_absent_pooling_reads_as_none() {
+        // A mode kohagi cannot reproduce, and junk, both decline rather than guess.
+        let other = r#"{"pooling_mode_max_tokens": true}"#;
+        assert_eq!(pooling_from_st_config(other), None);
+        assert_eq!(pooling_from_st_config("not json"), None);
+    }
+
+    #[test]
+    fn no_request_takes_the_declared_pooling_silently() {
+        // The point of the feature: a cls model just works, no flag, no noise.
+        assert_eq!(
+            resolve_pooling(None, Some(Pooling::Cls)),
+            (Pooling::Cls, None)
+        );
+        assert_eq!(
+            resolve_pooling(None, Some(Pooling::Mean)),
+            (Pooling::Mean, None)
+        );
+    }
+
+    #[test]
+    fn no_request_and_no_config_defaults_to_mean_and_warns() {
+        // The reranker / base-LM case.
+        assert_eq!(
+            resolve_pooling(None, None),
+            (
+                Pooling::Mean,
+                Some(PoolingNote::NoConfig {
+                    used: Pooling::Mean
+                })
+            ),
+        );
+    }
+
+    #[test]
+    fn a_request_wins_but_a_disagreement_warns() {
+        // Forcing mean on a cls model (the gte footgun) is honored but flagged.
+        assert_eq!(
+            resolve_pooling(Some(Pooling::Mean), Some(Pooling::Cls)),
+            (
+                Pooling::Mean,
+                Some(PoolingNote::Mismatch {
+                    used: Pooling::Mean,
+                    declared: Pooling::Cls,
+                }),
+            ),
+        );
+        // Forcing the pooling the model already declares is silent.
+        assert_eq!(
+            resolve_pooling(Some(Pooling::Cls), Some(Pooling::Cls)),
+            (Pooling::Cls, None),
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_config_is_honored_without_the_reranker_warning() {
+        // The user said what they want; do not second-guess with the NoConfig note.
+        assert_eq!(
+            resolve_pooling(Some(Pooling::Cls), None),
+            (Pooling::Cls, None),
+        );
+    }
 }

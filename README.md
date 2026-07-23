@@ -75,6 +75,14 @@ kohagi --model-id nomic-ai/modernbert-embed-base \
 ```
 
 `cl-nagoya/ruri-v3-310m`, which produces 768-dimensional vectors, works in the same way.
+
+Pooling is taken from the model. kohagi reads the checkpoint's
+`1_Pooling/config.json` and uses the mode it declares, so a CLS-pooled model
+such as `Alibaba-NLP/gte-modernbert-base` needs no flag. Pass `--pooling` only
+to override, and kohagi warns if your choice disagrees with the checkpoint —
+or if the model ships no pooling config at all, which usually means it is a
+reranker or a base LM rather than a sentence encoder.
+
 For offline environments, specify local model files instead. In this mode, kohagi does not make any network requests:
 
 ```bash
@@ -82,7 +90,9 @@ kohagi --model-path models/ruri-v3-130m/model.safetensors \
        --tokenizer-path models/ruri-v3-130m/tokenizer.json
 ```
 
-kohagi expects `config.json` to be located in the same directory as the model weights.
+kohagi expects `config.json` to be located in the same directory as the model
+weights. A `1_Pooling/config.json` beside them is read too if present; without
+it, pass `--pooling` for a CLS model, since there is nothing to detect from.
 
 ## Calling kohagi from another language
 

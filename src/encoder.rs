@@ -559,10 +559,9 @@ mod config_tests {
     /// duplicate field. They agree, and `layer_norm_eps` wins by construction.
     #[test]
     fn accepts_both_spellings() {
-        let c: Config = serde_json::from_str(&config_json(
-            r#""layer_norm_eps": 1e-5, "norm_eps": 1e-5,"#,
-        ))
-        .unwrap();
+        let c: Config =
+            serde_json::from_str(&config_json(r#""layer_norm_eps": 1e-5, "norm_eps": 1e-5,"#))
+                .unwrap();
         assert_eq!(c.layer_norm_eps, 1e-5);
     }
 
