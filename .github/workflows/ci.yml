@@ -27,23 +27,31 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
-      # The Metal backend (src/fused.rs, the encoder's Metal paths) is macOS-only
-      # and compiles out otherwise, so nothing above ever type-checks it. Lint it
-      # on the macOS runner. It cannot run — GitHub's macOS runners have no GPU —
-      # so this builds and lints but does not execute the kernel.
+      # The Metal (src/fused.rs, the encoder's Metal paths) and CoreML
+      # (src/coreml) backends are macOS-only and compile out otherwise, so
+      # nothing above ever type-checks them. Lint them on the macOS runner.
+      # Neither can run here — GitHub's macOS runners have no GPU, and CoreML
+      # needs the Neural Engine — so this builds and lints but does not execute
+      # the kernels.
       - if: runner.os == 'macOS'
-        run: cargo clippy --locked --all-targets --features metal -- -D warnings
+        run: cargo clippy --locked --all-targets --features metal,coreml -- -D warnings
 
   # Release binaries: Apple Silicon macOS and x86_64 Linux. Uploaded as
   # artifacts on every push; attached to the GitHub Release on v* tags.
+  #
+  # The macOS binary bundles the Metal and CoreML backends so `--device metal`
+  # and `--device coreml` work out of the box; both are macOS-only, so the
+  # Linux binary is the CPU path alone.
   build:
     strategy:
       matrix:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+            features: --features metal,coreml
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            features: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -51,7 +59,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
       - name: Smoke-test the protocol without a model
         run: |
           # Empty input must exit 0 without loading anything.

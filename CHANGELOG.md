@@ -14,6 +14,10 @@
   - `--coreml-prefer {compiled,package}` chooses which form to download when a
     repo ships both `.mlmodelc` and `.mlpackage` buckets.
   - `scripts/convert_coreml.py` converts a model to the expected layout.
+  - The prebuilt **macOS** release binary now bundles both `--device coreml`
+    and `--device metal`, so they work out of the box. The Linux binary is
+    CPU-only (both backends are macOS-only), and `cargo install kohagi` builds
+    without them unless you add `--features coreml` / `--features metal`.
 - **Exit code 3** for a CoreML request the backend cannot serve (built without
   the feature, no model given, or `--max-seq-length` past the largest bucket).
   Detected before any input is read, so no output is produced and a caller can
