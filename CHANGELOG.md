@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.1] - 2026-07-23
+
+### Changed
+
+- The prebuilt **macOS** release binary now bundles the Metal and CoreML
+  backends, so `--device metal` and `--device coreml` work without building from
+  source. The Linux binary stays CPU-only (both backends are macOS-only), and
+  `cargo install kohagi` still needs `--features metal` / `--features coreml`.
+
 ## [0.3.0] - 2026-07-23
 
 ### Added
@@ -14,10 +23,6 @@
   - `--coreml-prefer {compiled,package}` chooses which form to download when a
     repo ships both `.mlmodelc` and `.mlpackage` buckets.
   - `scripts/convert_coreml.py` converts a model to the expected layout.
-  - The prebuilt **macOS** release binary now bundles both `--device coreml`
-    and `--device metal`, so they work out of the box. The Linux binary is
-    CPU-only (both backends are macOS-only), and `cargo install kohagi` builds
-    without them unless you add `--features coreml` / `--features metal`.
 - **Exit code 3** for a CoreML request the backend cannot serve (built without
   the feature, no model given, or `--max-seq-length` past the largest bucket).
   Detected before any input is read, so no output is produced and a caller can
@@ -56,5 +61,6 @@
 - Hardened CI: `cargo fmt` / `--locked` checks, per-target release builds, and a
   Metal lint.
 
+[0.3.1]: https://github.com/takahashim/kohagi/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/takahashim/kohagi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/takahashim/kohagi/compare/v0.1.0...v0.2.0
