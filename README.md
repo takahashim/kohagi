@@ -96,6 +96,22 @@ Kohagi expects `config.json` to be located in the same directory as the model
 weights. A `1_Pooling/config.json` beside them is read too if present; without
 it, pass `--pooling` for a CLS model, since there is nothing to detect from.
 
+### Long inputs and truncation
+
+Text longer than `--max-seq-length` (512 tokens by default) is truncated before
+embedding, so its vector reflects only the beginning. This is silent by design —
+the summary line on stderr always ends with `truncated=N`, and `--report-tokens`
+adds `n_tokens` and `truncated` to each output record so a caller can route the
+truncated ones to a chunking pass:
+
+```console
+$ echo '{"id": 1, "text": "…a very long document…"}' | kohagi --report-tokens
+{"id":1,"embedding":[…],"n_tokens":512,"truncated":true}
+```
+
+Raising `--max-seq-length` embeds more of each text at a quadratic cost in
+attention compute. See [PROTOCOL.md](PROTOCOL.md) for the field definitions.
+
 ## Calling Kohagi from another language
 
 Launch Kohagi as a subprocess, write JSONL records to its standard input, and read JSONL results from its standard output.

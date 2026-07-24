@@ -39,6 +39,17 @@ embedded.
   output order matches input order, but the contract doesn't promise it).
 - `embedding` has the model's dimension (512 for ruri-v3-130m) and is
   L2-normalized unless `--no-normalize` is set.
+- **`--report-tokens`** adds two fields per record; without the flag they are
+  omitted entirely, so the default output is unchanged.
+
+  ```json
+  {"id": 123, "embedding": [0.0123, …], "n_tokens": 512, "truncated": true}
+  ```
+
+  | field | type | notes |
+  |---|---|---|
+  | `n_tokens` | integer | Tokens actually embedded, special tokens included — `min(true length, --max-seq-length)`. |
+  | `truncated` | bool | The text ran past `--max-seq-length`, so its tail was dropped; the vector reflects only the kept prefix. Route these to a chunking pass if whole-document coverage matters. |
 - stdout carries records only; every line is written whole (one `write` per
   record), so a reader never sees a partial line. Logs, warnings, and the
   summary go to stderr.
@@ -54,10 +65,13 @@ embedded.
 On completion, one summary line on stderr:
 
 ```
-kohagi: model=cl-nagoya/ruri-v3-130m dim=512 in=2141 out=2141 skipped=0
+kohagi: model=cl-nagoya/ruri-v3-130m dim=512 in=2141 out=2141 skipped=0 truncated=3
 ```
 
 `in` = lines parsed as records = `out + skipped`; blank lines are not counted.
+`truncated` counts how many of the `out` records ran past `--max-seq-length`
+(always reported, with or without `--report-tokens`); a nonzero value is a hint
+to raise `--max-seq-length` or chunk those documents, not an error.
 
 | exit | meaning |
 |---|---|

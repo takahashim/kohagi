@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Truncation visibility.** Text longer than `--max-seq-length` is truncated
+  before embedding; that used to be silent. The stderr summary now always ends
+  with `truncated=N`, and `--report-tokens` adds `n_tokens` and `truncated` to
+  each output record so a caller can route truncated documents to a chunking
+  pass. Without the flag the output is byte-for-byte the previous protocol-1
+  shape. New library method `Embedder::embed_with_tokens` returns the same
+  vectors plus a `TokenInfo` per text.
+
 ## [0.4.0] - 2026-07-24
 
 ### Added

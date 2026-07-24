@@ -142,6 +142,12 @@ struct Args {
     /// portable). Only the chosen form is fetched.
     #[arg(long, value_enum, default_value_t = CoreMlFormArg::Compiled)]
     coreml_prefer: CoreMlFormArg,
+    /// Add `n_tokens` (tokens embedded, specials included) and `truncated`
+    /// (text ran past --max-seq-length, so its tail was dropped) to each output
+    /// record. Off by default, keeping the plain protocol-1 output. The summary
+    /// line always reports how many records were truncated regardless.
+    #[arg(long)]
+    report_tokens: bool,
     /// Skip L2 normalization (normalized output is the default; unit vectors
     /// make dot product = cosine).
     #[arg(long)]
@@ -222,12 +228,6 @@ fn label_of(path: &Path) -> String {
 /// `--text` mode: embed the arguments and print the same JSONL that stdio
 /// mode would, with the argument positions as ids.
 fn embed_arguments(args: &Args, source: &ModelSource) -> anyhow::Result<()> {
-    #[derive(serde::Serialize)]
-    struct Out<'a> {
-        id: usize,
-        embedding: &'a [f32],
-    }
-
     let embedder = Embedder::load(source, args.options())?;
     let prefixed: Vec<String> = args
         .text
@@ -235,8 +235,17 @@ fn embed_arguments(args: &Args, source: &ModelSource) -> anyhow::Result<()> {
         .map(|t| format!("{}{t}", args.prefix))
         .collect();
     let texts: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-    for (id, embedding) in embedder.embed(&texts)?.iter().enumerate() {
-        println!("{}", serde_json::to_string(&Out { id, embedding })?);
+    let (vectors, tokens) = embedder.embed_with_tokens(&texts)?;
+
+    // Same output shape as stdio mode; ids are the argument positions.
+    let mut out = std::io::stdout().lock();
+    for (id, (embedding, info)) in vectors.iter().zip(&tokens).enumerate() {
+        stdio::write_record(
+            &mut out,
+            &serde_json::Value::from(id),
+            embedding,
+            args.report_tokens.then_some(info),
+        )?;
     }
     Ok(())
 }
@@ -251,7 +260,12 @@ fn run(args: Args) -> anyhow::Result<usize> {
     }
 
     let opts = args.options();
-    stdio::run(|| Embedder::load(&source, opts), &args.prefix, &label)
+    stdio::run(
+        || Embedder::load(&source, opts),
+        &args.prefix,
+        args.report_tokens,
+        &label,
+    )
 }
 
 fn main() -> ExitCode {

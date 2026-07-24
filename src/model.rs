@@ -26,7 +26,9 @@ use candle_nn::VarBuilder;
 use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
-use crate::batch::{l2_normalize, load_tokenizer, pool_row, tokenize_bucket, BatchInput, Pooling};
+use crate::batch::{
+    l2_normalize, load_tokenizer, pool_row, tokenize_bucket, BatchInput, Pooling, TokenInfo,
+};
 use crate::config::CoreMlForm;
 use crate::errors::UnsupportedRequest;
 
@@ -310,8 +312,15 @@ impl Embedder {
     /// Embed a batch of texts, one vector per text, in input order. Prefixes
     /// (e.g. Ruri's `"検索文書: "`) are the caller's job — pass prefixed text.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Ok(self.embed_with_tokens(texts)?.0)
+    }
+
+    /// Like [`Embedder::embed`], but also returns a [`TokenInfo`] per text (same
+    /// order as the vectors), so a caller can tell which embeddings were built
+    /// from truncated input. The vectors are identical to [`Embedder::embed`]'s.
+    pub fn embed_with_tokens(&self, texts: &[&str]) -> Result<(Vec<Vec<f32>>, Vec<TokenInfo>)> {
         if texts.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         match &self.engine {
             Engine::Candle { weights, device } => self.embed_candle(texts, weights, device),
@@ -328,8 +337,8 @@ impl Embedder {
         texts: &[&str],
         weights: &Weights,
         device: &Device,
-    ) -> Result<Vec<Vec<f32>>> {
-        let batches = tokenize_bucket(&self.tokenizer, texts, self.opts.batch_size)?;
+    ) -> Result<(Vec<Vec<f32>>, Vec<TokenInfo>)> {
+        let (batches, info) = tokenize_bucket(&self.tokenizer, texts, self.opts.batch_size)?;
 
         // Split each bucketed batch into forwards that fit the memory budget.
         let limit = weights.max_rows_per_forward();
@@ -387,7 +396,7 @@ impl Embedder {
                 rows_out[orig] = vec;
             }
         }
-        Ok(rows_out)
+        Ok((rows_out, info))
     }
 
     /// The CoreML/ANE path: one fixed-shape, batch=1 forward per text, routed
@@ -398,11 +407,12 @@ impl Embedder {
         &self,
         texts: &[&str],
         encoder: &crate::coreml::CoreMlEncoder,
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<(Vec<Vec<f32>>, Vec<TokenInfo>)> {
         let encodings = self
             .tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let info: Vec<TokenInfo> = encodings.iter().map(crate::batch::token_info).collect();
         let dim = encoder.dim();
         let pooling = self.pooling;
 
@@ -434,7 +444,7 @@ impl Embedder {
             }
             rows_out.push(vector);
         }
-        Ok(rows_out)
+        Ok((rows_out, info))
     }
 }
 

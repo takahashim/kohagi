@@ -18,6 +18,31 @@ pub enum Pooling {
     Cls,
 }
 
+/// Per-text tokenization facts, surfaced so a caller can tell a truncated
+/// embedding — one built from only the first `--max-seq-length` tokens — from a
+/// whole one. Both fields come straight off the encoding, so producing them
+/// costs nothing beyond the tokenization that already happens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenInfo {
+    /// Tokens actually embedded, the model's special tokens included — that is,
+    /// `min(true token length, max_seq_length)`.
+    pub n_tokens: usize,
+    /// The text ran past `--max-seq-length`, so its tail was dropped before
+    /// embedding; the vector reflects only the kept prefix.
+    pub truncated: bool,
+}
+
+/// The truncation facts for one encoding. Truncation stores the dropped tail in
+/// the encoding's `overflowing` chunks, so a non-empty list is the signal — no
+/// second tokenization pass and no reliance on the length happening to hit the
+/// cap (a text exactly `max_seq_length` long is not truncated).
+pub fn token_info(enc: &tokenizers::Encoding) -> TokenInfo {
+    TokenInfo {
+        n_tokens: enc.len(),
+        truncated: !enc.get_overflowing().is_empty(),
+    }
+}
+
 /// One padded batch: `ids`/`mask` are row-major `[batch, seq]`, and `orig[i]`
 /// is the caller's index for row `i` (rows are reordered by length).
 pub struct BatchInput {
@@ -50,15 +75,17 @@ struct Tokenized<'a> {
 
 /// Tokenize all texts (no padding), sort by token length, and split into
 /// padded batches of at most `batch_size` rows, each padded only to its own
-/// longest row.
+/// longest row. Also returns per-text [`TokenInfo`] in the original input
+/// order, so truncation can be reported alongside the vectors.
 pub fn tokenize_bucket(
     tokenizer: &Tokenizer,
     texts: &[&str],
     batch_size: usize,
-) -> Result<Vec<BatchInput>> {
+) -> Result<(Vec<BatchInput>, Vec<TokenInfo>)> {
     let encodings = tokenizer
         .encode_batch(texts.to_vec(), true)
         .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+    let info: Vec<TokenInfo> = encodings.iter().map(token_info).collect();
     let rows: Vec<Tokenized> = encodings
         .iter()
         .map(|e| Tokenized {
@@ -66,7 +93,7 @@ pub fn tokenize_bucket(
             mask: e.get_attention_mask(),
         })
         .collect();
-    Ok(bucket(&rows, batch_size))
+    Ok((bucket(&rows, batch_size), info))
 }
 
 /// Group tokenized rows into padded batches. Split out from tokenization so

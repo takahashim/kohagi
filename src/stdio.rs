@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::Embedder;
+use crate::{Embedder, TokenInfo};
 
 /// Records encoded (and written out) per chunk. Bounds resident memory to one
 /// chunk's texts + embeddings instead of the whole input, while leaving
@@ -25,6 +25,35 @@ const CHUNK_ROWS: usize = 1024;
 struct OutRecord<'a> {
     id: &'a Value,
     embedding: &'a [f32],
+    /// Present only under `--report-tokens`; omitted entirely otherwise, so the
+    /// default output is byte-for-byte the protocol-1 shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncated: Option<bool>,
+}
+
+/// Write one output record as a JSONL line — the single definition of the
+/// protocol's output shape, shared by the stdio loop and the `--text` one-shot
+/// path. `tokens` is `Some` only under `--report-tokens`, which adds the
+/// `n_tokens` / `truncated` fields; `None` keeps the plain protocol-1 shape.
+pub fn write_record(
+    out: &mut impl Write,
+    id: &Value,
+    embedding: &[f32],
+    tokens: Option<&TokenInfo>,
+) -> Result<()> {
+    serde_json::to_writer(
+        &mut *out,
+        &OutRecord {
+            id,
+            embedding,
+            n_tokens: tokens.map(|t| t.n_tokens),
+            truncated: tokens.map(|t| t.truncated),
+        },
+    )?;
+    out.write_all(b"\n")?;
+    Ok(())
 }
 
 /// One accepted input line: the opaque id and the raw text.
@@ -55,21 +84,32 @@ fn parse_line(line: &str) -> Result<Option<InRecord>, String> {
     }))
 }
 
+/// How many records a chunk produced, and how many of them were truncated.
+struct Flushed {
+    written: usize,
+    truncated: usize,
+}
+
 /// Embed the buffered chunk, write its output lines, and empty the buffer.
-/// Returns how many records were written.
 ///
 /// The model is loaded here on first use, so input with no valid records
 /// never loads it at all. Each record is written as one complete line, so an
 /// abort can never leave a half-written line for the caller to misread.
+/// `report_tokens` adds the `n_tokens` / `truncated` fields to each record; the
+/// truncated count is tallied for the summary regardless.
 fn flush_chunk(
     embedder: &mut Option<Embedder>,
     load: &impl Fn() -> Result<Embedder>,
     prefix: &str,
+    report_tokens: bool,
     chunk: &mut Vec<InRecord>,
     out: &mut impl Write,
-) -> Result<usize> {
+) -> Result<Flushed> {
     if chunk.is_empty() {
-        return Ok(0);
+        return Ok(Flushed {
+            written: 0,
+            truncated: 0,
+        });
     }
     let embedder = match embedder {
         Some(e) => e,
@@ -81,30 +121,30 @@ fn flush_chunk(
         .map(|r| format!("{prefix}{}", r.text))
         .collect();
     let texts: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-    let vectors = embedder.embed(&texts)?;
+    let (vectors, tokens) = embedder.embed_with_tokens(&texts)?;
 
-    for (record, vector) in chunk.iter().zip(&vectors) {
-        serde_json::to_writer(
-            &mut *out,
-            &OutRecord {
-                id: &record.id,
-                embedding: vector,
-            },
-        )?;
-        out.write_all(b"\n")?;
+    let mut truncated = 0usize;
+    for ((record, vector), info) in chunk.iter().zip(&vectors).zip(&tokens) {
+        truncated += info.truncated as usize;
+        write_record(out, &record.id, vector, report_tokens.then_some(info))?;
     }
     // Flush per chunk so the caller can consume output as it is produced.
     out.flush()?;
 
     let written = chunk.len();
     chunk.clear();
-    Ok(written)
+    Ok(Flushed { written, truncated })
 }
 
 /// Run the protocol over stdin/stdout. Returns the number of skipped lines —
 /// the caller maps >0 to exit code 2; fatal errors (model load, I/O) return
 /// `Err` (exit 1).
-pub fn run(load: impl Fn() -> Result<Embedder>, prefix: &str, model_label: &str) -> Result<usize> {
+pub fn run(
+    load: impl Fn() -> Result<Embedder>,
+    prefix: &str,
+    report_tokens: bool,
+    model_label: &str,
+) -> Result<usize> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
@@ -113,6 +153,7 @@ pub fn run(load: impl Fn() -> Result<Embedder>, prefix: &str, model_label: &str)
     let mut chunk: Vec<InRecord> = Vec::new();
     let mut n_out = 0usize;
     let mut skipped = 0usize;
+    let mut truncated = 0usize;
 
     for (lineno, line) in stdin.lock().lines().enumerate() {
         let line = line.context("reading stdin")?;
@@ -120,7 +161,16 @@ pub fn run(load: impl Fn() -> Result<Embedder>, prefix: &str, model_label: &str)
             Ok(Some(record)) => {
                 chunk.push(record);
                 if chunk.len() >= CHUNK_ROWS {
-                    n_out += flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
+                    let f = flush_chunk(
+                        &mut embedder,
+                        &load,
+                        prefix,
+                        report_tokens,
+                        &mut chunk,
+                        &mut out,
+                    )?;
+                    n_out += f.written;
+                    truncated += f.truncated;
                 }
             }
             Ok(None) => {}
@@ -130,13 +180,25 @@ pub fn run(load: impl Fn() -> Result<Embedder>, prefix: &str, model_label: &str)
             }
         }
     }
-    n_out += flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
+    let f = flush_chunk(
+        &mut embedder,
+        &load,
+        prefix,
+        report_tokens,
+        &mut chunk,
+        &mut out,
+    )?;
+    n_out += f.written;
+    truncated += f.truncated;
 
     // `in` counts record lines (blank lines are ignored entirely); with no
     // valid input the model was never loaded and dim is unknown (0).
     let dim = embedder.as_ref().map_or(0, Embedder::dim);
     let n_in = n_out + skipped;
-    eprintln!("kohagi: model={model_label} dim={dim} in={n_in} out={n_out} skipped={skipped}");
+    eprintln!(
+        "kohagi: model={model_label} dim={dim} in={n_in} out={n_out} \
+         skipped={skipped} truncated={truncated}"
+    );
     Ok(skipped)
 }
 
@@ -156,6 +218,29 @@ mod tests {
             .unwrap();
         assert_eq!(r.id, Value::from("b-9"));
         assert_eq!(r.text, "改行\nあり");
+    }
+
+    #[test]
+    fn write_record_omits_token_fields_unless_reported() {
+        let id = Value::from(1);
+        let v = [0.5f32, 0.5];
+
+        // Default: the plain protocol-1 shape, byte for byte plus the newline.
+        let mut plain = Vec::new();
+        write_record(&mut plain, &id, &v, None).unwrap();
+        assert_eq!(plain, b"{\"id\":1,\"embedding\":[0.5,0.5]}\n");
+
+        // --report-tokens: both fields appear, `truncated: false` included.
+        let mut full = Vec::new();
+        let info = TokenInfo {
+            n_tokens: 7,
+            truncated: false,
+        };
+        write_record(&mut full, &id, &v, Some(&info)).unwrap();
+        assert_eq!(
+            full,
+            b"{\"id\":1,\"embedding\":[0.5,0.5],\"n_tokens\":7,\"truncated\":false}\n"
+        );
     }
 
     #[test]
