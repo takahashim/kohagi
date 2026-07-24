@@ -3,6 +3,8 @@
 - [`parity_check.py`](parity_check.py) — verify kohagi against the
   sentence-transformers / PyTorch reference.
 - [`benchmark.py`](benchmark.py) — time kohagi against that same reference.
+- [`model_check.py`](model_check.py) — smoke-test kohagi against any other
+  ModernBERT sentence encoder on the Hub.
 - [`rails_open3.rb`](rails_open3.rb) — drive kohagi's stdio protocol from
   Ruby/Rails, the pattern any language can copy.
 
@@ -46,10 +48,12 @@ Both were checked on ruri-v3-130m over 400 mixed-length texts:
 | mean | 2.9e-13 | 1.7e-12 |
 | cls | 6.6e-13 | 2.1e-12 |
 
-Note that kohagi's own default is `--pooling mean` regardless of what the
-checkpoint says, so a CLS model such as `Alibaba-NLP/gte-modernbert-base`
-needs `--pooling cls` passed explicitly or the vectors will be wrong in a way
-nothing warns you about.
+kohagi does the same by default: with no `--pooling`, it reads the model's
+`1_Pooling/config.json` and uses what the checkpoint declares, so a CLS model
+such as `Alibaba-NLP/gte-modernbert-base` works without a flag. Passing
+`--pooling` forces a mode and warns if it disagrees with the checkpoint; a
+model that ships no `1_Pooling` (a reranker, a base LM) falls back to mean
+with a warning that it may not be a sentence encoder.
 
 ### What "matching" means
 
@@ -190,6 +194,39 @@ kohagi has nothing to amortize. If you spawn a process per batch — a rake
 task, a cron job, a queue worker handling a few hundred records — that is the
 number that matters. If you run a long-lived Python service that loads the
 model once and embeds continuously, torch on MPS will out-throughput it.
+
+---
+
+## `model_check.py` — does another model work?
+
+kohagi runs any ModernBERT encoder that ships a fast `tokenizer.json` and a
+`1_Pooling/config.json`, not just ruri-v3. This script points it at one and
+checks the embeddings are usable — a retrieval model returns plausible floats
+no matter what, so "it exited 0" proves nothing.
+
+```bash
+python examples/model_check.py --kohagi ./target/release/kohagi \
+    Alibaba-NLP/gte-modernbert-base
+```
+
+```console
+model    : Alibaba-NLP/gte-modernbert-base
+pooling  : cls   (kohagi autodetects; no flag needed)
+dims     : 768
+retrieval: 4/4 correct, smallest margin over runner-up +0.240
+paraphr. : within 0.881-0.917  across 0.425-0.444  [OK]
+bf16     : vs f32  worst 1-cos 6.71e-05
+
+OK: retrieval and paraphrase structure both hold
+```
+
+It reads the checkpoint's own `1_Pooling/config.json` to report the pooling
+kohagi will autodetect — and to flag a model that ships none, which is usually
+a reranker or a base LM rather than a sentence encoder. Requires no Python
+packages; it shells out to the binary and does the arithmetic in the standard
+library. The built-in corpus is English, so for a non-English model pass
+`--prefix-doc` / `--prefix-query` if it expects task prefixes and treat the
+retrieval line as a smoke test, not a benchmark.
 
 ---
 

@@ -112,9 +112,11 @@ struct Args {
     /// sentence similarity).
     #[arg(long, default_value = "")]
     prefix: String,
-    /// How to reduce token embeddings to one vector per text.
-    #[arg(long, value_enum, default_value_t = PoolingArg::Mean)]
-    pooling: PoolingArg,
+    /// How to reduce token embeddings to one vector per text. Omit to take the
+    /// model's own choice from its 1_Pooling/config.json (mean if it ships
+    /// none); pass this only to override that.
+    #[arg(long, value_enum)]
+    pooling: Option<PoolingArg>,
     /// Numeric precision of the forward pass. f32 is identical everywhere;
     /// bf16 is faster but not bit-identical.
     #[arg(long, value_enum, default_value_t = PrecisionArg::F32)]
@@ -159,7 +161,7 @@ struct Args {
 impl Args {
     fn options(&self) -> Options {
         Options {
-            pooling: self.pooling.into(),
+            pooling: self.pooling.map(Into::into),
             normalize: !self.no_normalize,
             max_seq_length: self.max_seq_length,
             batch_size: self.batch_size,
