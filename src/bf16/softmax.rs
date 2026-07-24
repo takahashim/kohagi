@@ -13,7 +13,7 @@
 //! three passes over one `seq`-float row — 2 KB, so it stays in L1 — with an
 //! AVX-512 `exp`. Like [`super::gemm`] it is deliberately single-threaded:
 //! parallelism comes from many forwards in flight, and candle's softmax
-//! nesting a rayon `par_chunks` inside kohagi's own pool is part of what this
+//! nesting a rayon `par_chunks` inside Kohagi's own pool is part of what this
 //! avoids.
 
 #[cfg(target_arch = "x86_64")]

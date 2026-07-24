@@ -1,8 +1,8 @@
-# kohagi
+# Kohagi
 
 A local sentence-embeddings CLI for [Ruri v3](https://huggingface.co/cl-nagoya/ruri-v3-130m) and other ModernBERT encoders.
 
-kohagi reads JSONL records from standard input and writes the corresponding embedding vectors as JSONL.
+Kohagi reads JSONL records from standard input and writes the corresponding embedding vectors as JSONL.
 It runs as a single executable and requires no cloud services or embedding server.
 
 ```console
@@ -10,10 +10,10 @@ $ echo '{"id": 1, "text": "瑠璃も玻璃も照らせば光る"}' | kohagi
 {"id":1,"embedding":[0.006987,-0.032139, …]}
 ```
 
-kohagi is a small CLI and Rust library built with [Candle](https://github.com/huggingface/candle).
+Kohagi is a small CLI and Rust library built with [Candle](https://github.com/huggingface/candle).
 It is designed for one job: embedding text in batches from any environment that can launch a subprocess, such as a Rails rake task, a Node.js script, or a shell pipeline.
 
-### Why use kohagi?
+### Why use Kohagi?
 
 - **Pure Rust and a single executable.** No PyTorch, LibTorch, ONNX Runtime, or Python environment required. Supports macOS with Apple Accelerate and Linux.
 - **Accurate.** Uses f32 inference and closely matches the PyTorch and Sentence Transformers reference implementations  (cosine ≈ 1.0).
@@ -41,8 +41,8 @@ cargo install kohagi
 
 ## Quick start
 
-By default, kohagi uses `cl-nagoya/ruri-v3-130m` (a Japanese sentence-embedding model, 512-dimensions).
-The model is downloaded from the Hugging Face Hub the first time kohagi runs and is cached under `~/.cache/huggingface`.
+By default, Kohagi uses `cl-nagoya/ruri-v3-130m` (a Japanese sentence-embedding model, 512-dimensions).
+The model is downloaded from the Hugging Face Hub the first time Kohagi runs and is cached under `~/.cache/huggingface`.
 
 ```bash
 # Run a quick sanity check without constructing JSONL:
@@ -55,7 +55,7 @@ kohagi --prefix "検索文書: " < texts.jsonl > embeddings.jsonl
 ### Ruri v3 prefixes
 
 Ruri v3 is trained to use task-specific prefixes.
-kohagi prepends the value of `--prefix` to every input text, allowing callers to pass the original text unchanged.
+Kohagi prepends the value of `--prefix` to every input text, allowing callers to pass the original text unchanged.
 
 | Task                              | `--prefix`                    |
 | --------------------------------- | ----------------------------- |
@@ -66,7 +66,7 @@ kohagi prepends the value of `--prefix` to every input text, allowing callers to
 
 ### Other models
 
-kohagi can also run other ModernBERT-based sentence encoders available on the Hugging Face Hub.
+Kohagi can also run other ModernBERT-based sentence encoders available on the Hugging Face Hub.
 For example, you can use [nomic-ai/modernbert-embed-base](https://huggingface.co/nomic-ai/modernbert-embed-base) for English-language retrieval:
 
 ```bash
@@ -76,29 +76,29 @@ kohagi --model-id nomic-ai/modernbert-embed-base \
 
 `cl-nagoya/ruri-v3-310m`, which produces 768-dimensional vectors, works in the
 same way. To check whether a given model produces usable embeddings under
-kohagi, run [`examples/model_check.py`](examples/model_check.py) against it.
+Kohagi, run [`examples/model_check.py`](examples/model_check.py) against it.
 
-Pooling is taken from the model. kohagi reads the checkpoint's
+Pooling is taken from the model. Kohagi reads the checkpoint's
 `1_Pooling/config.json` and uses the mode it declares, so a CLS-pooled model
 such as `Alibaba-NLP/gte-modernbert-base` needs no flag. Pass `--pooling` only
-to override, and kohagi warns if your choice disagrees with the checkpoint —
+to override, and Kohagi warns if your choice disagrees with the checkpoint —
 or if the model ships no pooling config at all, which usually means it is a
 reranker or a base LM rather than a sentence encoder.
 
-For offline environments, specify local model files instead. In this mode, kohagi does not make any network requests:
+For offline environments, specify local model files instead. In this mode, Kohagi does not make any network requests:
 
 ```bash
 kohagi --model-path models/ruri-v3-130m/model.safetensors \
        --tokenizer-path models/ruri-v3-130m/tokenizer.json
 ```
 
-kohagi expects `config.json` to be located in the same directory as the model
+Kohagi expects `config.json` to be located in the same directory as the model
 weights. A `1_Pooling/config.json` beside them is read too if present; without
 it, pass `--pooling` for a CLS model, since there is nothing to detect from.
 
-## Calling kohagi from another language
+## Calling Kohagi from another language
 
-Launch kohagi as a subprocess, write JSONL records to its standard input, and read JSONL results from its standard output.
+Launch Kohagi as a subprocess, write JSONL records to its standard input, and read JSONL results from its standard output.
 
 Read the output concurrently, such as from a separate thread, to prevent the pipe buffer from filling up and blocking the process.
 Use the `id` field to match each result with its input record.
@@ -131,7 +131,7 @@ The CLI is built on the same API, and its `main.rs` is ~100 lines.
 * `--max-seq-length` has the largest effect on throughput because attention cost grows quadratically with sequence length.
 
 Throughput is worth measuring on your own machine and texts rather than taking
-numbers on faith. [`examples/benchmark.py`](examples/benchmark.py) times kohagi against
+numbers on faith. [`examples/benchmark.py`](examples/benchmark.py) times Kohagi against
 Sentence Transformers on the same corpus and settings; see
 [`examples/README.md`](examples/README.md) for measured results on Apple Silicon.
 
@@ -141,7 +141,7 @@ Building with `--features metal` adds an Apple GPU backend. On an M2 it runs
 about 1.8× faster than the Accelerate CPU path — measured on 512-token
 batches — with f32 output unchanged (worst `1 - cosine` 9e-13 against CPU).
 
-The changes live in kohagi's own copy of the ModernBERT encoder
+The changes live in Kohagi's own copy of the ModernBERT encoder
 ([`src/encoder.rs`](src/encoder.rs)), so any build carries them, including
 `cargo install`. They are what makes the Metal path win rather than a CPU
 speedup: on CPU the difference measured smaller than the run-to-run noise,
@@ -203,7 +203,7 @@ Unsupported CPUs, including Apple Silicon, reject `--precision bf16` at startup 
 
 ## Accuracy and reproducibility
 
-kohagi's f32 output matches the Sentence Transformers and PyTorch reference implementation to within f32 rounding error.
+Kohagi's f32 output matches the Sentence Transformers and PyTorch reference implementation to within f32 rounding error.
 On 512-token inputs, `1 - cosine ≈ 3e-12`.
 
 You can verify this on your own texts using [`examples/parity_check.py`](examples/parity_check.py).
@@ -217,11 +217,11 @@ In Saeko Himuro’s Heian-era novel series *Nante Suteki ni Japonésque* (『な
 
 (in Japanese)
 
-## kohagi (小萩)
+## Kohagi (小萩)
 
-kohagiは[Ruri v3](https://huggingface.co/cl-nagoya/ruri-v3-130m) などのModernBERT系文埋め込みモデルをローカル環境で動かすためのCLI/Rustライブラリです。
+Kohagiは[Ruri v3](https://huggingface.co/cl-nagoya/ruri-v3-130m) などのModernBERT系文埋め込みモデルをローカル環境で動かすためのCLI / Rustライブラリです。
 使い方はシンプルで、標準入力に`{"id","text"}`のJSONLを流すと、標準出力に`{"id","embedding"}`を返します。
-外部サービス等を使用せず、バイナリひとつで動作します。
+外部サービス等を使用せず、バイナリ単体で動作します。GPUも不要です。
 
 ```bash
 # インストール(リリースのバイナリ、または cargo install kohagi)
@@ -229,11 +229,11 @@ kohagi --text "瑠璃も玻璃も照らせば光る"          # 動作確認
 kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 ```
 
-- モデルは初回には Hugging Face Hub から自動ダウンロードします (`--model-path`/`--tokenizer-path` でオフライン運用も可)
+- モデルは初回のみ Hugging Face Hub から自動ダウンロードします (`--model-path`/`--tokenizer-path` でオフライン運用も可)
 - x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では `--precision bf16` で約 2 倍高速化します(短文 2.3 倍、512 トークン 2.0 倍、cosine ≈ 0.99999、既定は f32。精度は若干落ちます)
 - Apple Silicon では `--features metal` でビルドすると `--device metal` が使え、512トークンで CPU の約1.8倍で動きます(出力は f32 のまま変わりません)
+- 同様に `--features coreml` でビルドすると `--device coreml` が使え、事前変換したモデルを Apple Neural Engine (ANE) 上で動かせます。512トークンで Metal の約4倍で、CPU 出力に対し cosine ≈ 0.99999 です(短い入力ではマルチコア CPU の方が速いこともあります)。ローカルの変換済みモデルは `--coreml-dir`、Hugging Face Hub 上の同じ構成は `--coreml-model-id` で指定します
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
-- メモリ使用量は入力サイズによらず一定になるようにしました (チャンク処理+attention 予算キャップ)
 - 入出力の契約・exit code(0/2/1)は [PROTOCOL.md](PROTOCOL.md) を参照してください。
   Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) にあります。
 
@@ -244,7 +244,7 @@ xattr -dr com.apple.quarantine ~/.local/bin/kohagi
 ```
 
 
-kohagiの名前は氷室冴子『なんて素敵にジャパネスク』に登場する、瑠璃姫の女房である小萩に由来します。
+Kohagiの名前は氷室冴子『なんて素敵にジャパネスク』に登場する、瑠璃姫の女房である小萩に由来します。
 
 ## License
 

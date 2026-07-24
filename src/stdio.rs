@@ -2,7 +2,7 @@
 //!
 //! One record per line: `{"id": …, "text": "…"}` in, `{"id": …, "embedding":
 //! […]}` out. `id` is opaque and echoed verbatim — callers map results by id,
-//! not by order. kohagi only prepends the configured prefix and embeds; text
+//! not by order. Kohagi only prepends the configured prefix and embeds; text
 //! shaping (trimming, truncation by characters, dedup) is the caller's job,
 //! so an id's embedding always corresponds to exactly the text that was sent.
 //! stdout carries records only; warnings and the final summary go to stderr.

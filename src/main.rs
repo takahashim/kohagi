@@ -1,4 +1,4 @@
-//! kohagi CLI: JSONL embedding over stdin/stdout, plus a `--text` one-shot
+//! Kohagi CLI: JSONL embedding over stdin/stdout, plus a `--text` one-shot
 //! mode for quick checks. See PROTOCOL.md for the full contract.
 //!
 //! Exit codes: 0 = all input embedded, 2 = finished but some lines were

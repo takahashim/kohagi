@@ -1,8 +1,8 @@
-"""Time kohagi against the sentence-transformers / PyTorch reference.
+"""Time Kohagi against the sentence-transformers / PyTorch reference.
 
     python examples/benchmark.py --kohagi ./target/release/kohagi
 
-Both sides are pinned to kohagi's defaults — mean pooling, L2 normalize,
+Both sides are pinned to Kohagi's defaults — mean pooling, L2 normalize,
 max_seq_length 512, batch size 64 — because a throughput comparison between
 differently-configured runs measures the configuration, not the code.
 
@@ -75,12 +75,12 @@ def time_kohagi(binary: str, texts: list[str], args) -> dict:
     r = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
     total = time.perf_counter() - t0
     if r.returncode != 0:
-        sys.exit(f"kohagi failed ({r.returncode}): {r.stderr.strip()}")
+        sys.exit(f"Kohagi failed ({r.returncode}): {r.stderr.strip()}")
 
     return {"load": load, "encode": total - load, "total": total}
 
 
-# Run torch in a fresh process, exactly as kohagi is run. Timing it in-process
+# Run torch in a fresh process, exactly as Kohagi is run. Timing it in-process
 # would let Python's module cache serve the second `import sentence_transformers`
 # for free, hiding ~3s of the startup cost that a real batch job pays every time.
 _ST_SCRIPT = """
@@ -126,8 +126,8 @@ def main() -> int:
         "--precision",
         choices=["f32", "bf16"],
         default="f32",
-        help="kohagi's --precision; bf16 needs an AVX512-BF16 CPU. torch stays f32, "
-        "so a bf16 run compares kohagi against itself, not against the reference.",
+        help="Kohagi's --precision; bf16 needs an AVX512-BF16 CPU. torch stays f32, "
+        "so a bf16 run compares Kohagi against itself, not against the reference.",
     )
     p.add_argument("--skip-torch", action="store_true")
     args = p.parse_args()
@@ -143,7 +143,7 @@ def main() -> int:
     print(f"runs       : {args.runs} (median reported)\n")
 
     # The first run of either implementation pays cold caches — page cache for
-    # kohagi, Metal shader compilation for MPS. Discard it.
+    # Kohagi, Metal shader compilation for MPS. Discard it.
     print("warming up...", flush=True)
     time_kohagi(args.kohagi, texts[:8], args)
 

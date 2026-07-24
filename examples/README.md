@@ -1,18 +1,18 @@
 # Examples
 
-- [`parity_check.py`](parity_check.py) — verify kohagi against the
+- [`parity_check.py`](parity_check.py) — verify Kohagi against the
   sentence-transformers / PyTorch reference.
-- [`benchmark.py`](benchmark.py) — time kohagi against that same reference.
-- [`model_check.py`](model_check.py) — smoke-test kohagi against any other
+- [`benchmark.py`](benchmark.py) — time Kohagi against that same reference.
+- [`model_check.py`](model_check.py) — smoke-test Kohagi against any other
   ModernBERT sentence encoder on the Hub.
-- [`rails_open3.rb`](rails_open3.rb) — drive kohagi's stdio protocol from
+- [`rails_open3.rb`](rails_open3.rb) — drive Kohagi's stdio protocol from
   Ruby/Rails, the pattern any language can copy.
 
 ---
 
 ## `parity_check.py` — matching PyTorch
 
-kohagi's f32 output *is* the sentence-transformers output, to f32 rounding.
+Kohagi's f32 output *is* the sentence-transformers output, to f32 rounding.
 That is the whole premise of using it instead of a Python service, so it is
 worth checking on your own machine and your own texts rather than taking it
 on faith.
@@ -40,7 +40,7 @@ own corpus (one text per line).
 `--pooling` defaults to `model`, meaning each side uses the checkpoint's own
 `1_Pooling` config. Passing `mean` or `cls` forces that mode on both sides,
 which is the only way to exercise a mode the model was not published with —
-ruri-v3 ships as mean, so `--pooling cls` is what covers kohagi's CLS path.
+ruri-v3 ships as mean, so `--pooling cls` is what covers Kohagi's CLS path.
 Both were checked on ruri-v3-130m over 400 mixed-length texts:
 
 | pooling | mean `1 - cosine` | worst |
@@ -48,7 +48,7 @@ Both were checked on ruri-v3-130m over 400 mixed-length texts:
 | mean | 2.9e-13 | 1.7e-12 |
 | cls | 6.6e-13 | 2.1e-12 |
 
-kohagi does the same by default: with no `--pooling`, it reads the model's
+Kohagi does the same by default: with no `--pooling`, it reads the model's
 `1_Pooling/config.json` and uses what the checkpoint declares, so a CLS model
 such as `Alibaba-NLP/gte-modernbert-base` works without a flag. Passing
 `--pooling` forces a mode and warns if it disagrees with the checkpoint; a
@@ -73,15 +73,15 @@ Measured on ruri-v3-130m against `sentence-transformers` on CPU (Linux,
 
 For scale, a `vector(512)` column in pgvector stores float4, which cannot
 represent a difference below ~1e-7 in the first place. The disagreement
-between kohagi and PyTorch is roughly five orders of magnitude smaller than
+between Kohagi and PyTorch is roughly five orders of magnitude smaller than
 what the storage format can hold — it disappears the moment you save it.
 
 `--precision bf16` is a deliberate tradeoff and sits well above this, at
 `1 - cosine ≈ 2e-6` (worst 2e-5). Still negligible for ranking, but it is a
 real difference rather than rounding.
 
-Measured against kohagi's own f32 output over 120 short and 120 long texts,
-which is the same comparison to within the `1e-12` that separates kohagi's f32
+Measured against Kohagi's own f32 output over 120 short and 120 long texts,
+which is the same comparison to within the `1e-12` that separates Kohagi's f32
 from PyTorch. The figure used to be an order of magnitude larger; fusing the
 mask into the softmax removed a rounding step that the separate `broadcast_add`
 had been introducing.
@@ -94,12 +94,12 @@ difference. The script pins all three; if you compare by hand, do the same.
 - **prefix**, exactly, trailing space included. `"検索文書:"` instead of
   `"検索文書: "` moves `1 - cosine` to ~`3e-3` — ten orders of magnitude above
   the real difference, and easy to cause with an unquoted shell variable.
-- **max_seq_length**. kohagi defaults to 512; sentence-transformers uses
+- **max_seq_length**. Kohagi defaults to 512; sentence-transformers uses
   whatever `sentence_bert_config.json` says, which is 8192 for ruri-v3. Any
   text between those limits gets truncated on one side only.
 - **pooling**, against the model's `1_Pooling/config.json` — mean for ruri-v3
   and modernbert-embed. Note ruri-v3 sets `include_prompt: true`, meaning the
-  prefix tokens participate in the mean, which is what kohagi does by
+  prefix tokens participate in the mean, which is what Kohagi does by
   prepending the prefix as ordinary text.
 
 Also worth knowing: ruri-v3 defines no built-in prompts
@@ -142,7 +142,7 @@ kohagi            1.73s   12.00s   13.73s
 torch/mps         9.74s    7.65s   17.51s
 ```
 
-Both sides are pinned to kohagi's defaults — mean pooling, L2 normalize,
+Both sides are pinned to Kohagi's defaults — mean pooling, L2 normalize,
 `max_seq_length` 512, batch size 64 — and torch runs in a fresh subprocess so
 it pays interpreter startup the same way a real batch job would. Timing it
 in-process would let Python's module cache serve the second
@@ -155,7 +155,7 @@ Useful flags: `--kind short|long`, `--count`, `--runs`, `--device cpu|mps|cuda`,
 
 8 cores, 16 GB, macOS 26.3, `ruri-v3-130m` f32 on the CPU, median of three
 runs. 1200 short texts (~30 tokens) or 240 long ones that fill the 512-token
-window. kohagi here is the default CPU backend, not `--device metal`.
+window. Kohagi here is the default CPU backend, not `--device metal`.
 
 | | kohagi | torch/cpu | torch/mps |
 |---|---:|---:|---:|
@@ -172,25 +172,25 @@ and run it yourself before making a decision on it.
 
 Two things the table says:
 
-- **On CPU, compute is a wash** — kohagi is within about 15% of torch/cpu
+- **On CPU, compute is a wash** — Kohagi is within about 15% of torch/cpu
   either way. Accelerate and PyTorch call comparable sgemm, which is the
   expected outcome, not a surprising one.
 - **The end-to-end win is startup.** torch spends several seconds loading
-  before embedding anything; kohagi spends well under one. That gap is what
-  makes a per-invocation subprocess practical, and it is why kohagi ties
+  before embedding anything; Kohagi spends well under one. That gap is what
+  makes a per-invocation subprocess practical, and it is why Kohagi ties
   torch/mps on short totals despite the GPU being twice as fast at the encode.
 
-### Where kohagi loses
+### Where Kohagi loses
 
 At the encode itself, torch/mps is roughly twice as fast — it runs on the
-Apple GPU while the table's kohagi column is the CPU. On long totals it already
+Apple GPU while the table's `kohagi` column is the CPU. On long totals it already
 comes out ahead (28.6 s vs 32.3 s), because at 512 tokens the compute gap
-outgrows kohagi's startup lead. A `--features metal` build closes most of that
+outgrows Kohagi's startup lead. A `--features metal` build closes most of that
 (see the top-level README), but a warm, long-lived torch/mps service still
 out-throughputs a process spawned per batch once the corpus is large enough.
 
-So the honest framing is not "kohagi is faster than PyTorch". It is that
-kohagi has nothing to amortize. If you spawn a process per batch — a rake
+So the honest framing is not "Kohagi is faster than PyTorch". It is that
+Kohagi has nothing to amortize. If you spawn a process per batch — a rake
 task, a cron job, a queue worker handling a few hundred records — that is the
 number that matters. If you run a long-lived Python service that loads the
 model once and embeds continuously, torch on MPS will out-throughput it.
@@ -199,7 +199,7 @@ model once and embeds continuously, torch on MPS will out-throughput it.
 
 ## `model_check.py` — does another model work?
 
-kohagi runs any ModernBERT encoder that ships a fast `tokenizer.json` and a
+Kohagi runs any ModernBERT encoder that ships a fast `tokenizer.json` and a
 `1_Pooling/config.json`, not just ruri-v3. This script points it at one and
 checks the embeddings are usable — a retrieval model returns plausible floats
 no matter what, so "it exited 0" proves nothing.
@@ -211,7 +211,7 @@ python examples/model_check.py --kohagi ./target/release/kohagi \
 
 ```console
 model    : Alibaba-NLP/gte-modernbert-base
-pooling  : cls   (kohagi autodetects; no flag needed)
+pooling  : cls   (Kohagi autodetects; no flag needed)
 dims     : 768
 retrieval: 4/4 correct, smallest margin over runner-up +0.240
 paraphr. : within 0.881-0.917  across 0.425-0.444  [OK]
@@ -221,7 +221,7 @@ OK: retrieval and paraphrase structure both hold
 ```
 
 It reads the checkpoint's own `1_Pooling/config.json` to report the pooling
-kohagi will autodetect — and to flag a model that ships none, which is usually
+Kohagi will autodetect — and to flag a model that ships none, which is usually
 a reranker or a base LM rather than a sentence encoder. Requires no Python
 packages; it shells out to the binary and does the arithmetic in the standard
 library. The built-in corpus is English, so for a non-English model pass
@@ -230,13 +230,13 @@ retrieval line as a smoke test, not a benchmark.
 
 ---
 
-## `rails_open3.rb` — calling kohagi from Ruby
+## `rails_open3.rb` — calling Kohagi from Ruby
 
 Spawn the process, write `{"id","text"}` JSONL to stdin, read
 `{"id","embedding"}` JSONL from stdout, and map results back by `id`.
 
 The one structural requirement: **read stdout from a separate thread while
-writing stdin.** kohagi emits results in chunks as it goes, so writing an
+writing stdin.** Kohagi emits results in chunks as it goes, so writing an
 entire corpus before reading anything fills the pipe buffer and deadlocks
 both processes. The example uses a writer thread plus a reader loop.
 

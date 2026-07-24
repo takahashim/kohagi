@@ -1,11 +1,11 @@
-# kohagi stdio protocol (v1)
+# Kohagi stdio protocol (v1)
 
-kohagi is a pure function from id-tagged texts to id-tagged vectors, spoken
+Kohagi is a pure function from id-tagged texts to id-tagged vectors, spoken
 over stdin/stdout as JSONL. It holds no state and knows nothing about your
 schema; the caller owns the data and maps results back by `id`.
 
 A design principle follows from that: **text shaping is the caller's job.**
-kohagi never trims, truncates (by characters), deduplicates, or otherwise
+Kohagi never trims, truncates (by characters), deduplicates, or otherwise
 edits the text it receives — it only prepends the configured `--prefix`,
 tokenizes (with token-level truncation to `--max-seq-length`), and embeds. If
 you store a digest of what you sent, it corresponds to exactly what was
@@ -42,7 +42,7 @@ embedded.
 - stdout carries records only; every line is written whole (one `write` per
   record), so a reader never sees a partial line. Logs, warnings, and the
   summary go to stderr.
-- Internally kohagi encodes in chunks (1024 records) against a single model
+- Internally Kohagi encodes in chunks (1024 records) against a single model
   load and flushes output after each chunk — resident memory stays flat on
   arbitrarily large input, and the caller can consume results incrementally.
   **Read stdout concurrently while writing stdin** (e.g. a reader thread);

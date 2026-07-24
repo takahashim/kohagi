@@ -103,7 +103,7 @@ kernel void geglu_wide_f32(
         // not reorder or approximate the float ops. It measured no different
         // here — the fused kernel moves the Metal output by 1.5e-13 against the
         // split path — but it keeps that true if the shader grows, which matters
-        // for kohagi's "f32 is f32 everywhere" claim.
+        // for Kohagi's "f32 is f32 everywhere" claim.
         let opts = objc2_metal::MTLCompileOptions::new();
         opts.setMathMode(objc2_metal::MTLMathMode::Safe);
         let lib = dev

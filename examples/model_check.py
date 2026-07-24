@@ -1,8 +1,8 @@
-"""Smoke-test kohagi against any ModernBERT sentence encoder on the Hub.
+"""Smoke-test Kohagi against any ModernBERT sentence encoder on the Hub.
 
-kohagi runs more than the default ruri-v3: any ModernBERT encoder that ships a
+Kohagi runs more than the default ruri-v3: any ModernBERT encoder that ships a
 fast `tokenizer.json` and a sentence-transformers `1_Pooling/config.json`. This
-script points kohagi at one and checks that the embeddings are actually usable,
+script points Kohagi at one and checks that the embeddings are actually usable,
 not merely that the process exited 0 — a retrieval model always returns
 plausible floats, so "it ran" proves nothing.
 
@@ -11,11 +11,11 @@ plausible floats, so "it ran" proves nothing.
 
 What it checks:
 
-- **pooling is taken from the checkpoint.** kohagi reads the model's own
+- **pooling is taken from the checkpoint.** Kohagi reads the model's own
   `1_Pooling/config.json` and needs no `--pooling` flag; a CLS model such as
   gte-modernbert-base just works. This script reads the same file only to print
-  what kohagi will pick, and to flag a model that ships none (a reranker or a
-  base LM, not a sentence encoder — kohagi falls back to mean and warns).
+  what Kohagi will pick, and to flag a model that ships none (a reranker or a
+  base LM, not a sentence encoder — Kohagi falls back to mean and warns).
 - **retrieval structure** — each query's correct document must rank first.
 - **paraphrase clustering** — paraphrase pairs must sit closer than unrelated
   sentences.
@@ -24,7 +24,7 @@ What it checks:
 The built-in corpus is English; for a non-English model, pass `--prefix-doc` /
 `--prefix-query` if it expects task prefixes, and read the retrieval line as a
 sanity check rather than a benchmark. Requires no Python packages — it shells
-out to the kohagi binary and does the arithmetic in the standard library.
+out to the Kohagi binary and does the arithmetic in the standard library.
 """
 
 import argparse
@@ -58,7 +58,7 @@ def declared_pooling(model):
     `config.json` also has a `classifier_pooling` field, which looks
     authoritative and is not: it configures a classification head. Only
     1_Pooling/config.json describes how the sentence embedding is formed, which
-    is why kohagi (and this script) read that file specifically.
+    is why Kohagi (and this script) read that file specifically.
     """
     url = f"https://huggingface.co/{model}/raw/main/1_Pooling/config.json"
     try:
@@ -73,8 +73,8 @@ def declared_pooling(model):
 
 
 def embed(kohagi, model, texts, prefix, precision="f32"):
-    """Run kohagi over `texts`, returning (vectors, error). Pooling is left to
-    kohagi's own autodetection — the point of not passing --pooling here."""
+    """Run Kohagi over `texts`, returning (vectors, error). Pooling is left to
+    Kohagi's own autodetection — the point of not passing --pooling here."""
     cmd = [kohagi, "--model-id", model, "--prefix", prefix]
     if precision != "f32":
         cmd += ["--precision", precision]
@@ -111,10 +111,10 @@ def main():
     print(f"model    : {args.model}")
     pooling = declared_pooling(args.model)
     if pooling is None:
-        print("pooling  : no 1_Pooling/config.json — kohagi warns and falls back "
+        print("pooling  : no 1_Pooling/config.json — Kohagi warns and falls back "
               "to mean; this may not be a sentence encoder")
     else:
-        note = "" if pooling == "mean" else "   (kohagi autodetects; no flag needed)"
+        note = "" if pooling == "mean" else "   (Kohagi autodetects; no flag needed)"
         print(f"pooling  : {pooling}{note}")
 
     docs, err = embed(args.kohagi, args.model, DOCS, args.prefix_doc)

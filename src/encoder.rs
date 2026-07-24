@@ -1,7 +1,7 @@
 //! The ModernBERT encoder.
 //!
 //! Lifted from candle-transformers 0.11.0 (`src/models/modernbert.rs`, MIT OR
-//! Apache-2.0) and modified for kohagi. The original file has no dependency on
+//! Apache-2.0) and modified for Kohagi. The original file has no dependency on
 //! the rest of candle-transformers, so carrying this one file is lighter than
 //! vendoring the whole crate to patch it — and it removes the `[patch.crates-io]`
 //! that would otherwise be dropped on publish, taking the Metal speedups with
@@ -566,7 +566,7 @@ mod config_tests {
     }
 
     /// HF `ModernbertConfig`'s own name — e.g. CodeSearch-ModernBERT-Crow-Plus,
-    /// which kohagi rejected before this alias.
+    /// which Kohagi rejected before this alias.
     #[test]
     fn accepts_norm_eps() {
         let c: Config = serde_json::from_str(&config_json(r#""norm_eps": 3e-5,"#)).unwrap();

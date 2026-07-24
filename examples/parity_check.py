@@ -1,6 +1,6 @@
-"""Check kohagi against the sentence-transformers / PyTorch reference.
+"""Check Kohagi against the sentence-transformers / PyTorch reference.
 
-kohagi's claim is that its f32 output *is* the reference output, to f32
+Kohagi's claim is that its f32 output *is* the reference output, to f32
 rounding. This script verifies that on your own machine and texts.
 
     pip install sentence-transformers
@@ -12,7 +12,7 @@ The three settings that actually bite:
 - **prefix** — must match exactly, trailing space included. A missing space
   moves `1 - cosine` to ~3e-3, ten orders of magnitude above the real
   difference. This is the single most common cause of a "mismatch".
-- **max_seq_length** — kohagi defaults to 512; sentence-transformers uses
+- **max_seq_length** — Kohagi defaults to 512; sentence-transformers uses
   whatever `sentence_bert_config.json` says (8192 for ruri-v3). Texts longer
   than the shorter limit get truncated on one side only.
 - **pooling** — must match the model's `1_Pooling/config.json` (mean for
@@ -64,7 +64,7 @@ def main() -> int:
         with open(args.texts, encoding="utf-8") as f:
             texts = [line.rstrip("\n") for line in f if line.strip()]
 
-    # --- kohagi, over its stdio protocol -------------------------------------
+    # --- Kohagi, over its stdio protocol -------------------------------------
     stdin = "".join(
         json.dumps({"id": i, "text": t}, ensure_ascii=False) + "\n" for i, t in enumerate(texts)
     )
@@ -94,7 +94,7 @@ def main() -> int:
         body = models.Transformer(args.model_id, max_seq_length=args.max_seq_length)
         head = models.Pooling(body.get_word_embedding_dimension(), pooling_mode=args.pooling)
         model = SentenceTransformer(modules=[body, head])
-    model.max_seq_length = args.max_seq_length  # match kohagi's truncation
+    model.max_seq_length = args.max_seq_length  # match Kohagi's truncation
     ref = model.encode(
         [args.prefix + t for t in texts],
         normalize_embeddings=True,

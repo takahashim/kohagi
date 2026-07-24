@@ -26,11 +26,11 @@ hf-hub = "0.4"
 #
 # The ModernBERT encoder lives in src/encoder.rs rather than pulling in
 # candle-transformers: it is one self-contained file, and carrying it directly
-# keeps kohagi's Metal changes in the build even when installed from crates.io.
+# keeps Kohagi's Metal changes in the build even when installed from crates.io.
 candle-core = "0.11"
 candle-nn = "0.11"
 
-# Only for the `metal` feature: kohagi's own fused GeGLU kernel (src/fused.rs)
+# Only for the `metal` feature: Kohagi's own fused GeGLU kernel (src/fused.rs)
 # dispatches through candle's Metal wrappers and needs MTLSize from objc2-metal.
 # Kept semver-aligned with candle-core's pins so cargo unifies to one instance.
 candle-metal-kernels = { version = "0.11", optional = true }

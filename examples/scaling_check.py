@@ -1,9 +1,9 @@
-"""Measure how kohagi's CPU throughput scales with worker threads.
+"""Measure how Kohagi's CPU throughput scales with worker threads.
 
     cargo build --release
     python examples/scaling_check.py --kohagi ./target/release/kohagi
 
-kohagi fans length-bucketed batches across a rayon pool sized to physical
+Kohagi fans length-bucketed batches across a rayon pool sized to physical
 cores. On an 8-core M2 that measured only ~2x over serial, which is either a
 real limit worth fixing or an artifact of a busy machine — telling those apart
 needs a quiet one, so this script checks before it measures and says so when
@@ -11,7 +11,7 @@ the answer is "your machine cannot resolve this".
 
 Two settings are swept independently because they are different mechanisms:
 
-- `RAYON_NUM_THREADS` — how many forwards kohagi runs at once.
+- `RAYON_NUM_THREADS` — how many forwards Kohagi runs at once.
 - `VECLIB_MAXIMUM_THREADS` — how many threads Accelerate uses *inside* one
   matmul. Pinned to 1 for the sweep so the outer scaling is measured on its
   own; measured separately at the end.
@@ -105,7 +105,7 @@ def timed(binary: str, stdin: str, env: dict) -> float:
                        text=True, env=e)
     dt = time.perf_counter() - t0
     if r.returncode != 0:
-        sys.exit(f"kohagi failed: {r.stderr.strip()[-400:]}")
+        sys.exit(f"Kohagi failed: {r.stderr.strip()[-400:]}")
     return dt
 
 

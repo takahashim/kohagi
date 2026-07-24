@@ -462,9 +462,9 @@ fn open_device(backend: Backend) -> Result<Device> {
 /// when it publishes neither a cls nor a mean flag (or has no such file).
 ///
 /// The sentence-transformers config sets one `pooling_mode_*` bool per mode.
-/// Only the two kohagi supports are read; a checkpoint pooling some other way
+/// Only the two Kohagi supports are read; a checkpoint pooling some other way
 /// (max, weighted mean) reads as `None`, the same as no file at all, which is
-/// the honest answer since kohagi cannot reproduce it.
+/// the honest answer since Kohagi cannot reproduce it.
 fn pooling_from_st_config(json: &str) -> Option<Pooling> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     if v.get("pooling_mode_cls_token")? == &serde_json::Value::Bool(true) {
@@ -720,7 +720,7 @@ mod pooling_tests {
 
     #[test]
     fn unsupported_or_absent_pooling_reads_as_none() {
-        // A mode kohagi cannot reproduce, and junk, both decline rather than guess.
+        // A mode Kohagi cannot reproduce, and junk, both decline rather than guess.
         let other = r#"{"pooling_mode_max_tokens": true}"#;
         assert_eq!(pooling_from_st_config(other), None);
         assert_eq!(pooling_from_st_config("not json"), None);

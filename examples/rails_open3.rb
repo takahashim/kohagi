@@ -31,7 +31,7 @@ Open3.popen3(*cmd) do |stdin, stdout, stderr, wait|
   writer.join
   logger.join
   status = wait.value
-  raise "kohagi failed (exit #{status.exitstatus})" if status.exitstatus == 1
+  raise "Kohagi failed (exit #{status.exitstatus})" if status.exitstatus == 1
 end
 
 # e.g. verify dimensions before writing to a pgvector column

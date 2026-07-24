@@ -1,4 +1,4 @@
-//! kohagi — local sentence embeddings for [Ruri v3] and other ModernBERT
+//! Kohagi — local sentence embeddings for [Ruri v3] and other ModernBERT
 //! encoders, in pure Rust (via [candle]).
 //!
 //! The library is one type: [`Embedder`]. Load a model (from the Hugging Face

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Convert a ModernBERT sentence encoder to the CoreML layout kohagi expects.
+"""Convert a ModernBERT sentence encoder to the CoreML layout Kohagi expects.
 
-kohagi's `--device coreml` backend runs the encoder on the Apple Neural Engine.
+Kohagi's `--device coreml` backend runs the encoder on the Apple Neural Engine.
 The ANE needs a *fixed-shape, batch=1* model, and one model per sequence length,
 so this script emits one `seq-<N>.mlpackage` per bucket length plus the
 tokenizer and config:
@@ -17,7 +17,7 @@ tokenizer and config:
         seq-256.mlmodelc
         seq-512.mlmodelc
 
-Point kohagi at it locally:
+Point Kohagi at it locally:
 
     kohagi --device coreml --coreml-dir <out-dir>
 
@@ -61,7 +61,7 @@ def patch_int_op():
 
 class Encoder(torch.nn.Module):
     """Expose a clean (input_ids, attention_mask) -> last_hidden_state forward.
-    Pooling and L2 normalization stay in kohagi (Rust)."""
+    Pooling and L2 normalization stay in Kohagi (Rust)."""
 
     def __init__(self, model):
         super().__init__()
@@ -109,7 +109,7 @@ def main():
         "--compiled",
         action="store_true",
         help="also emit a compiled seq-<N>.mlmodelc beside each .mlpackage. "
-        "kohagi then loads the .mlmodelc directly (no per-run compile) and "
+        "Kohagi then loads the .mlmodelc directly (no per-run compile) and "
         "falls back to the .mlpackage if it can't. Doubles the output size.",
     )
     args = ap.parse_args()
