@@ -1,6 +1,22 @@
 # Changelog
 
-## [0.3.1] - 2026-07-23
+## [0.4.0] - 2026-07-24
+
+### Added
+
+- **Pooling is taken from the checkpoint.** Kohagi reads the model's
+  `1_Pooling/config.json` and uses the mode it declares, so a CLS-pooled model
+  such as `Alibaba-NLP/gte-modernbert-base` works without a flag. `--pooling`
+  now only overrides, and warns if the choice disagrees with the checkpoint, or
+  if the model ships no pooling config at all (usually a reranker or a base LM
+  rather than a sentence encoder).
+- **Broader `config.json` compatibility.** The LayerNorm epsilon is accepted
+  under HF's `norm_eps` spelling as well as `layer_norm_eps` (ruri ships both),
+  and a config carrying neither falls back to the default rather than failing to
+  load. Lets more ModernBERT checkpoints run unchanged.
+- `examples/model_check.py` — smoke-test Kohagi against any ModernBERT sentence
+  encoder on the Hub, checking retrieval and paraphrase structure rather than
+  just that the process exited 0.
 
 ### Changed
 
@@ -8,6 +24,18 @@
   backends, so `--device metal` and `--device coreml` work without building from
   source. The Linux binary stays CPU-only (both backends are macOS-only), and
   `cargo install kohagi` still needs `--features metal` / `--features coreml`.
+- **`--pooling` no longer defaults to `mean`.** With the flag omitted, the
+  pooling now comes from the checkpoint (see above) instead of always being
+  mean. Mean-pooled models are unaffected; CLS models now pick CLS on their own.
+
+### Notes
+
+- `Options::pooling` changed from `Pooling` to `Option<Pooling>` (`None` =
+  detect from the checkpoint). A breaking change for library code that sets the
+  field.
+- The project name is now written **Kohagi** as a proper noun in prose; the
+  command, crate, and repository stay lowercase `kohagi`. Documentation only —
+  nothing to change in your setup.
 
 ## [0.3.0] - 2026-07-23
 
@@ -61,6 +89,6 @@
 - Hardened CI: `cargo fmt` / `--locked` checks, per-target release builds, and a
   Metal lint.
 
-[0.3.1]: https://github.com/takahashim/kohagi/compare/v0.3.0...v0.3.1
+[0.4.0]: https://github.com/takahashim/kohagi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/takahashim/kohagi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/takahashim/kohagi/compare/v0.1.0...v0.2.0
