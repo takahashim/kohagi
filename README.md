@@ -74,7 +74,9 @@ kohagi --model-id nomic-ai/modernbert-embed-base \
        --prefix "search_document: " < texts.jsonl
 ```
 
-`cl-nagoya/ruri-v3-310m`, which produces 768-dimensional vectors, works in the same way.
+`cl-nagoya/ruri-v3-310m`, which produces 768-dimensional vectors, works in the
+same way. To check whether a given model produces usable embeddings under
+kohagi, run [`examples/model_check.py`](examples/model_check.py) against it.
 
 Pooling is taken from the model. kohagi reads the checkpoint's
 `1_Pooling/config.json` and uses the mode it declares, so a CLS-pooled model
