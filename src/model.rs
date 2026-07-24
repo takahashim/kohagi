@@ -217,10 +217,7 @@ impl Embedder {
             }
         };
 
-        let (pooling, note) = resolve_pooling(opts.pooling, detected_pooling);
-        if let Some(note) = note {
-            eprintln!("kohagi: {}", note.message());
-        }
+        let pooling = resolve_pooling_warned(opts.pooling, detected_pooling);
 
         let config_path = model_path
             .parent()
@@ -285,13 +282,7 @@ impl Embedder {
 
         let tokenizer = load_tokenizer(&dir.join("tokenizer.json"), opts.max_seq_length)?;
 
-        let detected = std::fs::read_to_string(dir.join("1_Pooling").join("config.json"))
-            .ok()
-            .and_then(|s| pooling_from_st_config(&s));
-        let (pooling, note) = resolve_pooling(opts.pooling, detected);
-        if let Some(note) = note {
-            eprintln!("kohagi: {}", note.message());
-        }
+        let pooling = resolve_pooling_warned(opts.pooling, pooling_in_dir(&dir));
 
         Ok(Self {
             engine: Engine::CoreMl(encoder),
@@ -548,6 +539,17 @@ fn resolve_pooling(
     }
 }
 
+/// [`resolve_pooling`], with its warning (if any) emitted to stderr. The two
+/// load paths share this so the decision and its message live in one place;
+/// the pure `resolve_pooling` stays separate for testing.
+fn resolve_pooling_warned(requested: Option<Pooling>, detected: Option<Pooling>) -> Pooling {
+    let (pooling, note) = resolve_pooling(requested, detected);
+    if let Some(note) = note {
+        eprintln!("kohagi: {}", note.message());
+    }
+    pooling
+}
+
 /// Read and parse a `config.json`.
 fn read_config(path: &Path) -> Result<Config> {
     let text =
@@ -577,12 +579,19 @@ fn fetch_from_hub(repo: &str) -> Result<(PathBuf, PathBuf, Option<Pooling>)> {
     Ok((model, tokenizer, pooling))
 }
 
+/// The declared pooling in a checkpoint directory, read from its
+/// `1_Pooling/config.json` if present. The one place the `1_Pooling/config.json`
+/// path convention lives for on-disk checkpoints (the Hub path fetches it
+/// through the API instead).
+fn pooling_in_dir(dir: &Path) -> Option<Pooling> {
+    let text = std::fs::read_to_string(dir.join("1_Pooling").join("config.json")).ok()?;
+    pooling_from_st_config(&text)
+}
+
 /// The declared pooling of a local model, read from `1_Pooling/config.json`
 /// beside the weights if present.
 fn local_pooling(model_path: &Path) -> Option<Pooling> {
-    let cfg = model_path.parent()?.join("1_Pooling").join("config.json");
-    let text = std::fs::read_to_string(cfg).ok()?;
-    pooling_from_st_config(&text)
+    pooling_in_dir(model_path.parent()?)
 }
 
 fn load_weights(
