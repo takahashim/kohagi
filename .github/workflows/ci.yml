@@ -75,6 +75,11 @@ jobs:
           method: network
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
+        # Hosted runners do not expose a GPU, so Candle cannot query
+        # nvidia-smi. Compile PTX for Turing (sm_75), which remains compatible
+        # with newer NVIDIA architectures through driver JIT compilation.
+        env:
+          CUDA_COMPUTE_CAP: '75'
       - name: Smoke-test the protocol without a model (Unix)
         if: runner.os != 'Windows'
         run: |
