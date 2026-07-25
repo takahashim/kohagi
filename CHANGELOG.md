@@ -4,6 +4,10 @@
 
 ### Added
 
+- **Windows NVIDIA GPU support.** The new `cuda` feature and `--device cuda`
+  run Candle's CUDA backend on NVIDIA GPUs. Windows x64 release builds now
+  bundle that backend, and CI compiles both the default Windows build and the
+  CUDA release build. AMD and Intel GPUs remain unsupported.
 - **Truncation visibility.** Text longer than `--max-seq-length` is truncated
   before embedding; that used to be silent. The stderr summary now always ends
   with `truncated=N`, and `--report-tokens` adds `n_tokens` and `truncated` to

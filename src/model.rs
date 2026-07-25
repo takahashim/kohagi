@@ -41,20 +41,20 @@ use crate::errors::UnsupportedRequest;
 /// without buying any parallelism, since the rows already run in parallel.
 const ATTN_BUDGET: usize = 2 * 512 * 512;
 
-/// Same budget for the GPU, which runs one stream of wide forwards rather than
+/// Same budget for a GPU, which runs one stream of wide forwards rather than
 /// many narrow ones.
 ///
 /// The width barely matters now: with the vendored candle's SDPA the attention
 /// scores are never materialized, so 4 rows measured 16.80s against 17.59s at
 /// 64 on a 240-text run. It mattered a great deal before that, in the opposite
 /// direction, which is why the constant exists at all.
-const METAL_ATTN_BUDGET: usize = 16 * 512 * 512;
+const GPU_ATTN_BUDGET: usize = 16 * 512 * 512;
 
 /// Rows allowed in one forward of padded length `seq`.
 fn rows_per_forward(seq: usize, backend: Backend) -> usize {
     let budget = match backend {
         Backend::Cpu => ATTN_BUDGET,
-        Backend::Metal => METAL_ATTN_BUDGET,
+        Backend::Metal | Backend::Cuda => GPU_ATTN_BUDGET,
         // CoreML runs its own fixed-shape, batch=1 path (see embed_coreml) and
         // never reaches the candle memory-budget splitter.
         Backend::CoreML => unreachable!("CoreML does not use the candle attention budget"),
@@ -126,6 +126,9 @@ pub enum Backend {
     /// execution strategies (see [`Embedder::embed`]), so this is a fork of
     /// the pipeline rather than a drop-in swap.
     Metal,
+    /// NVIDIA GPU via Candle's CUDA backend. Requires the `cuda` cargo feature
+    /// and an NVIDIA driver with a compatible CUDA runtime.
+    Cuda,
     /// Apple Neural Engine via CoreML. Requires the `coreml` cargo feature and
     /// a [`ModelSource::CoreMl`] directory of pre-converted fixed-shape models.
     /// Runs batch=1 per bucket length; unsupported requests fail fast with
@@ -231,8 +234,9 @@ impl Embedder {
         // The bf16 path is a hand-written CPU GEMM (see `crate::bf16`), so it
         // has nothing to run on a GPU.
         anyhow::ensure!(
-            !(opts.backend == Backend::Metal && opts.precision == Precision::Bf16),
-            "bf16 is a CPU-only fast path and cannot run on Metal; pick one"
+            !matches!(opts.backend, Backend::Metal | Backend::Cuda)
+                || opts.precision != Precision::Bf16,
+            "bf16 is a CPU-only fast path and cannot run on a GPU; pick f32"
         );
 
         let device = open_device(opts.backend)?;
@@ -329,9 +333,9 @@ impl Embedder {
         }
     }
 
-    /// The candle (CPU/Metal) path: length-bucketed, padded batches split to a
+    /// The candle (CPU/GPU) path: length-bucketed, padded batches split to a
     /// memory budget and fanned across a thread pool (CPU) or run wide back to
-    /// back (Metal).
+    /// back (GPU).
     fn embed_candle(
         &self,
         texts: &[&str],
@@ -378,11 +382,11 @@ impl Embedder {
         // The two backends want opposite shapes. On the CPU, parallelism comes
         // from running many narrow forwards at once. There is only one GPU, so
         // fanning out just makes threads contend over command submission and
-        // multiplies scratch memory; Metal runs wide forwards back to back
+        // multiplies scratch memory; a GPU runs wide forwards back to back
         // instead, and gets its parallelism inside each one.
         let per_unit: Vec<Result<PooledRows>> = match self.opts.backend {
             Backend::Cpu => worker_pool()?.install(|| units.par_iter().map(run).collect()),
-            Backend::Metal => units.iter().map(run).collect(),
+            Backend::Metal | Backend::Cuda => units.iter().map(run).collect(),
             // embed() dispatches CoreML to embed_coreml, so it never arrives here.
             Backend::CoreML => unreachable!("CoreML uses embed_coreml, not embed_candle"),
         };
@@ -462,6 +466,14 @@ fn open_device(backend: Backend) -> Result<Device> {
         Backend::Metal => anyhow::bail!(
             "this binary was built without Metal support; rebuild with \
              `cargo build --release --features metal`"
+        ),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => Device::new_cuda(0)
+            .context("cannot open CUDA device 0 (is an NVIDIA driver and CUDA runtime installed?)"),
+        #[cfg(not(feature = "cuda"))]
+        Backend::Cuda => anyhow::bail!(
+            "this binary was built without CUDA support; rebuild with \
+             `cargo build --release --features cuda`"
         ),
         // CoreML is routed to its own loader before open_device is reached.
         Backend::CoreML => unreachable!("CoreML backend does not use a candle Device"),
@@ -719,6 +731,21 @@ fn worker_pool() -> Result<rayon::ThreadPool> {
 #[cfg(test)]
 mod pooling_tests {
     use super::*;
+
+    #[test]
+    fn gpu_backends_use_the_wide_forward_budget() {
+        assert_eq!(
+            rows_per_forward(512, Backend::Metal),
+            rows_per_forward(512, Backend::Cuda)
+        );
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn cuda_request_without_feature_explains_how_to_enable_it() {
+        let err = open_device(Backend::Cuda).unwrap_err().to_string();
+        assert!(err.contains("--features cuda"), "unexpected error: {err}");
+    }
 
     #[test]
     fn reads_cls_and_mean_from_st_config() {

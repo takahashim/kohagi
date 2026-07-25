@@ -15,19 +15,22 @@ It is designed for one job: embedding text in batches from any environment that 
 
 ### Why use Kohagi?
 
-- **Pure Rust and a single executable.** No PyTorch, LibTorch, ONNX Runtime, or Python environment required. Supports macOS with Apple Accelerate and Linux.
+- **Pure Rust and a single executable.** No PyTorch, LibTorch, ONNX Runtime, or Python environment required. Supports macOS, Linux, and Windows x64 (CUDA on NVIDIA GPUs).
 - **Accurate.** Uses f32 inference and closely matches the PyTorch and Sentence Transformers reference implementations  (cosine ≈ 1.0).
 - **Bounded memory usage.** Attention scratch space is capped for each forward pass, and input is processed in chunks. Peak memory usage therefore depends primarily on the number of CPU cores, not on the total amount of input.
 - **A deliberately simple, stable interface.** `{"id","text"}` in, `{"id","embedding"}` out, with exit codes `0`, `2`, and `1`. See [PROTOCOL.md](PROTOCOL.md).
 
 ## Install
 
-Prebuilt binaries for macOS (Apple Silicon) and Linux (x86_64) are on the
-[releases page](https://github.com/takahashim/kohagi/releases):
+Prebuilt binaries for macOS (Apple Silicon), Linux (x86_64), and Windows x64
+(NVIDIA CUDA) are on the [releases page](https://github.com/takahashim/kohagi/releases).
+On macOS and Linux:
 
 ```bash
 tar -xzf kohagi-<target>.tar.gz && mv kohagi ~/.local/bin/
 ```
+
+On Windows, extract `kohagi-x86_64-pc-windows-msvc.zip` and run `kohagi.exe`.
 
 The binaries are unsigned, so unpacking from Finder on macOS leaves a quarantine
 attribute that Gatekeeper blocks. Extracting with `tar` as above avoids it;
@@ -37,6 +40,16 @@ Or with cargo:
 
 ```bash
 cargo install kohagi
+```
+
+### NVIDIA GPU on Windows
+
+Kohagi can use an NVIDIA GPU through CUDA on Windows x64. Install a compatible
+NVIDIA driver and CUDA runtime, then use the Windows release binary with
+`--device cuda`:
+
+```powershell
+kohagi.exe --device cuda --prefix "検索文書: " < texts.jsonl > embeddings.jsonl
 ```
 
 ## Quick start

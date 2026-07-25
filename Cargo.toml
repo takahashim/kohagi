@@ -53,6 +53,10 @@ objc2-core-ml = { version = "0.3", optional = true, features = [
 candle-core = { version = "0.11", features = ["accelerate"] }
 
 [features]
+# NVIDIA GPU via Candle's CUDA backend: `cargo build --release --features cuda`,
+# then `kohagi --device cuda`. Requires an NVIDIA driver and CUDA runtime.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
 # Apple GPU via candle's Metal backend: `cargo build --release --features metal`,
 # then `kohagi --device metal`. ~1.8x the Accelerate CPU path on an M2 at 512
 # tokens; off by default because it is macOS-only and pulls in the metal crates.
@@ -74,4 +78,3 @@ coreml = [
 
 [profile.release]
 lto = "thin"
-

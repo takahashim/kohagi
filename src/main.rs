@@ -39,6 +39,8 @@ enum BackendArg {
     Cpu,
     /// Apple GPU. Needs a binary built with `--features metal`.
     Metal,
+    /// NVIDIA GPU via CUDA. Needs a binary built with `--features cuda`.
+    Cuda,
     /// Apple Neural Engine. Needs a binary built with `--features coreml` and
     /// `--coreml-dir` pointing at pre-converted fixed-shape models.
     Coreml,
@@ -84,6 +86,7 @@ impl From<BackendArg> for Backend {
         match b {
             BackendArg::Cpu => Backend::Cpu,
             BackendArg::Metal => Backend::Metal,
+            BackendArg::Cuda => Backend::Cuda,
             BackendArg::Coreml => Backend::CoreML,
         }
     }
@@ -121,7 +124,8 @@ struct Args {
     /// bf16 is faster but not bit-identical.
     #[arg(long, value_enum, default_value_t = PrecisionArg::F32)]
     precision: PrecisionArg,
-    /// Device for the forward pass. metal requires a binary built with
+    /// Device for the forward pass. cuda requires an NVIDIA GPU and a binary
+    /// built with `--features cuda`. metal requires a binary built with
     /// `--features metal`, and runs ~1.2x faster than cpu on Apple Silicon.
     /// coreml (Apple Neural Engine) requires `--features coreml` and
     /// `--coreml-dir`.
