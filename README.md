@@ -122,6 +122,33 @@ Use the `id` field to match each result with its input record.
 A complete Ruby example is available in [`examples/rails_open3.rb`](examples/rails_open3.rb).
 See [PROTOCOL.md](PROTOCOL.md) for the exit-code semantics.
 
+### Ruby
+
+In Ruby, [kohagi-ruby](https://github.com/takahashim/kohagi-ruby)
+packages that plumbing: it builds the command line from the CLI flags, spawns
+the process without deadlocking on the pipe buffer, and turns the exit codes
+into outcomes.
+
+```ruby
+require "kohagi"
+
+client = Kohagi::Client.new(prefix: "検索文書: ")
+
+records = [
+  { id: 1, text: "瑠璃も玻璃も照らせば光る" },
+  { id: 2, text: "犬も歩けば棒に当たる" },
+]
+
+# Each result is yielded as it arrives, so memory stays flat on any corpus.
+summary = client.embed(records) do |result|
+  store(result.id, result.embedding)   # e.g. a pgvector column
+end
+
+summary.dim        # => 512
+summary.out        # => 2
+summary.truncated  # => 0
+```
+
 ## Using the Rust library
 
 ```rust
@@ -252,6 +279,8 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
 - 入出力の契約・exit code(0/2/1)は [PROTOCOL.md](PROTOCOL.md) を参照してください。
   Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) にあります。
+
+また、Ruby では Kohagi 専用の gem である [kohagi-ruby](https://github.com/takahashim/kohagi-ruby)が使えます。
 
 なおmacOSで隔離属性のせいで起動がブロックされた場合は以下を実行して解除してください。
 
