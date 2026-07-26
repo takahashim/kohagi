@@ -65,6 +65,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # nvcc delegates host C++ compilation to MSVC. Load the x64 developer
+      # environment so cl.exe and the Windows SDK are on PATH.
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: amd64
       # Candle compiles CUDA kernels at build time. GitHub's Windows runner has
       # no CUDA Toolkit by default, so install the same 12.4 toolkit users can
       # install locally. The runner has no GPU; this validates compilation only.
