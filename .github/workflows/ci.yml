@@ -85,7 +85,7 @@ jobs:
         # nvidia-smi. Compile PTX for Turing (sm_75), which remains compatible
         # with newer NVIDIA architectures through driver JIT compilation.
         env:
-          CUDA_COMPUTE_CAP: '75'
+          CUDA_COMPUTE_CAP: '80'
       - name: Smoke-test the protocol without a model (Unix)
         if: runner.os != 'Windows'
         run: |
