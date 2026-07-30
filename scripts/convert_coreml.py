@@ -12,6 +12,7 @@ tokenizer and config:
       seq-512.mlpackage
       tokenizer.json
       config.json
+      1_Pooling/config.json     # if the base model ships one
       compiled/                 # only with --compiled
         seq-128.mlmodelc
         seq-256.mlmodelc
@@ -144,6 +145,21 @@ def main():
         src = hf_hub_download(args.model_id, fname)
         shutil.copy(src, args.out_dir / fname)
         print(f"  copied {fname}")
+
+    # And the declared pooling, so Kohagi reads it from the converted directory
+    # exactly as it would from the base checkpoint. Without it Kohagi falls back
+    # to mean and warns that this may not be a sentence-embedding model at all —
+    # true of a reranker, alarming for a converted encoder that is fine.
+    # Copy rather than symlink: the HF cache stores a tree of symlinks, and this
+    # directory is meant to be uploadable as-is.
+    try:
+        src = hf_hub_download(args.model_id, "1_Pooling/config.json")
+    except Exception as e:  # a model may genuinely ship none
+        print(f"  no 1_Pooling/config.json ({type(e).__name__}); Kohagi will warn and use mean")
+    else:
+        (args.out_dir / "1_Pooling").mkdir(exist_ok=True)
+        shutil.copy(src, args.out_dir / "1_Pooling" / "config.json")
+        print("  copied 1_Pooling/config.json")
 
     print(f"\ndone -> {args.out_dir}")
     print(f"try: kohagi --device coreml --coreml-dir {args.out_dir} --text '瑠璃も玻璃も照らせば光る'")
