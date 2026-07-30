@@ -62,14 +62,56 @@ struct RawConfig {
     norm_eps: Option<f64>,
     pad_token_id: u32,
     global_attn_every_n_layers: usize,
-    global_rope_theta: f64,
+    // transformers 5.x moves the RoPE thetas into `rope_parameters` and stops
+    // writing the flat keys, so both spellings are optional here and merged
+    // below. A config carrying neither is an error, not a default: silently
+    // assuming a theta would produce wrong embeddings for every position.
+    global_rope_theta: Option<f64>,
     local_attention: usize,
-    local_rope_theta: f64,
+    local_rope_theta: Option<f64>,
+    rope_parameters: Option<RopeParameters>,
+}
+
+/// The transformers 5.x spelling of the RoPE settings: one entry per attention
+/// kind, each carrying its own theta.
+#[derive(serde::Deserialize)]
+struct RopeParameters {
+    full_attention: Option<RopeTheta>,
+    sliding_attention: Option<RopeTheta>,
+}
+
+#[derive(serde::Deserialize)]
+struct RopeTheta {
+    rope_theta: Option<f64>,
 }
 
 impl<'de> Deserialize<'de> for Config {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let r = RawConfig::deserialize(d)?;
+        let rope = r.rope_parameters.as_ref();
+        let theta = |kind: fn(&RopeParameters) -> &Option<RopeTheta>,
+                     flat: Option<f64>,
+                     name: &str|
+         -> std::result::Result<f64, D::Error> {
+            rope.and_then(|p| kind(p).as_ref())
+                .and_then(|t| t.rope_theta)
+                .or(flat)
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "config has neither `rope_parameters` nor `{name}`"
+                    ))
+                })
+        };
+        let global_rope_theta = theta(
+            |p| &p.full_attention,
+            r.global_rope_theta,
+            "global_rope_theta",
+        )?;
+        let local_rope_theta = theta(
+            |p| &p.sliding_attention,
+            r.local_rope_theta,
+            "local_rope_theta",
+        )?;
         Ok(Config {
             vocab_size: r.vocab_size,
             hidden_size: r.hidden_size,
@@ -82,9 +124,9 @@ impl<'de> Deserialize<'de> for Config {
             layer_norm_eps: r.layer_norm_eps.or(r.norm_eps).unwrap_or(1e-5),
             pad_token_id: r.pad_token_id,
             global_attn_every_n_layers: r.global_attn_every_n_layers,
-            global_rope_theta: r.global_rope_theta,
+            global_rope_theta,
             local_attention: r.local_attention,
-            local_rope_theta: r.local_rope_theta,
+            local_rope_theta,
         })
     }
 }
@@ -557,6 +599,36 @@ mod config_tests {
 
     /// ruri-v3 ships both spellings; an `alias` would have rejected that as a
     /// duplicate field. They agree, and `layer_norm_eps` wins by construction.
+    #[test]
+    fn reads_the_transformers_5_rope_spelling() {
+        // transformers 5.x writes `rope_parameters` and drops the flat keys.
+        let json = r#"{
+            "vocab_size": 100, "hidden_size": 64, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "intermediate_size": 128,
+            "max_position_embeddings": 512, "pad_token_id": 0,
+            "global_attn_every_n_layers": 3, "local_attention": 128,
+            "rope_parameters": {
+                "full_attention": {"rope_theta": 160000.0, "rope_type": "default"},
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+            }
+        }"#;
+        let c: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(c.global_rope_theta, 160_000.0);
+        assert_eq!(c.local_rope_theta, 10_000.0);
+
+        // Carrying neither spelling is an error rather than a silent default.
+        let json = r#"{
+            "vocab_size": 100, "hidden_size": 64, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "intermediate_size": 128,
+            "max_position_embeddings": 512, "pad_token_id": 0,
+            "global_attn_every_n_layers": 3, "local_attention": 128
+        }"#;
+        let err = serde_json::from_str::<Config>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rope_parameters"), "{err}");
+    }
+
     #[test]
     fn accepts_both_spellings() {
         let c: Config =
