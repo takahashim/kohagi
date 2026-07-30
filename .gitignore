@@ -1,5 +1,8 @@
 /target
 
+# The CoreML development jigs build separately (tools/ is outside the workspace)
+/tools/coreml-jigs/target
+
 # Python bytecode from the example scripts
 __pycache__/
 

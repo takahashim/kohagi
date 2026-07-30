@@ -1,0 +1,45 @@
+[package]
+name = "coreml-jigs"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+description = "macOS-only development jigs for Kohagi's CoreML backend"
+
+# Deliberately outside the kohagi workspace (root Cargo.toml excludes `tools`),
+# so these three binaries and their deps stay out of kohagi's Cargo.lock and out
+# of the published crate. Build them explicitly:
+#
+#     cargo build --release --manifest-path tools/coreml-jigs/Cargo.toml
+
+[dependencies]
+half = "2"
+serde_json = "1"
+
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue", "NSError",
+] }
+objc2-core-ml = { version = "0.3", features = [
+    # coreml-inspect: function names and per-function input/output descriptions,
+    # read from the asset without loading the model onto the ANE.
+    "MLModelAsset", "MLModelDescription", "MLFeatureDescription",
+    "MLMultiArrayConstraint", "MLMultiArray",
+    # computeplan: per-operation device assignment.
+    "MLComputePlan", "MLComputePlanCost", "MLComputePlanDeviceUsage",
+    "MLComputeDeviceProtocol", "MLModelConfiguration",
+    "MLModelStructure", "MLModelStructureProgram",
+    "MLModelStructureProgramFunction", "MLModelStructureProgramBlock",
+    "MLModelStructureProgramOperation",
+    "block2",
+] }
+
+# Only for the `gen-proto` binary, which regenerates
+# `src/coreml_proto/generated/` from `proto/`. Kept here rather than in Kohagi so
+# that building Kohagi never needs protoc or a code generator: the output is
+# vendored.
+prost-build = "0.14"
+
+[profile.release]
+opt-level = 2

@@ -1,8 +1,17 @@
+[workspace]
+# `tools/` holds macOS-only development jigs for the CoreML backend. Excluded
+# rather than made a member so their dependencies stay out of Kohagi's
+# Cargo.lock; build them with
+# `cargo build --manifest-path tools/coreml-jigs/Cargo.toml`.
+exclude = ["tools"]
+
 [package]
 name = "kohagi"
 version = "0.4.0"
 edition = "2021"
 rust-version = "1.89"
+# ...and out of the published crate: they are for developing Kohagi, not using it.
+exclude = ["tools"]
 description = "Local sentence embeddings for Ruri v3 and other ModernBERT models: JSONL in, vectors out. Pure Rust, bounded memory."
 license = "MIT"
 repository = "https://github.com/takahashim/kohagi"

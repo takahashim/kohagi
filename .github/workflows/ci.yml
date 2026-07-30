@@ -35,6 +35,17 @@ jobs:
       # the kernels.
       - if: runner.os == 'macOS'
         run: cargo clippy --locked --all-targets --features metal,coreml -- -D warnings
+      # The CoreML development jigs (tools/coreml-jigs) live outside the
+      # workspace so their dependencies stay out of Kohagi's Cargo.lock, which
+      # also means the steps above never see them. Build and lint them here, and
+      # run the blob-format unit tests, which need no Neural Engine. The jigs
+      # that inspect a real model do, so they are not exercised in CI.
+      - if: runner.os == 'macOS'
+        working-directory: tools/coreml-jigs
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
 
   # Release binaries: Apple Silicon macOS, x86_64 Linux, and x86_64 Windows.
   # Uploaded as artifacts on every push; attached to the GitHub Release on v*
