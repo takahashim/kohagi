@@ -211,11 +211,27 @@ tokens, with cosine similarity of approximately 0.99999 against the CPU
 output. For short inputs, the multicore CPU backend may still be faster.
 
 
-Run a local converted model with:
+Convert a model with [`scripts/convert_coreml.py`](scripts/convert_coreml.py),
+then run it locally:
 
 ```bash
+python scripts/convert_coreml.py --model-id cl-nagoya/ruri-v3-130m \
+    --out-dir models/ruri-v3-130m-coreml \
+    --buckets 64 128 192 256 512 --multi-function --compiled
+
 kohagi --device coreml --coreml-dir models/ruri-v3-130m-coreml < texts.jsonl
 ```
+
+`--multi-function` puts every bucket length in one bundle as its own Core ML
+function, sharing a single copy of the weights instead of repeating them per
+length. On `bekko-embedding-v1-a25m` that is 237MB for five buckets against
+235MB *each* without it, output bit-identical and latency unchanged — which
+also makes a finer bucket set affordable, worth ~10% on a corpus whose lengths
+cluster below 192 tokens. `--compiled` doubles the directory but halves nothing
+a user downloads, since Kohagi fetches one form per bucket; without it, every
+load compiles the `.mlpackage` afresh. The largest bucket caps
+`--max-seq-length`, so keep 512 in the set unless you know your inputs are
+shorter.
 
 Or load the same directory layout from Hugging Face Hub:
 
