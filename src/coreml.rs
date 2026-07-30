@@ -237,6 +237,46 @@ unsafe fn feature_names(d: &NSDictionary<NSString, MLFeatureDescription>) -> Str
     }
 }
 
+/// An `NSArray<NSNumber>` of shape or stride values as `usize`.
+unsafe fn numbers(array: &NSArray<NSNumber>) -> Vec<usize> {
+    array.iter().map(|n| n.as_isize().max(0) as usize).collect()
+}
+
+/// Whether `strides` describe a densely packed row-major array, in which case
+/// element *i* of the logical order sits at index *i*.
+fn strides_are_packed(dims: &[usize], strides: &[usize]) -> bool {
+    if dims.len() != strides.len() {
+        return false;
+    }
+    let mut expected = 1;
+    for (dim, stride) in dims.iter().zip(strides).rev() {
+        if *stride != expected {
+            return false;
+        }
+        expected *= dim;
+    }
+    true
+}
+
+/// Each element's index into the buffer, in logical row-major order.
+fn strided_offsets(dims: &[usize], strides: &[usize]) -> Vec<usize> {
+    let total: usize = dims.iter().product();
+    let mut out = Vec::with_capacity(total);
+    let mut index = vec![0usize; dims.len()];
+    for _ in 0..total {
+        out.push(index.iter().zip(strides).map(|(i, s)| i * s).sum());
+        // Odometer over the logical indices, last axis fastest.
+        for axis in (0..dims.len()).rev() {
+            index[axis] += 1;
+            if index[axis] < dims[axis] {
+                break;
+            }
+            index[axis] = 0;
+        }
+    }
+    out
+}
+
 /// Build a `[1, seq]` Int32 MLMultiArray from `i64` token ids/mask.
 unsafe fn i32_multiarray(seq: usize, values: &[i64]) -> Result<Retained<MLMultiArray>> {
     let dims = [NSNumber::new_isize(1), NSNumber::new_isize(seq as isize)];
@@ -258,24 +298,38 @@ unsafe fn i32_multiarray(seq: usize, values: &[i64]) -> Result<Retained<MLMultiA
     Ok(arr)
 }
 
-/// Copy an output MLMultiArray into a flat `Vec<f32>`, converting from whatever
-/// element type CoreML produced (fp16 in practice, but be defensive).
+/// Copy an output MLMultiArray into a flat `Vec<f32>` in logical row-major order,
+/// converting from whatever element type CoreML produced (fp16 in practice, but
+/// be defensive).
+///
+/// `dataPointer` is not necessarily a packed buffer: CoreML may pad an axis, in
+/// which case `count()` scalars read straight off it interleave values with
+/// padding. That is invisible whenever the last axis happens to be aligned and
+/// silently wrong when it is not, so the strides are read rather than assumed. [`strides_are_packed`] keeps the common
+/// case a single copy.
 unsafe fn read_f32(arr: &MLMultiArray) -> Result<Vec<f32>> {
-    let count = arr.count() as usize;
+    let dims = numbers(&arr.shape());
+    let strides = numbers(&arr.strides());
+    let logical: usize = dims.iter().product();
     #[allow(deprecated)]
     let ptr = arr.dataPointer().as_ptr();
-    let out = match arr.dataType() {
-        MLMultiArrayDataType::Float32 => {
-            std::slice::from_raw_parts(ptr as *const f32, count).to_vec()
+
+    // Every element's byte offset, in logical order. `None` when the array is
+    // already packed, which lets the read below stay a straight slice copy.
+    let offsets = (!strides_are_packed(&dims, &strides)).then(|| strided_offsets(&dims, &strides));
+    let gather = |read: &dyn Fn(usize) -> f32| -> Vec<f32> {
+        match &offsets {
+            Some(offsets) => offsets.iter().map(|&o| read(o)).collect(),
+            None => (0..logical).map(read).collect(),
         }
-        MLMultiArrayDataType::Float16 => std::slice::from_raw_parts(ptr as *const u16, count)
-            .iter()
-            .map(|&b| f16::from_bits(b).to_f32())
-            .collect(),
-        MLMultiArrayDataType::Double => std::slice::from_raw_parts(ptr as *const f64, count)
-            .iter()
-            .map(|&v| v as f32)
-            .collect(),
+    };
+
+    let out = match arr.dataType() {
+        MLMultiArrayDataType::Float32 => gather(&|i| *(ptr as *const f32).add(i)),
+        MLMultiArrayDataType::Float16 => {
+            gather(&|i| f16::from_bits(*(ptr as *const u16).add(i)).to_f32())
+        }
+        MLMultiArrayDataType::Double => gather(&|i| *(ptr as *const f64).add(i) as f32),
         other => {
             return Err(anyhow::anyhow!(
                 "unexpected CoreML output dtype {other:?} (expected float)"
@@ -283,4 +337,40 @@ unsafe fn read_f32(arr: &MLMultiArray) -> Result<Vec<f32>> {
         }
     };
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strided_offsets, strides_are_packed};
+
+    #[test]
+    fn a_packed_array_is_recognized_at_every_rank() {
+        assert!(strides_are_packed(&[1, 128, 512], &[65536, 512, 1]));
+        assert!(strides_are_packed(&[1, 4], &[4, 1]));
+        assert!(strides_are_packed(&[7], &[1]));
+        // A padded last axis: a straight read off `dataPointer` would take the
+        // padding for data.
+        assert!(!strides_are_packed(&[1, 2, 4], &[16, 8, 1]));
+        // A padded middle axis does the same.
+        assert!(!strides_are_packed(&[1, 3, 2], &[24, 8, 1]));
+        assert!(!strides_are_packed(&[1, 4], &[8, 1]));
+        // A rank mismatch is not something to guess at.
+        assert!(!strides_are_packed(&[1, 4], &[1]));
+    }
+
+    #[test]
+    fn strided_offsets_skip_the_padding() {
+        // Two rows of 4, stored 8 apart: the second row starts at 8, not 4.
+        assert_eq!(
+            strided_offsets(&[1, 2, 4], &[16, 8, 1]),
+            [0, 1, 2, 3, 8, 9, 10, 11]
+        );
+        // Three rows of 2, stored 8 apart.
+        assert_eq!(
+            strided_offsets(&[1, 3, 2], &[24, 8, 1]),
+            [0, 1, 8, 9, 16, 17]
+        );
+        // And a packed array yields the identity, so the two paths agree.
+        assert_eq!(strided_offsets(&[2, 3], &[3, 1]), [0, 1, 2, 3, 4, 5]);
+    }
 }
