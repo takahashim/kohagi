@@ -68,7 +68,7 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-            features: --features metal,coreml
+            features: --features metal,coreml,coreml-export
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             features: ""

@@ -9,9 +9,10 @@
 //!     --sequence-lengths 128,256,512
 //! ```
 //!
-//! A separate binary rather than a `kohagi` subcommand: converting is something a
-//! publisher does once per model, not part of embedding text. `required-features`
-//! keeps it out of the default build and out of the release binaries.
+//! A separate binary rather than a `kohagi` subcommand: writing a bundle to a
+//! directory is something a publisher does once per model, while `--device coreml`
+//! converts into its own cache without going through here. `required-features`
+//! keeps it out of the default build, and only `kohagi` is packaged for release.
 //!
 //! What it writes, which is the layout `src/coreml.rs` looks for:
 //!

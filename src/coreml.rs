@@ -15,10 +15,14 @@
 //! (cosine ~0.99999).
 //!
 //! This module runs the loaded models; [`provision`] handles getting them onto
-//! disk (Hub download) and into memory (locate + compile + load).
+//! disk (Hub download) and into memory (locate + compile + load). With the
+//! `coreml-export` feature, [`autoconvert`] can also produce the bundle from a
+//! plain checkpoint on first use, so no pre-converted model is needed at all.
 //!
 //! [`ModernBert`]: crate::encoder::ModernBert
 
+#[cfg(feature = "coreml-export")]
+pub mod autoconvert;
 mod provision;
 
 use std::collections::BTreeMap;

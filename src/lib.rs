@@ -43,6 +43,6 @@ mod model;
 pub mod stdio;
 
 pub use batch::{Pooling, TokenInfo};
-pub use config::CoreMlForm;
+pub use config::{CoreMlForm, CoreMlQuantize};
 pub use errors::UnsupportedRequest;
 pub use model::{Backend, Embedder, ModelSource, Options, Precision};

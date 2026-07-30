@@ -92,6 +92,19 @@ pub enum ModelSource {
     /// downloaded into the standard HF cache. Only valid with `--device
     /// coreml`.
     CoreMlHub { repo: String },
+    /// A plain checkpoint to convert for [`Backend::CoreML`] on first use, caching
+    /// the bundle so later runs load it directly. What `--device coreml` does when
+    /// given neither `--coreml-dir` nor `--coreml-model-id`.
+    ///
+    /// `checkpoint` is the [`Self::Hub`] or [`Self::Files`] source the CPU path
+    /// would have taken, so the same `--model-id` serves both devices. Needs a
+    /// build with the `coreml-export` feature.
+    CoreMlConvert {
+        checkpoint: Box<ModelSource>,
+        /// Fixed sequence lengths to emit, one CoreML function each.
+        buckets: Vec<usize>,
+        quantize: crate::CoreMlQuantize,
+    },
 }
 
 /// Numeric precision of the forward pass.
@@ -129,8 +142,10 @@ pub enum Backend {
     /// NVIDIA GPU via Candle's CUDA backend. Requires the `cuda` cargo feature
     /// and an NVIDIA driver with a compatible CUDA runtime.
     Cuda,
-    /// Apple Neural Engine via CoreML. Requires the `coreml` cargo feature and
-    /// a [`ModelSource::CoreMl`] directory of pre-converted fixed-shape models.
+    /// Apple Neural Engine via CoreML. Requires the `coreml` cargo feature and a
+    /// converted model: a [`ModelSource::CoreMl`] directory, a
+    /// [`ModelSource::CoreMlHub`] repo, or a [`ModelSource::CoreMlConvert`]
+    /// checkpoint this converts itself.
     /// Runs batch=1 per bucket length; unsupported requests fail fast with
     /// [`UnsupportedRequest`] rather than falling back. See [`crate::coreml`].
     CoreML,
@@ -213,8 +228,13 @@ impl Embedder {
             ModelSource::Files { model, tokenizer } => {
                 (model.clone(), tokenizer.clone(), local_pooling(model))
             }
-            ModelSource::Hub { repo } => fetch_from_hub(repo)?,
-            ModelSource::CoreMl { .. } | ModelSource::CoreMlHub { .. } => {
+            ModelSource::Hub { repo } => {
+                let f = fetch_checkpoint(repo)?;
+                (f.weights, f.tokenizer, f.pooling)
+            }
+            ModelSource::CoreMl { .. }
+            | ModelSource::CoreMlHub { .. }
+            | ModelSource::CoreMlConvert { .. } => {
                 return Err(UnsupportedRequest::new(
                     "a CoreML model source needs `--device coreml`",
                 )
@@ -255,10 +275,26 @@ impl Embedder {
     /// Every unsupported condition is caught here, before any input is read.
     #[cfg(feature = "coreml")]
     fn load_coreml(source: &ModelSource, opts: Options) -> Result<Self> {
+        // `converted` is set only when this run did the conversion, which is when
+        // the self-check below is worth its few seconds.
+        #[cfg(feature = "coreml-export")]
+        let mut converted: Option<&ModelSource> = None;
         let dir = match source {
             ModelSource::CoreMl { dir } => dir.clone(),
             ModelSource::CoreMlHub { repo } => {
                 crate::coreml::fetch_from_hub(repo, opts.coreml_form)?
+            }
+            ModelSource::CoreMlConvert {
+                checkpoint,
+                buckets,
+                quantize,
+            } => {
+                let (dir, _fresh) = convert_for_coreml(checkpoint, buckets, *quantize)?;
+                #[cfg(feature = "coreml-export")]
+                if _fresh {
+                    converted = Some(checkpoint.as_ref());
+                }
+                dir
             }
             _ => {
                 return Err(UnsupportedRequest::new(
@@ -290,13 +326,81 @@ impl Embedder {
 
         let pooling = resolve_pooling_warned(opts.pooling, pooling_in_dir(&dir));
 
-        Ok(Self {
+        let embedder = Self {
             engine: Engine::CoreMl(encoder),
             tokenizer,
             opts,
             pooling,
             dim,
-        })
+        };
+        #[cfg(feature = "coreml-export")]
+        if let Some(checkpoint) = converted {
+            embedder.self_check(checkpoint);
+        }
+        Ok(embedder)
+    }
+
+    /// Compare a few sentences against the checkpoint's own f32 forward, once,
+    /// right after converting it.
+    ///
+    /// The emitter itself is verified against the Python conversion, but what no
+    /// converter can know in advance is whether a *checkpoint* is sensitive to fp16:
+    /// `nomic-ai/modernbert-embed-base` drifts far past fp16 rounding under both
+    /// this converter and coremltools. That is a property worth knowing and not worth failing on,
+    /// so this warns and continues. Any error here is ignored for the same reason —
+    /// a check that cannot run must not stop a working model from loading.
+    #[cfg(all(feature = "coreml", feature = "coreml-export"))]
+    fn self_check(&self, checkpoint: &ModelSource) {
+        /// Mixed scripts, so the comparison covers more of the embedding table
+        /// than one language would, and one long passage — fp16 error accumulates
+        /// with sequence length, and short probes miss it. On
+        /// `nomic-ai/modernbert-embed-base` the short ones diverge by 5e-5, under
+        /// the threshold, and adding the long one takes the worst to 7e-3.
+        const PROBES: [&str; 4] = [
+            "瑠璃も玻璃も照らせば光る",
+            "Local inference keeps data on the device.",
+            "近くの喫茶店で二時間ほど本を読んでいた。",
+            "Running a sentence encoder on the neural engine requires fixed shapes, one \
+             model per sequence length, and padding every row to that exact length, which \
+             is why the converter emits one function per bucket and shares a single copy \
+             of the weights between them; the embedding table dominates the bytes for a \
+             large vocabulary, so quantizing it to eight bits with one scale per row \
+             halves that part of the file while leaving retrieval quality unchanged on \
+             both benchmarks that were measured.",
+        ];
+
+        let Ok(reference) = Self::load(
+            checkpoint,
+            Options {
+                backend: Backend::Cpu,
+                ..self.opts
+            },
+        ) else {
+            return;
+        };
+        let (Ok(theirs), Ok(ours)) = (reference.embed(&PROBES), self.embed(&PROBES)) else {
+            return;
+        };
+        let worst = theirs
+            .iter()
+            .zip(&ours)
+            .map(|(a, b)| {
+                let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                let norm = |v: &Vec<f32>| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                1.0 - dot / (norm(a) * norm(b)).max(f32::MIN_POSITIVE)
+            })
+            .fold(0.0f32, f32::max);
+
+        // fp16 rounding through a 19-layer encoder lands around 1e-5; anything past
+        // 1e-4 is the checkpoint's own sensitivity rather than rounding.
+        if worst > 1e-4 {
+            eprintln!(
+                "kohagi: warning: this model's Neural Engine output differs from its \
+                 float32 output by 1 - cosine = {worst:.1e}, more than fp16 rounding \
+                 explains; the checkpoint is sensitive to fp16, so its ANE vectors are \
+                 not interchangeable with its CPU ones"
+            );
+        }
     }
 
     #[cfg(not(feature = "coreml"))]
@@ -579,26 +683,135 @@ fn read_config(path: &Path) -> Result<Config> {
     serde_json::from_str(&text).with_context(|| format!("cannot parse {}", path.display()))
 }
 
+/// Convert a checkpoint for the ANE, or reuse the cached bundle, and return the
+/// directory to load from.
+///
+/// The result has the layout `--coreml-dir` expects, so the caller carries on
+/// through the ordinary directory loader — which is what keeps `check_io` and the
+/// compile cache in the path.
+#[cfg(all(feature = "coreml", feature = "coreml-export"))]
+fn convert_for_coreml(
+    checkpoint: &ModelSource,
+    buckets: &[usize],
+    quantize: crate::CoreMlQuantize,
+) -> Result<(PathBuf, bool)> {
+    use crate::coreml::autoconvert;
+
+    let resolved = match checkpoint {
+        ModelSource::Hub { repo } => {
+            // The download dominates a first run on a machine that has never used
+            // the CPU path, and hf-hub is silent about it, so say so before
+            // starting. Nothing is printed when the cache already has the files.
+            if !hub_checkpoint_is_cached(repo) {
+                eprintln!("kohagi: downloading {repo} (safetensors; first run only) ...");
+            }
+            let files = fetch_checkpoint(repo)?;
+            autoconvert::Checkpoint {
+                config: beside(&files.weights, "config.json")?,
+                weights: files.weights,
+                tokenizer: files.tokenizer,
+                pooling: files.pooling_file,
+                source: repo.clone(),
+            }
+        }
+        ModelSource::Files { model, tokenizer } => autoconvert::Checkpoint {
+            config: beside(model, "config.json")?,
+            weights: model.clone(),
+            tokenizer: tokenizer.clone(),
+            pooling: model
+                .parent()
+                .map(|d| d.join("1_Pooling").join("config.json"))
+                .filter(|p| p.is_file()),
+            source: model.display().to_string(),
+        },
+        // `Args::source` only ever wraps a checkpoint source.
+        _ => {
+            return Err(UnsupportedRequest::new(
+                "`--device coreml` can convert a checkpoint (`--model-id` or \
+                 `--model-path`), not another CoreML model",
+            )
+            .into())
+        }
+    };
+    autoconvert::provision(&resolved, buckets, quantize)
+}
+
+#[cfg(all(feature = "coreml", not(feature = "coreml-export")))]
+fn convert_for_coreml(
+    _checkpoint: &ModelSource,
+    _buckets: &[usize],
+    _quantize: crate::CoreMlQuantize,
+) -> Result<(PathBuf, bool)> {
+    Err(UnsupportedRequest::new(
+        "this binary cannot convert checkpoints for CoreML; pass an already \
+         converted model with `--coreml-dir` or `--coreml-model-id`, or rebuild \
+         with `--features coreml,coreml-export`",
+    )
+    .into())
+}
+
+/// Whether the Hub cache already holds this checkpoint's weights, so that the
+/// "downloading" notice is only printed when there is a download to wait for.
+///
+/// Asks hf-hub for the file without hitting the network; a miss (or a cache layout
+/// this cannot read) errs towards printing the notice, which costs a line rather
+/// than a wrong wait.
+#[cfg(all(feature = "coreml", feature = "coreml-export"))]
+fn hub_checkpoint_is_cached(repo: &str) -> bool {
+    hf_hub::Cache::default()
+        .model(repo.to_string())
+        .get("model.safetensors")
+        .is_some()
+}
+
+/// A sibling of `path`, for the `config.json` that has to sit beside the weights.
+#[cfg(all(feature = "coreml", feature = "coreml-export"))]
+fn beside(path: &Path, name: &str) -> Result<PathBuf> {
+    path.parent()
+        .map(|d| d.join(name))
+        .with_context(|| format!("{} has no parent directory for {name}", path.display()))
+}
+
+/// What a Hub checkpoint download produced.
+struct Fetched {
+    weights: PathBuf,
+    tokenizer: PathBuf,
+    /// `1_Pooling/config.json` in the cache, when the checkpoint ships one. Kept as
+    /// a path as well as parsed, because the CoreML converter copies the file into
+    /// the bundle it writes.
+    #[cfg_attr(
+        not(all(feature = "coreml", feature = "coreml-export")),
+        allow(dead_code)
+    )]
+    pooling_file: Option<PathBuf>,
+    pooling: Option<Pooling>,
+}
+
 /// Download (or reuse from the HF cache) the files a model needs, plus its
 /// declared pooling if the checkpoint ships one.
-fn fetch_from_hub(repo: &str) -> Result<(PathBuf, PathBuf, Option<Pooling>)> {
+fn fetch_checkpoint(repo: &str) -> Result<Fetched> {
     let api = hf_hub::api::sync::Api::new().context("initializing Hugging Face Hub client")?;
     let repo = api.model(repo.to_string());
     let get = |f: &str| {
         repo.get(f)
             .with_context(|| format!("cannot fetch {f} (network down? try local --model-path)"))
     };
-    let model = get("model.safetensors")?;
+    let weights = get("model.safetensors")?;
     get("config.json")?; // lands next to the weights in the cache
     let tokenizer = get("tokenizer.json")?;
     // Optional: many checkpoints ship it, rerankers and base LMs do not, and a
     // 404 here is information rather than an error.
-    let pooling = repo
-        .get("1_Pooling/config.json")
-        .ok()
+    let pooling_file = repo.get("1_Pooling/config.json").ok();
+    let pooling = pooling_file
+        .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| pooling_from_st_config(&s));
-    Ok((model, tokenizer, pooling))
+    Ok(Fetched {
+        weights,
+        tokenizer,
+        pooling_file,
+        pooling,
+    })
 }
 
 /// The declared pooling in a checkpoint directory, read from its

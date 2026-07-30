@@ -13,7 +13,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
-use kohagi::{stdio, Backend, CoreMlForm, Embedder, ModelSource, Options, Pooling, Precision};
+use kohagi::{
+    stdio, Backend, CoreMlForm, CoreMlQuantize, Embedder, ModelSource, Options, Pooling, Precision,
+};
 
 /// CLI spellings of the library enums, so `--help` lists the valid values and
 /// clap rejects anything else before we do any work.
@@ -81,6 +83,23 @@ impl From<CoreMlFormArg> for CoreMlForm {
     }
 }
 
+#[derive(Copy, Clone, ValueEnum)]
+enum CoreMlQuantizeArg {
+    /// The embedding table int8, one scale per row.
+    Embeddings,
+    /// The embedding table and every projection int8.
+    All,
+}
+
+impl From<CoreMlQuantizeArg> for CoreMlQuantize {
+    fn from(q: CoreMlQuantizeArg) -> Self {
+        match q {
+            CoreMlQuantizeArg::Embeddings => CoreMlQuantize::Embeddings,
+            CoreMlQuantizeArg::All => CoreMlQuantize::All,
+        }
+    }
+}
+
 impl From<BackendArg> for Backend {
     fn from(b: BackendArg) -> Self {
         match b {
@@ -127,13 +146,15 @@ struct Args {
     /// Device for the forward pass. cuda requires an NVIDIA GPU and a binary
     /// built with `--features cuda`. metal requires a binary built with
     /// `--features metal`, and runs ~1.2x faster than cpu on Apple Silicon.
-    /// coreml (Apple Neural Engine) requires `--features coreml` and
-    /// `--coreml-dir`.
+    /// coreml (Apple Neural Engine) requires `--features coreml`; with no
+    /// --coreml-dir or --coreml-model-id it converts --model-id itself and
+    /// caches the result.
     #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
     device: BackendArg,
     /// Directory of pre-converted CoreML models for `--device coreml`: one
     /// `seq-<N>.mlpackage` per bucket length, plus tokenizer.json and
-    /// config.json. Produce one with scripts/convert_coreml.py.
+    /// config.json. Produce one with the coreml-convert binary or
+    /// scripts/convert_coreml.py. Omit it to convert --model-id on first use.
     #[arg(long)]
     coreml_dir: Option<PathBuf>,
     /// Hugging Face repo holding the CoreML models (same layout as
@@ -141,6 +162,18 @@ struct Args {
     /// --coreml-dir for `--device coreml`; --coreml-dir wins if both are set.
     #[arg(long)]
     coreml_model_id: Option<String>,
+    /// Fixed sequence lengths to emit when `--device coreml` converts a
+    /// checkpoint itself (that is, when neither --coreml-dir nor
+    /// --coreml-model-id is given). Each becomes one CoreML function over a
+    /// single shared copy of the weights.
+    #[arg(long, value_delimiter = ',', default_values_t = [128usize, 256, 512])]
+    coreml_buckets: Vec<usize>,
+    /// Quantize the model when `--device coreml` converts it. `embeddings`
+    /// halves a large-vocabulary bundle at no measured retrieval cost;
+    /// `all` roughly halves it again for a small one. Omit for fp16 — a
+    /// quantized bundle's vectors are not interchangeable with an fp16 one's.
+    #[arg(long, value_enum)]
+    coreml_quantize: Option<CoreMlQuantizeArg>,
     /// When a --coreml-model-id repo ships both forms of a bucket, which to
     /// download: `compiled` (.mlmodelc, faster) or `package` (.mlpackage,
     /// portable). Only the chosen form is fetched.
@@ -194,13 +227,34 @@ impl Args {
                 let label = repo.clone();
                 return Ok((ModelSource::CoreMlHub { repo }, label));
             }
-            return Err(kohagi::UnsupportedRequest(
-                "`--device coreml` requires `--coreml-dir <DIR>` or `--coreml-model-id <REPO>`"
-                    .to_string(),
-            )
-            .into());
+            // Neither: convert the checkpoint the CPU path would have used. One
+            // `--model-id` therefore serves every device.
+            let mut buckets = self.coreml_buckets.clone();
+            buckets.sort_unstable();
+            buckets.dedup();
+            if buckets.is_empty() {
+                return Err(kohagi::UnsupportedRequest(
+                    "`--coreml-buckets` is empty; give at least one sequence length".to_string(),
+                )
+                .into());
+            }
+            let (checkpoint, label) = self.checkpoint_source();
+            return Ok((
+                ModelSource::CoreMlConvert {
+                    checkpoint: Box::new(checkpoint),
+                    buckets,
+                    quantize: self.coreml_quantize.map(Into::into).unwrap_or_default(),
+                },
+                label,
+            ));
         }
-        let out = match (&self.model_path, &self.tokenizer_path) {
+        Ok(self.checkpoint_source())
+    }
+
+    /// The safetensors checkpoint the run names, with its display label. Shared by
+    /// the candle backends and by CoreML's own conversion.
+    fn checkpoint_source(&self) -> (ModelSource, String) {
+        match (&self.model_path, &self.tokenizer_path) {
             // clap's `requires` guarantees these two arrive together.
             (Some(model), Some(tokenizer)) => {
                 let label = label_of(model);
@@ -210,14 +264,13 @@ impl Args {
                 };
                 (source, label)
             }
-            _ => {
-                let source = ModelSource::Hub {
+            _ => (
+                ModelSource::Hub {
                     repo: self.model_id.clone(),
-                };
-                (source, self.model_id.clone())
-            }
-        };
-        Ok(out)
+                },
+                self.model_id.clone(),
+            ),
+        }
     }
 }
 

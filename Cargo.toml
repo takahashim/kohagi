@@ -91,17 +91,19 @@ metal = [
 coreml-export = ["dep:prost"]
 
 # Apple Neural Engine via CoreML: `cargo build --release --features coreml`,
-# then `kohagi --device coreml --coreml-dir <dir>`. macOS-only. Runs pre-
-# converted, fixed-shape ModernBERT models (batch=1) — see src/coreml.rs.
+# then `kohagi --device coreml`. macOS-only. Runs fixed-shape ModernBERT models
+# (batch=1) from `--coreml-dir`, `--coreml-model-id`, or — with `coreml-export`
+# — converted from a checkpoint on first use. See src/coreml.rs.
 coreml = [
     "dep:objc2",
     "dep:objc2-foundation",
     "dep:objc2-core-ml",
 ]
 
-# The CoreML converter as its own binary, behind `coreml-export` so it is neither
-# built by default nor shipped in the release binaries: converting a model is a
-# publisher's one-off, not part of embedding text. See src/bin/coreml-convert.rs.
+# The CoreML converter as its own binary, behind `coreml-export`. The macOS
+# release build enables that feature (so `--device coreml` can convert a
+# checkpoint itself), but only `kohagi` is packaged: converting to a directory is
+# a publisher's one-off, not part of embedding text. See src/bin/coreml-convert.rs.
 [[bin]]
 name = "coreml-convert"
 required-features = ["coreml-export"]

@@ -1314,3 +1314,102 @@ fn a_blockwise_quantized_weight_is_dequantized_inside_the_graph() {
         .collect();
     assert_close(&got, &want, 2e-2, "blockwise dequantize");
 }
+
+/// The end of the whole line: a plain checkpoint, no pre-converted anything, and a
+/// working ANE embedder — plus the cache that makes the second run cheap.
+///
+/// Needs a checkpoint directory (`model.safetensors`, `config.json`,
+/// `tokenizer.json`) because the point is the path from weights to vectors; it
+/// runs offline, so it uses `ModelSource::Files` rather than a Hub id.
+#[test]
+fn a_checkpoint_converts_itself_on_first_use_and_is_cached() {
+    use kohagi::{Backend, Embedder, ModelSource, Options};
+
+    let Some(checkpoint) = std::env::var_os("KOHAGI_TEST_CHECKPOINT") else {
+        eprintln!("skipping: set KOHAGI_TEST_CHECKPOINT to a checkpoint directory");
+        return;
+    };
+    let checkpoint = std::path::PathBuf::from(checkpoint);
+
+    // A cache of this test's own, so a developer's real one is neither read nor
+    // written and the "was it converted?" question has a definite answer.
+    let cache =
+        std::env::temp_dir().join(format!("kohagi-autoconvert-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache);
+    // SAFETY: single-threaded test setup, before any Kohagi call reads it.
+    unsafe { std::env::set_var("KOHAGI_COREML_CACHE", &cache) };
+
+    let source = ModelSource::CoreMlConvert {
+        checkpoint: Box::new(ModelSource::Files {
+            model: checkpoint.join("model.safetensors"),
+            tokenizer: checkpoint.join("tokenizer.json"),
+        }),
+        buckets: vec![128],
+        quantize: kohagi::CoreMlQuantize::None,
+    };
+    let opts = Options {
+        backend: Backend::CoreML,
+        max_seq_length: 128,
+        ..Options::default()
+    };
+
+    let texts = ["瑠璃も玻璃も照らせば光る", "Local inference."];
+    let first = Embedder::load(&source, opts).expect("convert and load");
+    let a = first.embed(&texts).expect("embed");
+
+    let converted = cache.join("converted");
+    assert!(converted.is_dir(), "the conversion was cached");
+    let entries: Vec<_> = std::fs::read_dir(&converted)
+        .expect("read the cache")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 1, "one directory per model");
+    let model_dir = entries[0].path();
+    let bundles: Vec<_> = std::fs::read_dir(&model_dir)
+        .expect("read the model's cache")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    assert_eq!(
+        bundles.len(),
+        1,
+        "one entry, no leftover staging: {bundles:?}"
+    );
+    assert!(
+        bundles[0].contains("-b128-fp16-g"),
+        "the key carries buckets, quantization and graph version: {bundles:?}"
+    );
+
+    // Second load: same vectors, and nothing new written.
+    let before = std::fs::metadata(model_dir.join(&bundles[0]))
+        .and_then(|m| m.modified())
+        .expect("entry mtime");
+    let second = Embedder::load(&source, opts).expect("load from the cache");
+    let b = second.embed(&texts).expect("embed again");
+    assert_eq!(a, b, "a cached bundle gives the same vectors");
+    let after = std::fs::metadata(model_dir.join(&bundles[0]))
+        .and_then(|m| m.modified())
+        .expect("entry mtime");
+    assert_eq!(before, after, "the second load reconverted nothing");
+
+    // Quantizing is a different bundle, not a replacement for this one.
+    let quantized = ModelSource::CoreMlConvert {
+        checkpoint: Box::new(ModelSource::Files {
+            model: checkpoint.join("model.safetensors"),
+            tokenizer: checkpoint.join("tokenizer.json"),
+        }),
+        buckets: vec![128],
+        quantize: kohagi::CoreMlQuantize::Embeddings,
+    };
+    Embedder::load(&quantized, opts).expect("convert the quantized form");
+    let after_quantize: Vec<_> = std::fs::read_dir(&model_dir)
+        .expect("read the model's cache")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    assert_eq!(
+        after_quantize.len(),
+        2,
+        "the fp16 bundle survives its int8 sibling: {after_quantize:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&cache);
+}
