@@ -167,9 +167,11 @@ def main():
     ap.add_argument(
         "--compiled",
         action="store_true",
-        help="also emit a compiled .mlmodelc beside each .mlpackage. Kohagi then "
-        "loads the .mlmodelc directly (no per-run compile) and falls back to the "
-        ".mlpackage if it can't. Doubles the output size.",
+        help="also emit a compiled .mlmodelc beside each .mlpackage. Kohagi loads "
+        "the .mlmodelc directly and falls back to the .mlpackage if it can't. "
+        "Doubles the output size; without it Kohagi compiles the .mlpackage on "
+        "first use (~20s per bucket) and caches the result, so only the first run "
+        "pays.",
     )
     ap.add_argument(
         "--multi-function",
