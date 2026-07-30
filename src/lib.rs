@@ -33,6 +33,8 @@ mod config;
 #[cfg(feature = "coreml")]
 mod coreml;
 #[cfg(feature = "coreml-export")]
+pub mod coreml_export;
+#[cfg(feature = "coreml-export")]
 mod coreml_proto;
 mod encoder;
 mod errors;

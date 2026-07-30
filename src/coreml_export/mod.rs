@@ -1,0 +1,407 @@
+//! Writing CoreML `.mlpackage` models from Rust.
+//!
+//! Behind the `coreml-export` feature, so that a converted model comes out of the
+//! same code that reads the checkpoint at inference time rather than out of
+//! `scripts/convert_coreml.py` and a PyTorch install. [`blob`] writes
+//! `weights/weight.bin`, [`mil`] the program, [`encoder`] the ModernBERT graph,
+//! and [`write_package`] the bundle around them.
+//!
+//! The layout, which [`write_package`] produces and `src/coreml.rs` consumes:
+//!
+//! ```text
+//! seq-128.mlpackage/
+//! ├── Manifest.json
+//! └── Data/
+//!     └── com.apple.CoreML/
+//!         ├── model.mlmodel
+//!         └── weights/
+//!             └── weight.bin
+//! ```
+
+pub mod blob;
+pub mod encoder;
+pub mod mil;
+pub mod modernbert;
+pub mod safetensors;
+
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use prost::Message;
+
+use crate::coreml_proto::{
+    array_feature_type, feature_type, model, ArrayFeatureType, FeatureDescription, FeatureType,
+    FunctionDescription, Metadata, Model, ModelDescription,
+};
+
+/// `Manifest.json`, the 617-byte index at the root of a `.mlpackage`.
+///
+/// The two identifiers are opaque: CoreML only needs `rootModelIdentifier` to
+/// name an entry that exists. A real package carries freshly generated UUIDs;
+/// these are fixed so that generating the same model twice produces the same
+/// bytes.
+const MODEL_ID: &str = "6B0C4B1A-1E7C-4B7E-9E3D-000000000001";
+const WEIGHTS_ID: &str = "6B0C4B1A-1E7C-4B7E-9E3D-000000000002";
+
+fn manifest() -> String {
+    // Written out rather than serialized from a map: the file is four fixed keys,
+    // and matching a reference byte for byte is easier to see this way.
+    format!(
+        r#"{{
+    "fileFormatVersion": "1.0.0",
+    "itemInfoEntries": {{
+        "{WEIGHTS_ID}": {{
+            "author": "com.apple.CoreML",
+            "description": "CoreML Model Weights",
+            "name": "weights",
+            "path": "com.apple.CoreML/weights"
+        }},
+        "{MODEL_ID}": {{
+            "author": "com.apple.CoreML",
+            "description": "CoreML Model Specification",
+            "name": "model.mlmodel",
+            "path": "com.apple.CoreML/model.mlmodel"
+        }}
+    }},
+    "rootModelIdentifier": "{MODEL_ID}"
+}}
+"#
+    )
+}
+
+/// One input or output in the model description, which is what a caller feeds and
+/// reads at prediction time. Kept separate from [`mil::Tensor`]: the program's
+/// internal values are not part of the model's interface.
+fn feature(tensor: &mil::Tensor) -> FeatureDescription {
+    let dtype = match tensor.dtype {
+        mil::DType::Fp16 => array_feature_type::ArrayDataType::Float16,
+        mil::DType::Fp32 => array_feature_type::ArrayDataType::Float32,
+        mil::DType::Int32 => array_feature_type::ArrayDataType::Int32,
+        mil::DType::Int8 => array_feature_type::ArrayDataType::Int8,
+        // A model's interface is numeric arrays. Bool and Str exist for operation
+        // parameters inside the graph and have no place in a feature description,
+        // so this is a caller error rather than something to encode.
+        other => panic!(
+            "{} is declared {other:?}, which cannot be a model input or output",
+            tensor.name
+        ),
+    };
+    FeatureDescription {
+        name: tensor.name.clone(),
+        short_description: String::new(),
+        r#type: Some(FeatureType {
+            r#type: Some(feature_type::Type::MultiArrayType(ArrayFeatureType {
+                shape: tensor.shape.iter().map(|&d| d as i64).collect(),
+                data_type: dtype as i32,
+            })),
+            is_optional: false,
+        }),
+    }
+}
+
+/// What produced a model, recorded in its `userDefined` metadata.
+///
+/// A model card is expected to state the toolchain and the source revision; a
+/// converted model that carries them can be asked instead of trusted.
+/// `coreml-inspect` reads these back.
+#[derive(Debug, Clone, Default)]
+pub struct Provenance {
+    /// The checkpoint this was converted from, as a Hub id or a path.
+    pub source: String,
+    /// Which sequence lengths the bundle serves.
+    pub lengths: Vec<usize>,
+    /// Whether the embedding table is int8. Recorded because a quantized bundle's
+    /// vectors are not interchangeable with an fp16 one's.
+    pub quantized_embeddings: bool,
+    /// Whether the projections are int8 too.
+    pub quantized_projections: bool,
+}
+
+impl Provenance {
+    fn entries(&self) -> Vec<(String, String)> {
+        let mut out = vec![
+            (
+                "com.github.takahashim.kohagi.version".to_string(),
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+            (
+                "com.github.takahashim.kohagi.emitter".to_string(),
+                "coreml-export".to_string(),
+            ),
+        ];
+        if !self.source.is_empty() {
+            out.push((
+                "com.github.takahashim.kohagi.source".to_string(),
+                self.source.clone(),
+            ));
+        }
+        if self.quantized_embeddings {
+            out.push((
+                "com.github.takahashim.kohagi.quantization".to_string(),
+                if self.quantized_projections {
+                    "all-int8".to_string()
+                } else {
+                    "embeddings-int8".to_string()
+                },
+            ));
+        }
+        if !self.lengths.is_empty() {
+            out.push((
+                "com.github.takahashim.kohagi.sequence_lengths".to_string(),
+                self.lengths
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ));
+        }
+        out
+    }
+
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            short_description: String::new(),
+            version_string: String::new(),
+            author: String::new(),
+            license: String::new(),
+            user_defined: self.entries().into_iter().collect(),
+        }
+    }
+}
+
+/// Assemble a [`Model`] around a program.
+pub fn model(program: crate::coreml_proto::mil_spec::Program, io: Io) -> Model {
+    model_with(program, io, &Provenance::default())
+}
+
+/// The same, recording what produced it.
+pub fn model_with(
+    program: crate::coreml_proto::mil_spec::Program,
+    io: Io,
+    provenance: &Provenance,
+) -> Model {
+    Model {
+        specification_version: mil::SPECIFICATION_VERSION,
+        description: Some(ModelDescription {
+            input: io.inputs.iter().map(feature).collect(),
+            output: io.outputs.iter().map(feature).collect(),
+            functions: Vec::new(),
+            default_function_name: String::new(),
+            metadata: Some(provenance.metadata()),
+        }),
+        is_updatable: false,
+        r#type: Some(model::Type::MlProgram(program)),
+    }
+}
+
+/// Assemble a [`Model`] whose program holds several functions, one per bucket
+/// length.
+///
+/// A multi-function model describes each function separately rather than through
+/// the top-level `input`/`output`, and names one as the default. `functions` pairs
+/// each MIL function name with the interface it presents.
+pub fn multi_function_model(
+    program: crate::coreml_proto::mil_spec::Program,
+    functions: &[(String, Vec<mil::Tensor>, Vec<mil::Tensor>)],
+    default: &str,
+    provenance: &Provenance,
+) -> Model {
+    Model {
+        specification_version: mil::SPECIFICATION_VERSION,
+        description: Some(ModelDescription {
+            input: Vec::new(),
+            output: Vec::new(),
+            functions: functions
+                .iter()
+                .map(|(name, inputs, outputs)| FunctionDescription {
+                    name: name.clone(),
+                    input: inputs.iter().map(feature).collect(),
+                    output: outputs.iter().map(feature).collect(),
+                })
+                .collect(),
+            default_function_name: default.to_string(),
+            metadata: Some(provenance.metadata()),
+        }),
+        is_updatable: false,
+        r#type: Some(model::Type::MlProgram(program)),
+    }
+}
+
+/// The model's interface: which of the program's values a caller supplies and
+/// which it reads back.
+pub struct Io {
+    pub inputs: Vec<mil::Tensor>,
+    pub outputs: Vec<mil::Tensor>,
+}
+
+/// Write a `.mlpackage` at `path`, replacing anything already there.
+///
+/// `weights` may be empty, in which case the file is still written: a package
+/// whose manifest names a weights directory that does not exist fails to compile.
+pub fn write_package(path: &Path, model: &Model, weights: &[u8]) -> Result<()> {
+    let data = path.join("Data/com.apple.CoreML");
+    if path.exists() {
+        std::fs::remove_dir_all(path).with_context(|| format!("clearing {}", path.display()))?;
+    }
+    std::fs::create_dir_all(data.join("weights"))
+        .with_context(|| format!("creating {}", data.display()))?;
+
+    std::fs::write(path.join("Manifest.json"), manifest())
+        .with_context(|| format!("writing {}/Manifest.json", path.display()))?;
+    std::fs::write(data.join("model.mlmodel"), model.encode_to_vec())
+        .with_context(|| format!("writing {}/model.mlmodel", data.display()))?;
+    std::fs::write(data.join("weights/weight.bin"), weights)
+        .with_context(|| format!("writing {}/weights/weight.bin", data.display()))?;
+    Ok(())
+}
+
+/// Compile a written `.mlpackage` into `<dir>/compiled/<name>.mlmodelc`.
+///
+/// Optional: Kohagi compiles a package on first use and caches the result
+/// (`src/coreml/provision.rs`), so shipping the compiled form only moves ~20 s off
+/// a user's first run, at the cost of doubling what they download. A publisher
+/// deciding to pay that can call this.
+///
+/// Needs the `coreml` feature as well, since compiling goes through the framework.
+#[cfg(feature = "coreml")]
+pub fn compile_beside(bundle: &Path) -> Result<std::path::PathBuf> {
+    use objc2_core_ml::MLModel;
+    use objc2_foundation::{NSString, NSURL};
+
+    let parent = bundle
+        .parent()
+        .context("the bundle has no parent directory")?;
+    let stem = bundle
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .context("the bundle has no name")?;
+    let out = parent.join("compiled").join(format!("{stem}.mlmodelc"));
+
+    let url = NSURL::fileURLWithPath(&NSString::from_str(
+        bundle.to_str().context("bundle path is not valid UTF-8")?,
+    ));
+    let compiled = unsafe {
+        // The async form is current, but a batch converter has nothing to do while
+        // it waits.
+        #[allow(deprecated)]
+        MLModel::compileModelAtURL_error(&url)
+    }
+    .map_err(|e| anyhow::anyhow!("compiling {}: {e}", bundle.display()))?;
+    let from = std::path::PathBuf::from(
+        compiled
+            .path()
+            .context("the compiled model has no path")?
+            .to_string(),
+    );
+
+    if out.exists() {
+        std::fs::remove_dir_all(&out).with_context(|| format!("clearing {}", out.display()))?;
+    }
+    std::fs::create_dir_all(out.parent().expect("compiled/ has a parent"))?;
+    // CoreML leaves the result in a temporary directory for the caller to move.
+    if std::fs::rename(&from, &out).is_err() {
+        copy_tree(&from, &out).with_context(|| format!("copying into {}", out.display()))?;
+        let _ = std::fs::remove_dir_all(&from);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "coreml")]
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(from, to).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_manifest_matches_the_shape_coreml_writes() {
+        let text = manifest();
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["fileFormatVersion"], "1.0.0");
+        assert_eq!(parsed["rootModelIdentifier"], MODEL_ID);
+        let entries = parsed["itemInfoEntries"].as_object().expect("entries");
+        assert_eq!(entries.len(), 2);
+        // The root identifier must name an entry, and that entry must be the spec.
+        assert_eq!(entries[MODEL_ID]["name"], "model.mlmodel");
+        assert_eq!(entries[MODEL_ID]["path"], "com.apple.CoreML/model.mlmodel");
+        assert_eq!(entries[WEIGHTS_ID]["name"], "weights");
+        assert_eq!(entries[WEIGHTS_ID]["path"], "com.apple.CoreML/weights");
+    }
+
+    #[test]
+    fn a_written_package_has_the_layout_the_backend_looks_for() {
+        let dir = std::env::temp_dir().join(format!("kohagi-pkg-{}.mlpackage", std::process::id()));
+        let x = mil::Tensor::new("x", mil::DType::Fp16, &[1, 3]);
+        let mut b = mil::Builder::new(std::slice::from_ref(&x));
+        let y = b.op(
+            "identity",
+            mil::Tensor::new("y", mil::DType::Fp16, &[1, 3]),
+            &[("x", &x)],
+        );
+        b.returns(&y);
+        let m = model(
+            b.finish(),
+            Io {
+                inputs: vec![x],
+                outputs: vec![y],
+            },
+        );
+        let mut w = blob::Writer::new();
+        w.write_f32_as_fp16(&[1.0]);
+        write_package(&dir, &m, &w.finish()).expect("writes");
+
+        assert!(dir.join("Manifest.json").is_file());
+        assert!(dir.join("Data/com.apple.CoreML/model.mlmodel").is_file());
+        assert!(dir
+            .join("Data/com.apple.CoreML/weights/weight.bin")
+            .is_file());
+
+        // And the description declares the interface, not the internals.
+        let bytes = std::fs::read(dir.join("Data/com.apple.CoreML/model.mlmodel")).unwrap();
+        let back = Model::decode(bytes.as_slice()).expect("decodes");
+        let d = back.description.expect("a description");
+        assert_eq!(d.input.len(), 1);
+        assert_eq!(d.input[0].name, "x");
+        assert_eq!(d.output[0].name, "y");
+        assert_eq!(back.specification_version, mil::SPECIFICATION_VERSION);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writing_twice_produces_the_same_bytes() {
+        // Generation is reproducible: the manifest identifiers are fixed and the
+        // program's maps are sorted, so nothing here varies between runs.
+        let build = || {
+            let x = mil::Tensor::new("x", mil::DType::Fp16, &[1, 2]);
+            let mut b = mil::Builder::new(std::slice::from_ref(&x));
+            let w = b.const_blob(mil::Tensor::new("w", mil::DType::Fp16, &[2, 2]), 64);
+            let y = b.op(
+                "matmul",
+                mil::Tensor::new("y", mil::DType::Fp16, &[1, 2]),
+                &[("x", &x), ("y", &w)],
+            );
+            b.returns(&y);
+            model(
+                b.finish(),
+                Io {
+                    inputs: vec![x],
+                    outputs: vec![y],
+                },
+            )
+            .encode_to_vec()
+        };
+        assert_eq!(build(), build());
+    }
+}
