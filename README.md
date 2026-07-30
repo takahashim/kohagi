@@ -210,9 +210,49 @@ Neural Engine (ANE). On an M2, it is about 4× faster than Metal at 512
 tokens, with cosine similarity of approximately 0.99999 against the CPU
 output. For short inputs, the multicore CPU backend may still be faster.
 
+The ANE needs fixed input shapes, so it runs a converted model rather than the
+safetensors the other devices read. A release build converts one for itself:
 
-Convert a model with [`scripts/convert_coreml.py`](scripts/convert_coreml.py),
-then run it locally:
+```bash
+kohagi --device coreml < texts.jsonl
+kohagi --device coreml --model-id answerdotai/ModernBERT-large < texts.jsonl
+```
+
+The first run downloads the checkpoint if it is not already cached, converts it
+(about 20 seconds), and compiles it for the Neural Engine; later runs load the
+cached bundle in about 0.3 s. Both caches live under
+`~/Library/Caches/kohagi/coreml`, or `$KOHAGI_COREML_CACHE`, and are safe to
+delete. `--coreml-buckets` chooses the sequence lengths (default
+`128,256,512`; the largest caps `--max-seq-length`), and `--coreml-quantize
+embeddings` roughly halves a large-vocabulary bundle at no measured retrieval
+cost — though a quantized bundle's vectors are not interchangeable with an fp16
+one's, which is why it is not the default.
+
+This works for ModernBERT checkpoints Kohagi's converter supports; one it does
+not is refused before anything is written, naming every reason at once. Of the
+690 ModernBERT configs published on the Hub with at least 50 downloads, 670 are
+accepted; [`scripts/survey_modernbert.py`](scripts/survey_modernbert.py) is what
+measures that.
+
+#### Converting ahead of time
+
+Two converters can also write a bundle to a directory.
+[`src/bin/coreml-convert.rs`](src/bin/coreml-convert.rs) is the same pure-Rust
+emitter the automatic path uses, behind the `coreml-export` feature;
+[`scripts/convert_coreml.py`](scripts/convert_coreml.py) goes through PyTorch and
+`coremltools`, and every model published for Kohagi so far was made with it. For
+`cl-nagoya/ruri-v3-130m` the two produce bit-identical output with the same
+Neural Engine placement.
+
+```bash
+cargo run --release --bin coreml-convert --features coreml-export -- \
+    --model-id cl-nagoya/ruri-v3-130m --out-dir models/ruri-v3-130m-coreml \
+    --sequence-lengths 128,256,512
+
+kohagi --device coreml --coreml-dir models/ruri-v3-130m-coreml < texts.jsonl
+```
+
+Or with the Python converter:
 
 ```bash
 python scripts/convert_coreml.py --model-id cl-nagoya/ruri-v3-130m \
@@ -256,10 +296,13 @@ bucket while torch pads only to its batch's longest row.
 Startup swings it back the other way. Torch spends about 12 s importing and
 loading per process against Kohagi's 0.6 s, so on the totals a rake task or a
 per-batch subprocess actually pays, `--device coreml` comes out 2.8× (short) and
-4.4× (long) ahead. Those 0.6 s assume the converted directory ships compiled
-`seq-<N>.mlmodelc` bundles, as `--compiled` emits and the repo above contains;
-a directory holding only `.mlpackage` bundles has CoreML compile them on every
-load, which cost ~20 s per run on the same machine.
+4.4× (long) ahead. Those 0.6 s assume the buckets are already compiled. A converted directory can
+ship compiled `seq-<N>.mlmodelc` bundles, as `--compiled` emits and the repo
+above contains, in which case they are loaded directly. Otherwise Kohagi compiles
+each `.mlpackage` on first use — ~20 s per bucket — and caches the result under
+`~/Library/Caches/kohagi/coreml` (or `$KOHAGI_COREML_CACHE`), so only the first
+run pays it. Shipping `compiled/` doubles a repository's size to move that cost
+off the first run as well.
 
 ### `--precision bf16` on AVX512-BF16 CPUs
 
