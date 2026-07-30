@@ -18,6 +18,21 @@ tokenizer and config:
         seq-256.mlmodelc
         seq-512.mlmodelc
 
+With --multi-function the lengths land in one bundle instead, as one CoreML
+function each, sharing a single copy of the weights:
+
+    <out-dir>/
+      buckets-128-256-512.mlpackage    # functions seq_128 / seq_256 / seq_512
+      tokenizer.json
+      config.json
+      1_Pooling/config.json
+      compiled/
+        buckets-128-256-512.mlmodelc
+
+That is the form to upload: on bekko-embedding-v1-a25m it is 248MB against
+740MB for the three separate packages, with bit-identical output and latency
+within a percent. Kohagi reads either layout.
+
 Point Kohagi at it locally:
 
     kohagi --device coreml --coreml-dir <out-dir>
@@ -95,6 +110,49 @@ def convert_bucket(enc, seq, out_path):
     print(f"  saved {out_path.name}")
 
 
+def merge_functions(out_dir, buckets):
+    """Merge the per-length packages into one multi-function bundle and return it.
+
+    Each length becomes a `seq_<N>` function, and `save_multifunction`
+    deduplicates the weights they share — which for a large-vocabulary encoder is
+    nearly everything, since only the fixed input shape differs. The per-length
+    packages are removed afterwards so the directory holds one form of each
+    bucket; Kohagi reads the lengths back out of the bundle's name.
+    """
+    from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
+
+    desc = MultiFunctionDescriptor()
+    for seq in buckets:
+        desc.add_function(
+            str(out_dir / f"seq-{seq}.mlpackage"),
+            src_function_name="main",
+            target_function_name=f"seq_{seq}",
+        )
+    desc.default_function_name = f"seq_{buckets[0]}"
+
+    merged = out_dir / ("buckets-" + "-".join(str(s) for s in buckets) + ".mlpackage")
+    if merged.exists():
+        shutil.rmtree(merged)
+    print(f"merging {len(buckets)} lengths into {merged.name} ...")
+    save_multifunction(desc, str(merged))
+    for seq in buckets:
+        shutil.rmtree(out_dir / f"seq-{seq}.mlpackage")
+    return merged
+
+
+def compile_beside(out_dir, bundle):
+    """Compile `bundle` into `compiled/<name>.mlmodelc` next to it."""
+    from coremltools.models.utils import compile_model
+
+    compiled_dir = out_dir / "compiled"
+    compiled_dir.mkdir(exist_ok=True)
+    mlmodelc = compiled_dir / (bundle.stem + ".mlmodelc")
+    if mlmodelc.exists():
+        shutil.rmtree(mlmodelc)
+    shutil.copytree(compile_model(str(bundle)), mlmodelc)
+    print(f"  compiled compiled/{mlmodelc.name}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model-id", default="cl-nagoya/ruri-v3-130m", help="HF model to convert")
@@ -109,9 +167,18 @@ def main():
     ap.add_argument(
         "--compiled",
         action="store_true",
-        help="also emit a compiled seq-<N>.mlmodelc beside each .mlpackage. "
-        "Kohagi then loads the .mlmodelc directly (no per-run compile) and "
-        "falls back to the .mlpackage if it can't. Doubles the output size.",
+        help="also emit a compiled .mlmodelc beside each .mlpackage. Kohagi then "
+        "loads the .mlmodelc directly (no per-run compile) and falls back to the "
+        ".mlpackage if it can't. Doubles the output size.",
+    )
+    ap.add_argument(
+        "--multi-function",
+        action="store_true",
+        help="emit one buckets-<N>-<N>....mlpackage holding every length as a "
+        "CoreML function instead of one .mlpackage per length. The lengths then "
+        "share a single copy of the weights: on bekko-embedding-v1-a25m, 3 "
+        "buckets go from 740MB to 248MB with bit-identical output and no "
+        "measurable change in latency. Needs macOS 15 to load.",
     )
     args = ap.parse_args()
 
@@ -120,23 +187,21 @@ def main():
     model = AutoModel.from_pretrained(args.model_id, attn_implementation="eager").eval()
     enc = Encoder(model)
 
+    buckets = sorted(args.buckets)
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    for seq in sorted(args.buckets):
+    for seq in buckets:
         out = args.out_dir / f"seq-{seq}.mlpackage"
         if out.exists():
             shutil.rmtree(out)
         print(f"converting seq={seq} ...")
         convert_bucket(enc, seq, out)
-        if args.compiled:
-            from coremltools.models.utils import compile_model
 
-            compiled_dir = args.out_dir / "compiled"
-            compiled_dir.mkdir(exist_ok=True)
-            mlmodelc = compiled_dir / f"seq-{seq}.mlmodelc"
-            if mlmodelc.exists():
-                shutil.rmtree(mlmodelc)
-            shutil.copytree(compile_model(str(out)), mlmodelc)
-            print(f"  compiled compiled/{mlmodelc.name}")
+    bundles = [args.out_dir / f"seq-{seq}.mlpackage" for seq in buckets]
+    if args.multi_function:
+        bundles = [merge_functions(args.out_dir, buckets)]
+    if args.compiled:
+        for bundle in bundles:
+            compile_beside(args.out_dir, bundle)
 
     # Copy tokenizer.json and config.json next to the buckets, from the HF cache.
     from huggingface_hub import hf_hub_download
