@@ -223,6 +223,28 @@ Or load the same directory layout from Hugging Face Hub:
 kohagi --device coreml --coreml-model-id takahashim/ruri-v3-130m-coreml < texts.jsonl
 ```
 
+Measured against PyTorch on the same machine — M2, `ruri-v3-130m`, median of
+three runs, from `examples/benchmark.py --device mps --coreml-model-id
+takahashim/ruri-v3-130m-coreml`:
+
+| Input                   | kohagi (CPU) | kohagi (`--device coreml`) | torch (MPS) |
+| ----------------------- | -----------: | -------------------------: | ----------: |
+| 1200 short (~36 tokens) |       9.9 s  |                 **5.6 s**  |      4.4 s  |
+| 240 long (512 tokens)   |      37.0 s  |                 **6.5 s**  |     19.3 s  |
+
+Those are encode times, with startup and model load excluded. At 512 tokens the
+ANE is 3.0× torch/MPS and 5.7× Kohagi's own CPU path. On the short inputs
+torch/MPS computes *faster* than the ANE, which pads every row to the 128-token
+bucket while torch pads only to its batch's longest row.
+
+Startup swings it back the other way. Torch spends about 12 s importing and
+loading per process against Kohagi's 0.6 s, so on the totals a rake task or a
+per-batch subprocess actually pays, `--device coreml` comes out 2.8× (short) and
+4.4× (long) ahead. Those 0.6 s assume the converted directory ships compiled
+`seq-<N>.mlmodelc` bundles, as `--compiled` emits and the repo above contains;
+a directory holding only `.mlpackage` bundles has CoreML compile them on every
+load, which cost ~20 s per run on the same machine.
+
 ### `--precision bf16` on AVX512-BF16 CPUs
 
 On Zen 4 (Sapphire Rapids) and newer CPUs, `--precision bf16` uses `bf16` for projection layers while keeping normalization, softmax, and attention scores in `f32`.
@@ -288,7 +310,7 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 - モデルは初回のみ Hugging Face Hub から自動ダウンロードします (`--model-path`/`--tokenizer-path` でオフライン運用も可)
 - x86_64 (AVX512-BF16 搭載の Zen 4 / Sapphire Rapids 以降)では `--precision bf16` で約 2 倍高速化します(短文 2.3 倍、512 トークン 2.0 倍、cosine ≈ 0.99999、既定は f32。精度は若干落ちます)
 - Apple Silicon では `--features metal` でビルドすると `--device metal` が使え、512トークンで CPU の約1.8倍で動きます(出力は f32 のまま変わりません)
-- 同様に `--features coreml` でビルドすると `--device coreml` が使え、事前変換したモデルを Apple Neural Engine (ANE) 上で動かせます。512トークンで Metal の約4倍で、CPU 出力に対し cosine ≈ 0.99999 です(短い入力ではマルチコア CPU の方が速いこともあります)。ローカルの変換済みモデルは `--coreml-dir`、Hugging Face Hub 上の同じ構成は `--coreml-model-id` で指定します
+- 同様に `--features coreml` でビルドすると `--device coreml` が使え、事前変換したモデルを Apple Neural Engine (ANE) 上で動かせます。512トークンで Metal の約4倍、PyTorch (MPS) 比でも埋め込み処理が3.0倍で、CPU 出力に対し cosine ≈ 0.99999 です(短い入力では ANE が固定長にパディングする分、PyTorch (MPS) やマルチコア CPU の方が速いこともあります)。起動時間を含めた合計では短文2.8倍・512トークン4.4倍になります。ローカルの変換済みモデルは `--coreml-dir`、Hugging Face Hub 上の同じ構成は `--coreml-model-id` で指定します
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
 - 入出力の契約・exit code(0/2/1)は [PROTOCOL.md](PROTOCOL.md) を参照してください。
   Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) にあります。
