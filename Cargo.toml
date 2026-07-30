@@ -65,6 +65,12 @@ objc2-core-ml = { version = "0.3", optional = true, features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.11", features = ["accelerate"] }
 
+# Only for the `coreml-export` feature: the CoreML protobuf schema in
+# src/coreml_proto is generated prost code, so the runtime crate is needed to
+# encode and decode it. The generator (prost-build) is not a dependency here —
+# the generated code is committed, see src/coreml_proto/mod.rs.
+prost = { version = "0.14", optional = true }
+
 [features]
 # NVIDIA GPU via Candle's CUDA backend: `cargo build --release --features cuda`,
 # then `kohagi --device cuda`. Requires an NVIDIA driver and CUDA runtime.
@@ -79,6 +85,10 @@ metal = [
     "dep:candle-metal-kernels",
     "dep:objc2-metal",
 ]
+
+# Writing CoreML models from Rust instead of scripts/convert_coreml.py, behind
+# its own feature because it is under development and pulls in prost.
+coreml-export = ["dep:prost"]
 
 # Apple Neural Engine via CoreML: `cargo build --release --features coreml`,
 # then `kohagi --device coreml --coreml-dir <dir>`. macOS-only. Runs pre-

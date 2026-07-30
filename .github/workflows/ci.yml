@@ -34,7 +34,13 @@ jobs:
       # needs the Neural Engine — so this builds and lints but does not execute
       # the kernels.
       - if: runner.os == 'macOS'
-        run: cargo clippy --locked --all-targets --features metal,coreml -- -D warnings
+        run: cargo clippy --locked --all-targets --features metal,coreml,coreml-export -- -D warnings
+      # coreml-export carries the generated CoreML protobuf bindings, which are
+      # not macOS-specific — lint and test them everywhere. Its round-trip test
+      # needs a real model.mlmodel, which the repository does not carry, so it
+      # skips unless KOHAGI_TEST_MLMODEL is set.
+      - run: cargo clippy --locked --all-targets --features coreml-export -- -D warnings
+      - run: cargo test --locked --features coreml-export
       # The CoreML development jigs (tools/coreml-jigs) live outside the
       # workspace so their dependencies stay out of Kohagi's Cargo.lock, which
       # also means the steps above never see them. Build and lint them here, and

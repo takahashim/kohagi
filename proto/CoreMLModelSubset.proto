@@ -1,0 +1,119 @@
+// A subset of CoreML's Model.proto and FeatureTypes.proto: the messages needed
+// to wrap an ML Program, and nothing else.
+//
+// Field numbers, names and types are taken verbatim from
+// apple/coremltools `mlmodel/format/{Model.proto,FeatureTypes.proto}` at
+// main @ 02c736ddca46 (2026-07-20), BSD-3-Clause, see LICENSE-COREMLTOOLS-BSD.
+// `MIL.proto` beside this file is vendored unchanged; only this outer wrapper is
+// trimmed.
+//
+// Why trim at all: upstream `Model.proto` transitively imports 30 further files,
+// including a 186KB `NeuralNetwork.proto`, for model types Kohagi will never
+// emit or read. Generating all of it would put megabytes of code behind the
+// `coreml-export` feature to describe a tree ensemble and a word tagger.
+//
+// What was kept, and how that was decided: a converted ModernBERT encoder's
+// `model.mlmodel` uses three fields of `Model` (`specificationVersion`,
+// `description`, `mlProgram`) and three of `ModelDescription` (`input`,
+// `output`, `metadata`) — read off the wire from a real one rather than assumed.
+// `functions` and `defaultFunctionName` are kept as well, since a
+// multi-function bundle needs them. Everything else in the `Model.Type` oneof is
+// dropped.
+//
+// What was dropped, in the order it would need to come back:
+//
+//   ModelDescription   state=13, predictedFeatureName=11,
+//                      predictedProbabilitiesName=12, trainingInput=50
+//   FunctionDescription state=6, predictedFeatureName=4,
+//                      predictedProbabilitiesName=5
+//   FeatureType        every Type case but multiArrayType: int64Type=1,
+//                      doubleType=2, stringType=3, imageType=4,
+//                      dictionaryType=6, sequenceType=7, stateType=8
+//   ArrayFeatureType   ShapeFlexibility (enumeratedShapes=21, shapeRange=31),
+//                      defaultOptionalValue (41, 51, 61)
+//   Model.Type         every case but mlProgram=502
+//
+// Dropping ShapeFlexibility is deliberate rather than incidental: a flexible or
+// enumerated input shape disables the ANE compute plan outright (see
+// src/coreml.rs), so a model carrying one is not a model this crate should be
+// writing or silently accepting.
+//
+// The risk of a subset is that a field present in a real file has nowhere to be
+// decoded into and is silently lost, because prost does not preserve unknown
+// fields. The round-trip test in src/coreml_proto/roundtrip.rs guards it:
+// re-encoding a published `model.mlmodel` must produce the same number of bytes,
+// which a dropped field makes impossible. Extending this file when that test
+// fails is the intended way to follow upstream.
+//
+// Verified against a single-function, fixed-shape encoder
+// (`takahashim/ruri-v3-130m-coreml`, seq-128). `functions` and
+// `defaultFunctionName` are declared for multi-function bundles but not yet
+// exercised by any fixture.
+
+syntax = "proto3";
+option optimize_for = LITE_RUNTIME;
+package CoreML.Specification;
+
+import public "MIL.proto";
+
+// From FeatureTypes.proto. The `Type` oneof keeps only the multiarray case: an
+// encoder's inputs and outputs are all tensors.
+message ArrayFeatureType {
+    enum ArrayDataType {
+        INVALID_ARRAY_DATA_TYPE = 0;
+        FLOAT32 = 65568; // 0x10000 | 32
+        DOUBLE = 65600;  // 0x10000 | 64
+        INT32 = 131104;  // 0x20000 | 32
+        INT8  = 131080;  // 0x20000 |  8
+        FLOAT16 = 65552; // 0x10000 | 16
+    }
+
+    repeated int64 shape = 1;
+    ArrayDataType dataType = 2;
+}
+
+message FeatureType {
+    oneof Type {
+        ArrayFeatureType multiArrayType = 5;
+    }
+    bool isOptional = 1000;
+}
+
+// From Model.proto.
+message FeatureDescription {
+    string name = 1;
+    string shortDescription = 2;
+    FeatureType type = 3;
+}
+
+message Metadata {
+    string shortDescription = 1;
+    string versionString = 2;
+    string author = 3;
+    string license = 4;
+    map<string, string> userDefined = 100;
+}
+
+message FunctionDescription {
+    string name = 1;
+    repeated FeatureDescription input = 2;
+    repeated FeatureDescription output = 3;
+}
+
+message ModelDescription {
+    repeated FunctionDescription functions = 20;
+    string defaultFunctionName = 21;
+    Metadata metadata = 100;
+    repeated FeatureDescription input = 1;
+    repeated FeatureDescription output = 10;
+}
+
+message Model {
+    int32 specificationVersion = 1;
+    ModelDescription description = 2;
+    bool isUpdatable = 10;
+
+    oneof Type {
+        MILSpec.Program mlProgram = 502;
+    }
+}
