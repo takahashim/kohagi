@@ -19,6 +19,19 @@ Startup is measured, not assumed: PyTorch pays it once per process, so a
 long-lived worker amortizes it away while a rake task never does. Decide
 which row matters by how you plan to deploy, not by which is larger.
 
+Pass --coreml-dir (or --coreml-model-id) to add a `kohagi/coreml` row for the
+Apple Neural Engine, alongside the CPU one. It must be the *same* checkpoint
+as --model-id, or the two Kohagi rows are not comparable — nothing checks this
+for you. Two things about that row:
+
+- **Convert with --compiled.** A directory whose buckets are only
+  `.mlpackage` bundles is compiled to `.mlmodelc` on *every* load, which lands
+  in the load column: ~20s per invocation on an M2, against ~0.6s for a
+  directory that ships `compiled/`. That is a property of the directory, not
+  of the ANE.
+- **The very first load of a given model pays one more one-time cost** while
+  the OS caches its ANE program (~20s). The warm-up run absorbs it.
+
 By default this generates a synthetic Japanese corpus so the numbers are
 reproducible without shipping a dataset. Pass --texts to use your own.
 """
@@ -55,21 +68,27 @@ def synth(kind: str, n: int) -> list[str]:
     ]
 
 
-def time_kohagi(binary: str, texts: list[str], args) -> dict:
+def time_kohagi(binary: str, texts: list[str], args, *, coreml: bool = False) -> dict:
     stdin = "".join(
         json.dumps({"id": i, "text": t}, ensure_ascii=False) + "\n"
         for i, t in enumerate(texts)
     )
     cmd = [binary, "--model-id", args.model_id, "--max-seq-length", str(args.max_seq_length)]
-    if args.precision != "f32":
+    if coreml:
+        cmd += ["--device", "coreml"]
+        if args.coreml_dir:
+            cmd += ["--coreml-dir", args.coreml_dir]
+        else:
+            cmd += ["--coreml-model-id", args.coreml_model_id]
+    elif args.precision != "f32":
         cmd += ["--precision", args.precision]
 
     # A 2-record run is almost entirely startup plus model load, so it
     # isolates the fixed cost that the full run also pays.
     #
     # Take the fastest of two probes. The probe runs in its own process before
-    # the full run, so a one-time cost that lands on the *first* invocation of a
-    # model — a cold page cache, or the OS caching the CoreML compile of an
+    # the full run, so a one-time cost that lands on the *first* invocation of
+    # a model — a cold page cache, or the OS caching the CoreML compile of an
     # uncompiled .mlpackage — would be counted as load and then not paid by the
     # full run, pushing `encode` (total - load) below zero. Timing two probes
     # and keeping the smaller one measures the cost the full run actually
@@ -133,6 +152,18 @@ def main() -> int:
     p.add_argument("--runs", type=int, default=3)
     p.add_argument("--texts", help="file with one text per line")
     p.add_argument("--device", default="cpu", help="PyTorch device: cpu, mps, cuda")
+    coreml = p.add_mutually_exclusive_group()
+    coreml.add_argument(
+        "--coreml-dir",
+        help="local converted CoreML model directory; adds a kohagi/coreml row. "
+        "Must be the same checkpoint as --model-id, and should ship compiled/ "
+        "(see the description above).",
+    )
+    coreml.add_argument(
+        "--coreml-model-id",
+        help="Hub repo with converted CoreML models; adds a kohagi/coreml row. "
+        "Same-checkpoint caveat as --coreml-dir.",
+    )
     p.add_argument(
         "--precision",
         choices=["f32", "bf16"],
@@ -150,6 +181,8 @@ def main() -> int:
         texts = synth(args.kind, args.count or (1200 if args.kind == "short" else 240))
 
     print(f"model      : {args.model_id} ({args.precision})")
+    if args.coreml_dir or args.coreml_model_id:
+        print(f"coreml     : {args.coreml_dir or args.coreml_model_id}")
     print(f"texts      : {len(texts)} ({args.texts or args.kind})")
     print(f"runs       : {args.runs} (median reported)\n")
 
@@ -157,12 +190,20 @@ def main() -> int:
     # Kohagi, Metal shader compilation for MPS. Discard it.
     print("warming up...", flush=True)
     time_kohagi(args.kohagi, texts[:8], args)
+    if args.coreml_dir or args.coreml_model_id:
+        time_kohagi(args.kohagi, texts[:8], args, coreml=True)
 
     rows = []
     med = lambda rs, k: statistics.median(r[k] for r in rs)  # noqa: E731
 
     runs = [time_kohagi(args.kohagi, texts, args) for _ in range(args.runs)]
     rows.append(("kohagi", med(runs, "load"), med(runs, "encode"), med(runs, "total")))
+
+    if args.coreml_dir or args.coreml_model_id:
+        runs = [time_kohagi(args.kohagi, texts, args, coreml=True) for _ in range(args.runs)]
+        rows.append(
+            ("kohagi/coreml", med(runs, "load"), med(runs, "encode"), med(runs, "total"))
+        )
 
     if not args.skip_torch:
         try:
@@ -191,10 +232,16 @@ def main() -> int:
                 "compute. Raise --count, or quiet the machine, and re-run."
             )
 
-    if len(rows) == 2:
-        k, t = rows[0], rows[1]
-        print(f"\nencode : kohagi is {t[2] / k[2]:.2f}x the reference")
-        print(f"total  : kohagi is {t[3] / k[3]:.2f}x the reference")
+    by_name = {row[0]: row for row in rows}
+    if "torch/" + args.device in by_name:
+        torch = by_name["torch/" + args.device]
+        kohagi = by_name["kohagi"]
+        print(f"\nencode : kohagi is {torch[2] / kohagi[2]:.2f}x torch/{args.device}")
+        print(f"total  : kohagi is {torch[3] / kohagi[3]:.2f}x torch/{args.device}")
+        if "kohagi/coreml" in by_name:
+            coreml_row = by_name["kohagi/coreml"]
+            print(f"encode : coreml is {torch[2] / coreml_row[2]:.2f}x torch/{args.device}")
+            print(f"total  : coreml is {torch[3] / coreml_row[3]:.2f}x torch/{args.device}")
         print(
             "\nNote: torch pays load once per process. If you can amortize it,\n"
             "compare the encode row; if you spawn per batch, compare total."
