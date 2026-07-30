@@ -34,13 +34,42 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::AllocAnyThread;
 use objc2_core_ml::{
     MLDictionaryFeatureProvider, MLFeatureDescription, MLFeatureProvider, MLFeatureValue, MLModel,
-    MLMultiArray, MLMultiArrayDataType,
+    MLModelCreatorDefinedKey, MLMultiArray, MLMultiArrayDataType,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 
 use crate::UnsupportedRequest;
 
 pub use provision::fetch_from_hub;
+
+/// Say so when a bundle was quantized, reading the converter's own provenance.
+///
+/// A quantized bundle's vectors are close enough to an fp16 one's to score the same
+/// on a retrieval benchmark but are not the same vectors, so an index built from one
+/// and queried with the other degrades quietly. One line at load is what makes that
+/// visible; a bundle without the key (a Python conversion, or an fp16 one) says
+/// nothing.
+fn warn_if_quantized(model: &MLModel) {
+    let Some(quantization) = creator_metadata(model, "com.github.takahashim.kohagi.quantization")
+    else {
+        return;
+    };
+    eprintln!(
+        "kohagi: this CoreML bundle is quantized ({quantization}); its vectors are not \
+         interchangeable with an fp16 bundle's, so do not mix them in one index"
+    );
+}
+
+/// One value from the creator-defined metadata a converted bundle carries.
+fn creator_metadata(model: &MLModel, key: &str) -> Option<String> {
+    unsafe {
+        let defined = MLModelCreatorDefinedKey.as_ref()?;
+        let all = model.modelDescription().metadata();
+        let user = all.objectForKey(defined)?;
+        let user: &NSDictionary<NSString, NSString> = &*std::ptr::from_ref(&*user).cast();
+        Some(user.objectForKey(&NSString::from_str(key))?.to_string())
+    }
+}
 
 /// One loaded fixed-length model plus the sequence length it was compiled for.
 struct Bucket {
@@ -96,6 +125,9 @@ impl CoreMlEncoder {
                 provision::load_bucket(seq, forms.compiled.as_ref(), forms.package.as_ref())?;
             check_io(&model, seq, dim)?;
             buckets.push(Bucket { seq, model });
+        }
+        if let Some(first) = buckets.first() {
+            warn_if_quantized(&first.model);
         }
         Ok(Self { buckets, dim })
     }
