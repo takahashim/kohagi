@@ -91,12 +91,9 @@ jobs:
         run: |
           # Empty input must exit 0 without loading anything.
           : | ./target/${{ matrix.target }}/release/kohagi --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
-      - name: Smoke-test the protocol without a model (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $null | & .\\target\\${{ matrix.target }}\\release\\kohagi.exe --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # This runner has the CUDA Toolkit but no NVIDIA driver.  A CUDA-linked
+      # executable therefore cannot be launched here, even with empty stdin;
+      # the Windows job above deliberately validates compilation only.
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
