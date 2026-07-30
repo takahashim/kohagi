@@ -36,6 +36,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use kohagi::coreml_export::{
     encoder::{self, EncoderConfig, Options},
+    modernbert::Activation,
     safetensors::Checkpoint,
     write_package, Provenance,
 };
@@ -204,8 +205,12 @@ fn run(args: &Args) -> Result<()> {
     let sources = gather(args)?;
     let cfg = EncoderConfig::from_json(&sources.config)?;
     eprintln!(
-        "config  : hidden {}, {} layers, {} heads, vocab {}",
-        cfg.hidden, cfg.layers, cfg.heads, cfg.vocab
+        "config  : hidden {}, {} layers, {} heads, vocab {}, gate {}",
+        cfg.hidden,
+        cfg.layers,
+        cfg.heads,
+        cfg.vocab,
+        cfg.activation.name()
     );
 
     // Before opening a 500MB checkpoint: a bucket past the trained positions has no
@@ -233,6 +238,7 @@ fn run(args: &Args) -> Result<()> {
         lengths: lengths.clone(),
         quantized_embeddings: opts.quantize_embeddings,
         quantized_projections: opts.quantize_projections,
+        activation: (cfg.activation != Activation::default()).then(|| cfg.activation.name()),
     };
 
     eprintln!(

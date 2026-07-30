@@ -32,6 +32,31 @@ pub struct Config {
     pub seq: usize,
     pub eps: f32,
     pub rope_theta: f32,
+    pub activation: Activation,
+}
+
+/// The gate's activation in the gated feed-forward.
+///
+/// ModernBERT's MLP multiplies an activated gate by a linear up-projection, so
+/// this choice is what makes the block a GeGLU or a SwiGLU. Both are one MIL op
+/// with the same shape, and the rest of the graph does not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Activation {
+    /// Exact GeLU, the ModernBERT default.
+    #[default]
+    Gelu,
+    /// SiLU, which `hidden_activation: "silu"` selects (granite-embedding-r2).
+    Silu,
+}
+
+impl Activation {
+    /// The `hidden_activation` spelling, for provenance metadata and messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Gelu => "gelu",
+            Self::Silu => "silu",
+        }
+    }
 }
 
 impl Config {
@@ -476,12 +501,16 @@ pub fn block(
             ("split_sizes", &geglu_sizes),
         ],
     );
-    let mode = b.const_str(&tag("gelu_mode"), "EXACT");
-    let gate = b.op(
-        "gelu",
-        Tensor::new(tag("gate"), DType::Fp16, &[1, seq, inter]),
-        &[("x", &halves[0]), ("mode", &mode)],
-    );
+    // GeLU takes a mode; SiLU takes only its input. Everything downstream is
+    // shape-identical, so the two differ by this one op.
+    let out = Tensor::new(tag("gate"), DType::Fp16, &[1, seq, inter]);
+    let gate = match cfg.activation {
+        Activation::Gelu => {
+            let mode = b.const_str(&tag("gelu_mode"), "EXACT");
+            b.op("gelu", out, &[("x", &halves[0]), ("mode", &mode)])
+        }
+        Activation::Silu => b.op("silu", out, &[("x", &halves[0])]),
+    };
     let gated = b.op(
         "mul",
         Tensor::new(tag("gated"), DType::Fp16, &[1, seq, inter]),
@@ -569,6 +598,7 @@ mod tests {
             seq: 3,
             eps: 1e-5,
             rope_theta: 10_000.0,
+            activation: Activation::Gelu,
         };
         let d = cfg.head_dim();
         assert_eq!(d, 4);
@@ -631,6 +661,7 @@ mod tests {
             seq: 128,
             eps: 1e-5,
             rope_theta: 10_000.0,
+            activation: Activation::Gelu,
         };
         assert_eq!(cfg.head_dim(), 64);
         // 0x1p-3 in the reference model.

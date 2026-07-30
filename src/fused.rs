@@ -1,7 +1,8 @@
-//! A fused GeGLU kernel for the Metal backend.
+//! A fused gated-feed-forward kernel for the Metal backend.
 //!
-//! ModernBERT's MLP computes `gelu(gate) * up` where gate and up are the two
-//! halves of one wide `Wi` projection. Done with candle ops that is two passes
+//! ModernBERT's MLP computes `act(gate) * up` where gate and up are the two
+//! halves of one wide `Wi` projection, and `act` is the gelu or silu the config
+//! names (a GeGLU or a SwiGLU). Done with candle ops that is two passes
 //! over a [tokens, intermediate] tensor — gelu writes it, the multiply reads it
 //! back. This kernel does both in one pass, reading gate and up straight out of
 //! the wide `[tokens, 2*intermediate]` projection so no chunk copy is needed
@@ -10,17 +11,19 @@
 //! It is a [`CustomOp1`] with candle unmodified: the shader is compiled at
 //! runtime through candle's public Metal wrappers and dispatched onto candle's
 //! command buffer, exactly as candle's own `UgIOp1` does. Non-Metal callers use
-//! [`geglu`], which falls back to the plain candle path.
+//! [`gated`], which falls back to the plain candle path.
 
 use candle_core::{Result, Tensor};
 
-/// `gelu(gate) * up`, where `wide` is `[.., 2 * inter]` with gate in the first
+use crate::encoder::Activation;
+
+/// `act(gate) * up`, where `wide` is `[.., 2 * inter]` with gate in the first
 /// `inter` columns and up in the rest. Returns `[.., inter]`.
 ///
 /// On Metal this runs the fused kernel; elsewhere it splits and uses candle's
 /// ops, so the same call works on every backend. The MLP only reaches this on
 /// Metal (the CPU keeps a pre-split Wi), but the fallback keeps it total.
-pub fn geglu(wide: &Tensor, inter: usize) -> Result<Tensor> {
+pub fn gated(wide: &Tensor, inter: usize, act: Activation) -> Result<Tensor> {
     #[cfg(feature = "metal")]
     if wide.device().is_metal() && wide.dtype() == candle_core::DType::F32 {
         // The kernel works on a 2-D [rows, 2*inter]; flatten any leading dims
@@ -29,20 +32,25 @@ pub fn geglu(wide: &Tensor, inter: usize) -> Result<Tensor> {
         let (lead, cols) = dims.split_at(dims.len() - 1);
         let rows: usize = lead.iter().product();
         let flat = wide.reshape((rows, cols[0]))?;
-        let out = flat.apply_op1_no_bwd(&metal::GegluWide { inter })?;
+        let out = flat.apply_op1_no_bwd(&metal::GatedWide { inter, act })?;
         let mut out_shape = lead.to_vec();
         out_shape.push(inter);
         return out.reshape(out_shape);
     }
     let gate = wide.narrow(candle_core::D::Minus1, 0, inter)?;
     let up = wide.narrow(candle_core::D::Minus1, inter, inter)?;
-    gate.gelu_erf()? * up
+    match act {
+        Activation::Gelu => gate.gelu_erf()? * up,
+        Activation::Silu => gate.silu()? * up,
+    }
 }
 
 #[cfg(feature = "metal")]
 mod metal {
     use candle_core::backend::BackendStorage;
     use candle_core::{CustomOp1, Layout, MetalStorage, Result, Shape};
+
+    use crate::encoder::Activation;
     use candle_metal_kernels::metal::{ComputePipeline, Device};
     use std::sync::{Mutex, OnceLock};
 
@@ -86,15 +94,35 @@ kernel void geglu_wide_f32(
     float gelu = g * (1.0f + kohagi_erf(g * M_SQRT1_2_F)) / 2.0f;
     out[gid] = gelu * u;
 }
+
+// The same, with silu on the gate: x / (1 + exp(-x)), matching candle's silu so
+// the fused and split paths agree by arithmetic rather than by tolerance.
+kernel void swiglu_wide_f32(
+    device const float *wide [[buffer(0)]],
+    device float       *out  [[buffer(1)]],
+    constant uint      &m    [[buffer(2)]],
+    constant uint      &i    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= m * i) return;
+    uint row = gid / i;
+    uint col = gid % i;
+    uint base = row * 2u * i;
+    float g = wide[base + col];
+    float u = wide[base + i + col];
+    out[gid] = (g / (1.0f + exp(-g))) * u;
+}
 "#;
 
-    /// Cached pipeline per Metal device. candle's own kernel cache is keyed by a
-    /// closed enum we cannot extend, so we hold our own. One shader, one dtype,
-    /// so the device is the only key that matters.
-    fn pipeline(dev: &Device) -> Result<ComputePipeline> {
-        static CACHE: OnceLock<Mutex<Vec<(usize, ComputePipeline)>>> = OnceLock::new();
+    /// Cached pipeline per (device, activation). candle's own kernel cache is keyed
+    /// by a closed enum we cannot extend, so we hold our own. One shader and one
+    /// dtype, so those two are the only keys that matter.
+    fn pipeline(dev: &Device, act: Activation) -> Result<ComputePipeline> {
+        /// Metal device registry id and gate activation.
+        type Key = (usize, Activation);
+        static CACHE: OnceLock<Mutex<Vec<(Key, ComputePipeline)>>> = OnceLock::new();
         let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
-        let key = dev.registry_id() as usize;
+        let key = (dev.registry_id() as usize, act);
         let mut guard = cache.lock().unwrap();
         if let Some((_, p)) = guard.iter().find(|(k, _)| *k == key) {
             return Ok(p.clone());
@@ -109,8 +137,12 @@ kernel void geglu_wide_f32(
         let lib = dev
             .new_library_with_source(SHADER, Some(&opts))
             .map_err(candle_core::Error::wrap)?;
+        let name = match act {
+            Activation::Gelu => "geglu_wide_f32",
+            Activation::Silu => "swiglu_wide_f32",
+        };
         let func = lib
-            .get_function("geglu_wide_f32", None)
+            .get_function(name, None)
             .map_err(candle_core::Error::wrap)?;
         let pipe = dev
             .new_compute_pipeline_state_with_function(&func)
@@ -119,13 +151,14 @@ kernel void geglu_wide_f32(
         Ok(pipe)
     }
 
-    pub struct GegluWide {
+    pub struct GatedWide {
         pub inter: usize,
+        pub act: Activation,
     }
 
-    impl CustomOp1 for GegluWide {
+    impl CustomOp1 for GatedWide {
         fn name(&self) -> &'static str {
-            "geglu_wide"
+            "gated_wide"
         }
 
         fn cpu_fwd(
@@ -133,18 +166,18 @@ kernel void geglu_wide_f32(
             _: &candle_core::CpuStorage,
             _: &Layout,
         ) -> Result<(candle_core::CpuStorage, Shape)> {
-            // geglu() never routes the CPU here, but the trait requires it.
-            candle_core::bail!("geglu_wide is metal-only; use the split path on cpu")
+            // gated() never routes the CPU here, but the trait requires it.
+            candle_core::bail!("gated_wide is metal-only; use the split path on cpu")
         }
 
         fn metal_fwd(&self, wide: &MetalStorage, l: &Layout) -> Result<(MetalStorage, Shape)> {
             if !l.is_contiguous() {
-                candle_core::bail!("geglu_wide needs a contiguous input");
+                candle_core::bail!("gated_wide needs a contiguous input");
             }
             let (rows, cols) = l.shape().dims2()?;
             if cols != 2 * self.inter {
                 candle_core::bail!(
-                    "geglu_wide: expected [.., {}], got [.., {cols}]",
+                    "gated_wide: expected [.., {}], got [.., {cols}]",
                     2 * self.inter
                 );
             }
@@ -153,10 +186,10 @@ kernel void geglu_wide_f32(
             let out = device
                 .new_buffer_builder()
                 .with_size_for(n, candle_core::DType::F32)
-                .with_label("geglu_wide")
+                .with_label("gated_wide")
                 .build()?;
 
-            let pipe = pipeline(device.metal_device())?;
+            let pipe = pipeline(device.metal_device(), self.act)?;
             let encoder = device.command_encoder()?;
             let enc = encoder.as_ref();
             enc.set_compute_pipeline_state(&pipe);
@@ -184,6 +217,67 @@ kernel void geglu_wide_f32(
                 MetalStorage::new(out, device.clone(), n, candle_core::DType::F32),
                 (rows, self.inter).into(),
             ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two gate activations against a plain candle split, on whatever device
+    /// the build has. On Metal that exercises the fused kernels; elsewhere it
+    /// checks the fallback's own dispatch.
+    #[test]
+    fn gated_matches_a_split_reference() {
+        // Metal when the build has it, so the fused kernels are what runs; the
+        // fallback otherwise.
+        #[cfg(feature = "metal")]
+        let device = candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu);
+        #[cfg(not(feature = "metal"))]
+        let device = candle_core::Device::Cpu;
+        let (rows, inter) = (4usize, 6usize);
+        let values: Vec<f32> = (0..rows * 2 * inter)
+            .map(|i| (i as f32 / 7.0) - 3.0)
+            .collect();
+        let wide = Tensor::from_vec(values.clone(), (rows, 2 * inter), &device).unwrap();
+
+        for act in [Activation::Gelu, Activation::Silu] {
+            let got = gated(&wide, inter, act).unwrap().flatten_all().unwrap();
+            let got = got.to_vec1::<f32>().unwrap();
+            let vals = &values;
+            let want: Vec<f32> = (0..rows)
+                .flat_map(|r| {
+                    (0..inter).map(move |c| {
+                        let g = f64::from(vals[r * 2 * inter + c]);
+                        let u = f64::from(vals[r * 2 * inter + inter + c]);
+                        let a = match act {
+                            // erf via Abramowitz & Stegun 7.1.26, as the shader uses.
+                            Activation::Gelu => {
+                                let z = g / std::f64::consts::SQRT_2;
+                                let (sign, z) = (z.signum(), z.abs());
+                                let t = 1.0 / (1.0 + 0.327_591_1 * z);
+                                let poly = ((((1.061_405_429 * t - 1.453_152_027) * t
+                                    + 1.421_413_741)
+                                    * t
+                                    - 0.284_496_736)
+                                    * t
+                                    + 0.254_829_592)
+                                    * t;
+                                g * 0.5 * (1.0 + sign * (1.0 - poly * (-z * z).exp()))
+                            }
+                            Activation::Silu => g / (1.0 + (-g).exp()),
+                        };
+                        (a * u) as f32
+                    })
+                })
+                .collect();
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-5,
+                    "{act:?} element {i}: got {g}, want {w}"
+                );
+            }
         }
     }
 }

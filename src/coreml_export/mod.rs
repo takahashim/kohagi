@@ -115,6 +115,10 @@ pub struct Provenance {
     pub quantized_embeddings: bool,
     /// Whether the projections are int8 too.
     pub quantized_projections: bool,
+    /// The gate activation the graph was built with, when it is not the
+    /// ModernBERT default. Recorded because it is the one graph shape a config
+    /// changes, so a bundle should be able to say which one it is.
+    pub activation: Option<&'static str>,
 }
 
 impl Provenance {
@@ -143,6 +147,12 @@ impl Provenance {
                 } else {
                     "embeddings-int8".to_string()
                 },
+            ));
+        }
+        if let Some(act) = self.activation {
+            out.push((
+                "com.github.takahashim.kohagi.activation".to_string(),
+                act.to_string(),
             ));
         }
         if !self.lengths.is_empty() {

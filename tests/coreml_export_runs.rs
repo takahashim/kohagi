@@ -597,7 +597,7 @@ fn one_attention_head_computes_scaled_dot_product() {
 /// definition rather than from the emitter, so that agreement is evidence about
 /// the emitted graph's wiring rather than a tautology.
 mod reference {
-    use kohagi::coreml_export::modernbert::{rope_tables, Config};
+    use kohagi::coreml_export::modernbert::{rope_tables, Activation, Config};
 
     pub struct Weights<'a> {
         pub attn_norm: Option<&'a [f32]>,
@@ -629,6 +629,11 @@ mod reference {
             out.extend(row.iter().zip(gamma).map(|(v, g)| (v - mean) / denom * g));
         }
         out
+    }
+
+    fn silu(v: f32) -> f32 {
+        let v = f64::from(v);
+        (v / (1.0 + (-v).exp())) as f32
     }
 
     fn gelu_exact(v: f32) -> f32 {
@@ -709,7 +714,11 @@ mod reference {
             for i in 0..inter {
                 let gate = wide[r * 2 * inter + i];
                 let up = wide[r * 2 * inter + inter + i];
-                gated[r * inter + i] = gelu_exact(gate) * up;
+                let activated = match cfg.activation {
+                    Activation::Gelu => gelu_exact(gate),
+                    Activation::Silu => silu(gate),
+                };
+                gated[r * inter + i] = activated * up;
             }
         }
         let mlp_out = linear(&gated, w.mlp_wo, seq, inter, h);
@@ -741,6 +750,16 @@ fn spread(n: usize, seed: u32) -> Vec<f32> {
 /// taking a minute to check by hand.
 #[test]
 fn a_transformer_block_matches_a_reference_implementation() {
+    use kohagi::coreml_export::modernbert::Activation;
+    for activation in [Activation::Gelu, Activation::Silu] {
+        one_block_against_the_reference(activation);
+    }
+}
+
+/// The block at both gate activations. `silu` is a different MIL operation of the
+/// same shape, so running the whole block on each is what shows the substitution is
+/// the only difference — and that CoreML has the operation at all.
+fn one_block_against_the_reference(activation: kohagi::coreml_export::modernbert::Activation) {
     use kohagi::coreml_export::modernbert::{self, BlockOffsets, Config, Stored};
 
     let cfg = Config {
@@ -750,6 +769,7 @@ fn a_transformer_block_matches_a_reference_implementation() {
         seq: 6,
         eps: 1e-5,
         rope_theta: 10_000.0,
+        activation,
     };
     let (h, inter, seq) = (cfg.hidden, cfg.intermediate, cfg.seq);
 
@@ -800,7 +820,7 @@ fn a_transformer_block_matches_a_reference_implementation() {
         },
     );
 
-    let dir = scratch("block");
+    let dir = scratch(&format!("block-{}", activation.name()));
     write_package(&dir, &m, &weights.finish()).expect("write the package");
     let model_handle = load(&dir);
 
@@ -826,7 +846,7 @@ fn a_transformer_block_matches_a_reference_implementation() {
     // A block accumulates fp16 rounding through two normalizations, a softmax and
     // four projections, so this is looser than the single-operation rungs. A
     // wiring error is off by far more than this.
-    assert_close(&got, &want, 3e-2, "block");
+    assert_close(&got, &want, 3e-2, &format!("block ({})", activation.name()));
 }
 
 /// Rung 9: the same block at `ruri-v3-130m`'s real dimensions, which is the size
@@ -846,6 +866,7 @@ fn a_real_size_block_compiles_and_runs() {
         seq: 128,
         eps: 1e-5,
         rope_theta: 10_000.0,
+        activation: kohagi::coreml_export::modernbert::Activation::Gelu,
     };
     let (h, inter, seq) = (cfg.hidden, cfg.intermediate, cfg.seq);
 
@@ -971,6 +992,7 @@ fn the_whole_encoder_matches_the_python_conversion() {
         local_rope_theta: 10_000.0,
         global_rope_theta: 160_000.0,
         max_positions: None,
+        activation: kohagi::coreml_export::modernbert::Activation::Gelu,
     };
     let seq = 128;
 

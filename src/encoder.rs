@@ -42,9 +42,25 @@ pub struct Config {
     pub layer_norm_eps: f64,
     pub pad_token_id: u32,
     pub global_attn_every_n_layers: usize,
+    pub activation: Activation,
     pub global_rope_theta: f64,
     pub local_attention: usize,
     pub local_rope_theta: f64,
+}
+
+/// The gate's activation in ModernBERT's gated feed-forward, which is what makes
+/// the block a GeGLU or a SwiGLU.
+///
+/// The CoreML emitter carries its own copy of this choice (as a MIL operation
+/// rather than a candle one), so the two are deliberately separate types: the
+/// runtime must not depend on the `coreml-export` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Activation {
+    /// Exact GeLU, the ModernBERT default.
+    #[default]
+    Gelu,
+    /// SiLU, which `hidden_activation: "silu"` selects (granite-embedding-r2).
+    Silu,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +78,7 @@ struct RawConfig {
     norm_eps: Option<f64>,
     pad_token_id: u32,
     global_attn_every_n_layers: usize,
+    hidden_activation: Option<String>,
     // transformers 5.x moves the RoPE thetas into `rope_parameters` and stops
     // writing the flat keys, so both spellings are optional here and merged
     // below. A config carrying neither is an error, not a default: silently
@@ -102,6 +119,18 @@ impl<'de> Deserialize<'de> for Config {
                     ))
                 })
         };
+        // An unknown name is an error rather than a fallback: the wrong
+        // nonlinearity still produces plausible-looking vectors.
+        let activation = match r.hidden_activation.as_deref() {
+            None | Some("gelu") => Activation::Gelu,
+            Some("silu") => Activation::Silu,
+            Some(other) => {
+                return Err(serde::de::Error::custom(format!(
+                    "hidden_activation `{other}` is not supported; \
+                     Kohagi implements gelu and silu"
+                )))
+            }
+        };
         let global_rope_theta = theta(
             |p| &p.full_attention,
             r.global_rope_theta,
@@ -124,6 +153,7 @@ impl<'de> Deserialize<'de> for Config {
             layer_norm_eps: r.layer_norm_eps.or(r.norm_eps).unwrap_or(1e-5),
             pad_token_id: r.pad_token_id,
             global_attn_every_n_layers: r.global_attn_every_n_layers,
+            activation,
             global_rope_theta,
             local_attention: r.local_attention,
             local_rope_theta,
@@ -336,6 +366,7 @@ enum Wi {
 pub struct ModernBertMLP {
     wi: Wi,
     inter: usize,
+    act: Activation,
     wo: Linear,
 }
 
@@ -364,15 +395,27 @@ impl ModernBertMLP {
             }
         };
         let wo = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("Wo"))?;
-        Ok(Self { wi, inter, wo })
+        Ok(Self {
+            wi,
+            inter,
+            act: config.activation,
+            wo,
+        })
     }
 }
 
 impl Module for ModernBertMLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let gated = match &self.wi {
-            Wi::Wide(wi) => crate::fused::geglu(&xs.apply(wi)?, self.inter)?,
-            Wi::Split { gate, up } => (xs.apply(gate)?.gelu_erf()? * xs.apply(up)?)?,
+            Wi::Wide(wi) => crate::fused::gated(&xs.apply(wi)?, self.inter, self.act)?,
+            Wi::Split { gate, up } => {
+                let g = xs.apply(gate)?;
+                let g = match self.act {
+                    Activation::Gelu => g.gelu_erf()?,
+                    Activation::Silu => g.silu()?,
+                };
+                (g * xs.apply(up)?)?
+            }
         };
         gated.apply(&self.wo)
     }
@@ -567,7 +610,7 @@ impl ModernBert {
 
 #[cfg(test)]
 mod config_tests {
-    use super::Config;
+    use super::{Activation, Config};
 
     /// A ModernBERT config with everything except the eps field, which the
     /// three cases below vary. Values are arbitrary but well-formed.
@@ -599,6 +642,33 @@ mod config_tests {
 
     /// ruri-v3 ships both spellings; an `alias` would have rejected that as a
     /// duplicate field. They agree, and `layer_norm_eps` wins by construction.
+    #[test]
+    fn reads_the_gate_activation() {
+        let base = r#""vocab_size": 100, "hidden_size": 64, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "intermediate_size": 128,
+            "max_position_embeddings": 512, "pad_token_id": 0,
+            "global_attn_every_n_layers": 3, "local_attention": 128,
+            "global_rope_theta": 160000.0, "local_rope_theta": 10000.0"#;
+        let of = |extra: &str| serde_json::from_str::<Config>(&format!("{{{base}{extra}}}"));
+
+        // Absent means the ModernBERT default.
+        assert_eq!(of("").unwrap().activation, Activation::Gelu);
+        assert_eq!(
+            of(r#", "hidden_activation": "gelu""#).unwrap().activation,
+            Activation::Gelu
+        );
+        assert_eq!(
+            of(r#", "hidden_activation": "silu""#).unwrap().activation,
+            Activation::Silu
+        );
+
+        // Anything else is refused rather than silently treated as gelu.
+        let err = of(r#", "hidden_activation": "relu""#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("relu"), "{err}");
+    }
+
     #[test]
     fn reads_the_transformers_5_rope_spelling() {
         // transformers 5.x writes `rope_parameters` and drops the flat keys.

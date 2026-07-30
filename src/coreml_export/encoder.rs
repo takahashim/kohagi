@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 
 use super::blob::Writer;
 use super::mil::{Builder, DType, Tensor};
-use super::modernbert::{self, BlockOffsets, Config, Stored};
+use super::modernbert::{self, Activation, BlockOffsets, Config, Stored};
 use super::Io;
 
 /// A ModernBERT config, as far as emitting needs it.
@@ -33,14 +33,17 @@ pub struct EncoderConfig {
     /// The longest position the checkpoint was trained for, when it says so. A
     /// bucket past it would run and be wrong.
     pub max_positions: Option<usize>,
+    /// The gate's activation in the feed-forward.
+    pub activation: Activation,
 }
 
 impl EncoderConfig {
     /// Read a Hugging Face `config.json`, refusing anything this emitter would
     /// silently get wrong.
     ///
-    /// The graph is fixed: no projection biases, exact GeLU, RoPE over the whole
-    /// head dimension, and the global layers chosen by `layer % n == 0`. A config
+    /// The graph is fixed: no projection biases, RoPE over the whole head
+    /// dimension, and the global layers chosen by `layer % n == 0`. The one thing a
+    /// config chooses is the feed-forward gate's activation, gelu or silu. A config
     /// that disagrees with any of those would still convert, and would still
     /// produce plausible-looking numbers, so every one of them is checked here.
     /// All the problems are reported at once:
@@ -103,15 +106,24 @@ impl EncoderConfig {
                 ));
             }
         }
-        match v
+        // The gate's activation is the one graph choice a config can change, so it
+        // is read rather than rejected. Anything else is still refused: the gated
+        // feed-forward would run and produce plausible numbers with the wrong
+        // nonlinearity.
+        let activation = match v
             .get("hidden_activation")
             .and_then(serde_json::Value::as_str)
         {
-            None | Some("gelu") => {}
-            Some(other) => unsupported.push(format!(
-                "hidden_activation: {other}, and the emitted GeGLU uses exact GeLU"
-            )),
-        }
+            None | Some("gelu") => Activation::Gelu,
+            Some("silu") => Activation::Silu,
+            Some(other) => {
+                unsupported.push(format!(
+                    "hidden_activation: {other}, and the emitted feed-forward gate \
+                     is either gelu or silu"
+                ));
+                Activation::Gelu
+            }
+        };
 
         // Newer transformers moves the RoPE settings into `rope_parameters` and the
         // per-layer attention kinds into `layer_types`. Reading the legacy keys
@@ -200,6 +212,7 @@ impl EncoderConfig {
                 .get("max_position_embeddings")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize),
+            activation,
         })
     }
     fn block(&self, seq: usize, global: bool) -> Config {
@@ -214,6 +227,7 @@ impl EncoderConfig {
             } else {
                 self.local_rope_theta
             },
+            activation: self.activation,
         }
     }
 
@@ -802,6 +816,7 @@ mod tests {
     fn cfg() -> EncoderConfig {
         EncoderConfig {
             max_positions: None,
+            activation: Activation::Gelu,
             hidden: 512,
             heads: 8,
             layers: 19,
@@ -989,6 +1004,7 @@ mod tests {
             local_rope_theta: 10_000.0,
             global_rope_theta: 160_000.0,
             max_positions: Some(64),
+            activation: Activation::Gelu,
         }
     }
 
@@ -1054,6 +1070,7 @@ mod tests {
                 local_rope_theta: 10_000.0,
                 global_rope_theta: 160_000.0,
                 max_positions: None,
+                activation: Activation::Gelu,
             };
             assert!(cfg.head_dim_ok(), "{cfg:?}");
             let seq = next(1, 4) * 4;
