@@ -264,14 +264,13 @@ fn convert_into(
 
     // Before reading 500MB of weights: a bucket past the trained positions has no
     // RoPE frequencies behind it, and `emit_with` would refuse anyway.
-    if let Some(max) = cfg.max_positions {
-        if let Some(&over) = buckets.iter().find(|&&b| b > max) {
-            anyhow::bail!(
-                "bucket {over} is longer than {}'s {max} trained positions; \
-                 lower --coreml-buckets",
-                checkpoint.source
-            );
-        }
+    let max = cfg.max_positions;
+    if let Some(&over) = buckets.iter().find(|&&b| b > max) {
+        anyhow::bail!(
+            "bucket {over} is longer than {}'s {max} trained positions; \
+             lower --coreml-buckets",
+            checkpoint.source
+        );
     }
 
     eprintln!(
@@ -357,7 +356,7 @@ mod tests {
 
     #[test]
     fn a_local_checkpoint_gets_a_fingerprint_revision() {
-        let dir = std::env::temp_dir().join(format!("kohagi-rev-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kohagi-converted-rev-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let weights = dir.join("model.safetensors");
         std::fs::write(&weights, b"one").unwrap();
@@ -379,7 +378,8 @@ mod tests {
 
     #[test]
     fn superseding_spares_other_bucket_sets_and_other_models() {
-        let root = std::env::temp_dir().join(format!("kohagi-evict-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("kohagi-converted-evict-{}", std::process::id()));
         let dir = root.join("cl-nagoya--ruri-v3-130m");
         let other = root.join("answerdotai--ModernBERT-base");
         std::fs::create_dir_all(&dir).unwrap();

@@ -216,13 +216,12 @@ fn run(args: &Args) -> Result<()> {
 
     // Before opening a 500MB checkpoint: a bucket past the trained positions has no
     // RoPE frequencies behind it, and `emit_all` would refuse anyway.
-    if let Some(max) = cfg.max_positions {
-        if let Some(&over) = lengths.iter().find(|&&s| s > max) {
-            bail!(
-                "--sequence-lengths {over} is past this checkpoint's \
-                 max_position_embeddings ({max})"
-            );
-        }
+    let max = cfg.max_positions;
+    if let Some(&over) = lengths.iter().find(|&&s| s > max) {
+        bail!(
+            "--sequence-lengths {over} is past this checkpoint's \
+             max_position_embeddings ({max})"
+        );
     }
 
     let checkpoint = Checkpoint::open(&sources.weights)?;

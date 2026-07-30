@@ -30,9 +30,9 @@ pub struct EncoderConfig {
     pub global_every: usize,
     pub local_rope_theta: f32,
     pub global_rope_theta: f32,
-    /// The longest position the checkpoint was trained for, when it says so. A
-    /// bucket past it would run and be wrong.
-    pub max_positions: Option<usize>,
+    /// The longest position the checkpoint was trained for. A bucket past it has
+    /// no trained RoPE frequencies behind it, so it would run and be wrong.
+    pub max_positions: usize,
     /// The gate's activation in the feed-forward.
     pub activation: Activation,
 }
@@ -53,25 +53,18 @@ impl EncoderConfig {
     /// Both spellings of the LayerNorm epsilon are accepted, as `crate::encoder`
     /// does — ruri ships `norm_eps` and `layer_norm_eps`.
     pub fn from_json(text: &str) -> Result<Self> {
+        // Values come from `crate::encoder`'s reader, so the two never disagree
+        // about what a field is called or which spelling wins. What is checked
+        // here is only what that reader has no opinion on: the keys the runtime
+        // does not model, and the shapes this graph is fixed to.
+        let raw: crate::encoder::RawConfig =
+            serde_json::from_str(text).context("parsing config.json")?;
         let v: serde_json::Value = serde_json::from_str(text).context("parsing config.json")?;
         let mut unsupported: Vec<String> = Vec::new();
 
-        let usize_at = |key: &str| -> Result<usize> {
-            v.get(key)
-                .and_then(serde_json::Value::as_u64)
-                .map(|n| n as usize)
-                .ok_or_else(|| anyhow::anyhow!("config.json has no numeric `{key}`"))
-        };
-        let f32_at = |keys: &[&str]| -> Result<f32> {
-            keys.iter()
-                .find_map(|k| v.get(*k).and_then(serde_json::Value::as_f64))
-                .map(|n| n as f32)
-                .ok_or_else(|| anyhow::anyhow!("config.json has none of {keys:?}"))
-        };
-
-        let hidden = usize_at("hidden_size")?;
-        let heads = usize_at("num_attention_heads")?;
-        let global_every = usize_at("global_attn_every_n_layers")?;
+        let hidden = raw.hidden_size;
+        let heads = raw.num_attention_heads;
+        let global_every = raw.global_attn_every_n_layers;
 
         // The graph slices each head's last axis in half for RoPE, and reshapes the
         // fused QKV into exactly `heads` heads.
@@ -94,7 +87,8 @@ impl EncoderConfig {
         }
 
         // Every `linear` this emitter writes takes a zero bias, and every norm has
-        // gamma without beta.
+        // gamma without beta. The runtime has no opinion on these because it never
+        // builds a graph from them.
         for (key, what) in [
             ("attention_bias", "attention projections"),
             ("mlp_bias", "feed-forward projections"),
@@ -106,38 +100,30 @@ impl EncoderConfig {
                 ));
             }
         }
-        // The gate's activation is the one graph choice a config can change, so it
-        // is read rather than rejected. Anything else is still refused: the gated
-        // feed-forward would run and produce plausible numbers with the wrong
-        // nonlinearity.
-        let activation = match v
-            .get("hidden_activation")
-            .and_then(serde_json::Value::as_str)
-        {
-            None | Some("gelu") => Activation::Gelu,
-            Some("silu") => Activation::Silu,
-            Some(other) => {
-                unsupported.push(format!(
-                    "hidden_activation: {other}, and the emitted feed-forward gate \
-                     is either gelu or silu"
-                ));
-                Activation::Gelu
-            }
-        };
 
-        // Newer transformers moves the RoPE settings into `rope_parameters` and the
-        // per-layer attention kinds into `layer_types`. Reading the legacy keys
-        // alone would give a config that carries only the new ones the default
-        // theta, without saying so.
-        let rope = v.get("rope_parameters");
-        let theta_from = |kind: &str| -> Option<f32> {
-            rope?
-                .get(kind)?
-                .get("rope_theta")?
-                .as_f64()
-                .map(|n| n as f32)
+        // Collected rather than returned, so an unsupported checkpoint reports
+        // everything wrong with it at once.
+        let activation = raw.activation().unwrap_or_else(|why| {
+            unsupported.push(why);
+            Activation::Gelu
+        });
+
+        let mut theta = |kind| {
+            raw.theta(kind).map(|n| n as f32).unwrap_or_else(|| {
+                unsupported.push(format!(
+                    "rope theta: neither `rope_parameters` nor `{}` is present, and \
+                         defaulting one would be wrong without saying so",
+                    crate::encoder::RawConfig::theta_name(kind)
+                ));
+                0.0
+            })
         };
-        if let Some(rope) = rope {
+        let global_rope_theta = theta(crate::encoder::Attention::Global);
+        let local_rope_theta = theta(crate::encoder::Attention::Local);
+
+        // The emitted RoPE has no scaling, so a `rope_type` other than default
+        // would be applied by the reference and not here.
+        if let Some(rope) = v.get("rope_parameters") {
             for kind in ["full_attention", "sliding_attention"] {
                 match rope
                     .get(kind)
@@ -151,16 +137,6 @@ impl EncoderConfig {
                     )),
                 }
             }
-        }
-        let has_legacy =
-            v.get("global_rope_theta").is_some() && v.get("local_rope_theta").is_some();
-        if rope.is_none() && !has_legacy {
-            unsupported.push(
-                "rope theta: neither `rope_parameters` nor both of `global_rope_theta` \
-                 and `local_rope_theta` are present, and defaulting one would be wrong \
-                 without saying so"
-                    .to_string(),
-            );
         }
 
         // Where `layer_types` is present it, not the interval, is authoritative — so
@@ -198,23 +174,19 @@ impl EncoderConfig {
         Ok(Self {
             hidden,
             heads,
-            layers: usize_at("num_hidden_layers")?,
-            intermediate: usize_at("intermediate_size")?,
-            vocab: usize_at("vocab_size")?,
-            eps: f32_at(&["norm_eps", "layer_norm_eps"]).unwrap_or(1e-5),
-            local_attention: usize_at("local_attention")?,
+            layers: raw.num_hidden_layers,
+            intermediate: raw.intermediate_size,
+            vocab: raw.vocab_size,
+            eps: raw.eps() as f32,
+            local_attention: raw.local_attention,
             global_every,
-            local_rope_theta: theta_from("sliding_attention")
-                .map_or_else(|| f32_at(&["local_rope_theta"]), Ok)?,
-            global_rope_theta: theta_from("full_attention")
-                .map_or_else(|| f32_at(&["global_rope_theta", "rope_theta"]), Ok)?,
-            max_positions: v
-                .get("max_position_embeddings")
-                .and_then(serde_json::Value::as_u64)
-                .map(|n| n as usize),
+            local_rope_theta,
+            global_rope_theta,
+            max_positions: raw.max_position_embeddings,
             activation,
         })
     }
+
     fn block(&self, seq: usize, global: bool) -> Config {
         Config {
             hidden: self.hidden,
@@ -683,14 +655,13 @@ pub fn emit_with(
     opts: &Options,
 ) -> Result<(crate::coreml_proto::Model, Vec<u8>)> {
     anyhow::ensure!(!lengths.is_empty(), "a bundle needs at least one length");
-    if let Some(max) = cfg.max_positions {
-        if let Some(&over) = lengths.iter().find(|&&s| s > max) {
-            anyhow::bail!(
-                "sequence length {over} is past `max_position_embeddings` {max}; the \
-                 checkpoint has no RoPE frequencies trained that far, and the model \
-                 would run and be wrong"
-            );
-        }
+    let max = cfg.max_positions;
+    if let Some(&over) = lengths.iter().find(|&&s| s > max) {
+        anyhow::bail!(
+            "sequence length {over} is past `max_position_embeddings` {max}; the \
+             checkpoint has no RoPE frequencies trained that far, and the model \
+             would run and be wrong"
+        );
     }
     let mut sorted = lengths.to_vec();
     sorted.sort_unstable();
@@ -815,7 +786,7 @@ mod tests {
 
     fn cfg() -> EncoderConfig {
         EncoderConfig {
-            max_positions: None,
+            max_positions: 8192,
             activation: Activation::Gelu,
             hidden: 512,
             heads: 8,
@@ -830,17 +801,26 @@ mod tests {
         }
     }
 
-    /// A config with everything this emitter needs and nothing it refuses.
+    /// A config with everything this emitter needs and nothing it refuses, with
+    /// `extra` merged over it.
+    ///
+    /// Merged rather than appended: a repeated key is a duplicate field, which the
+    /// reader rejects outright, and a case here means "this checkpoint says
+    /// something else", not "this file is malformed".
     fn json(extra: &str) -> String {
-        let base = r#""hidden_size": 512, "num_attention_heads": 8, "num_hidden_layers": 19,
+        let base = r#"{"hidden_size": 512, "num_attention_heads": 8, "num_hidden_layers": 19,
             "intermediate_size": 2048, "vocab_size": 102400, "norm_eps": 1e-5,
             "local_attention": 128, "global_attn_every_n_layers": 3,
-            "local_rope_theta": 10000.0, "global_rope_theta": 160000.0"#;
-        if extra.is_empty() {
-            format!("{{{base}}}")
-        } else {
-            format!("{{{base}, {extra}}}")
+            "max_position_embeddings": 8192, "pad_token_id": 1,
+            "local_rope_theta": 10000.0, "global_rope_theta": 160000.0}"#;
+        let mut v: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(base).expect("the base config parses");
+        if !extra.is_empty() {
+            let over: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&format!("{{{extra}}}")).expect("the override parses");
+            v.extend(over);
         }
+        serde_json::to_string(&v).expect("serializes")
     }
 
     #[test]
@@ -850,30 +830,28 @@ mod tests {
         assert!(cfg.head_dim_ok());
         assert_eq!(cfg.local_rope_theta, 10_000.0);
         assert_eq!(cfg.global_rope_theta, 160_000.0);
-        assert_eq!(cfg.max_positions, None);
+        assert_eq!(cfg.max_positions, 8192);
     }
 
     #[test]
     fn the_new_rope_spelling_is_read_rather_than_defaulted() {
         // transformers 4.57 moves the thetas into `rope_parameters`. A config with
         // only those must not silently come out at the legacy default.
-        let text = r#"{"hidden_size": 384, "num_attention_heads": 6,
-            "num_hidden_layers": 13, "intermediate_size": 1152, "vocab_size": 256000,
-            "norm_eps": 1e-5, "local_attention": 128, "global_attn_every_n_layers": 3,
-            "rope_parameters": {
+        let text = json(
+            r#""rope_parameters": {
                 "full_attention": {"rope_theta": 160000, "rope_type": "default"},
-                "sliding_attention": {"rope_theta": 160000, "rope_type": "default"}}}"#;
-        let cfg = EncoderConfig::from_json(text).expect("supported");
+                "sliding_attention": {"rope_theta": 160000, "rope_type": "default"}},
+               "local_rope_theta": null, "global_rope_theta": null"#,
+        );
+        let cfg = EncoderConfig::from_json(&text).expect("supported");
         assert_eq!(cfg.local_rope_theta, 160_000.0);
         assert_eq!(cfg.global_rope_theta, 160_000.0);
 
         // And neither spelling present is an error, not a default.
-        let text = r#"{"hidden_size": 512, "num_attention_heads": 8,
-            "num_hidden_layers": 19, "intermediate_size": 2048, "vocab_size": 100,
-            "local_attention": 128, "global_attn_every_n_layers": 3}"#;
+        let text = json(r#""local_rope_theta": null, "global_rope_theta": null"#);
         let err = format!(
             "{:#}",
-            EncoderConfig::from_json(text).expect_err("no theta")
+            EncoderConfig::from_json(&text).expect_err("no theta")
         );
         assert!(err.contains("rope theta"), "{err}");
     }
@@ -1003,7 +981,7 @@ mod tests {
             global_every: 3,
             local_rope_theta: 10_000.0,
             global_rope_theta: 160_000.0,
-            max_positions: Some(64),
+            max_positions: 64,
             activation: Activation::Gelu,
         }
     }
@@ -1069,7 +1047,7 @@ mod tests {
                 global_every: next(1, 4),
                 local_rope_theta: 10_000.0,
                 global_rope_theta: 160_000.0,
-                max_positions: None,
+                max_positions: 8192,
                 activation: Activation::Gelu,
             };
             assert!(cfg.head_dim_ok(), "{cfg:?}");

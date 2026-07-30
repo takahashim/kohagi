@@ -35,29 +35,10 @@ pub struct Config {
     pub activation: Activation,
 }
 
-/// The gate's activation in the gated feed-forward.
-///
-/// ModernBERT's MLP multiplies an activated gate by a linear up-projection, so
-/// this choice is what makes the block a GeGLU or a SwiGLU. Both are one MIL op
-/// with the same shape, and the rest of the graph does not change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Activation {
-    /// Exact GeLU, the ModernBERT default.
-    #[default]
-    Gelu,
-    /// SiLU, which `hidden_activation: "silu"` selects (granite-embedding-r2).
-    Silu,
-}
-
-impl Activation {
-    /// The `hidden_activation` spelling, for provenance metadata and messages.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Gelu => "gelu",
-            Self::Silu => "silu",
-        }
-    }
-}
+/// The gate's activation, shared with the candle forward so that a config means
+/// the same thing on both. Each is one MIL operation of the same shape, so the
+/// rest of the graph does not change with it.
+pub use crate::encoder::Activation;
 
 impl Config {
     pub fn head_dim(&self) -> usize {

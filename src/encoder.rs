@@ -51,9 +51,9 @@ pub struct Config {
 /// The gate's activation in ModernBERT's gated feed-forward, which is what makes
 /// the block a GeGLU or a SwiGLU.
 ///
-/// The CoreML emitter carries its own copy of this choice (as a MIL operation
-/// rather than a candle one), so the two are deliberately separate types: the
-/// runtime must not depend on the `coreml-export` feature.
+/// Here rather than beside either forward, because both the candle path and the
+/// CoreML emitter choose from it and must agree on which names are supported and
+/// on what to say about one that is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Activation {
     /// Exact GeLU, the ModernBERT default.
@@ -63,84 +63,144 @@ pub enum Activation {
     Silu,
 }
 
+impl Activation {
+    /// The `hidden_activation` spelling, for messages and for a converted
+    /// bundle's provenance.
+    #[cfg_attr(not(feature = "coreml-export"), allow(dead_code))]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Gelu => "gelu",
+            Self::Silu => "silu",
+        }
+    }
+
+    /// Resolve a `hidden_activation` value, or say why it cannot be.
+    ///
+    /// `Err` rather than a fallback to gelu: the wrong nonlinearity still
+    /// produces plausible-looking vectors. The caller chooses how to report it —
+    /// the runtime fails the parse, the emitter collects it with the other
+    /// reasons — but not what counts as supported.
+    pub fn from_name(name: Option<&str>) -> std::result::Result<Self, String> {
+        match name {
+            None | Some("gelu") => Ok(Self::Gelu),
+            Some("silu") => Ok(Self::Silu),
+            Some(other) => Err(format!(
+                "hidden_activation: {other}, and Kohagi's gated feed-forward \
+                 implements gelu and silu"
+            )),
+        }
+    }
+}
+
+/// A ModernBERT `config.json` as written, before anything is decided about it.
+///
+/// The one place the file's field names and their alternative spellings are
+/// known. Both the runtime [`Config`] and the CoreML emitter's `EncoderConfig`
+/// are built from this rather than parsing the file separately: when they did,
+/// they drifted, and a checkpoint saved by transformers 5.x converted fine while
+/// failing to load.
 #[derive(Deserialize)]
-struct RawConfig {
-    vocab_size: usize,
-    hidden_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    intermediate_size: usize,
-    max_position_embeddings: usize,
+pub(crate) struct RawConfig {
+    pub(crate) vocab_size: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) max_position_embeddings: usize,
     // A serde `alias` would reject a config carrying both names as a duplicate
     // field, and ruri-v3 carries both, so they are two optional fields merged
-    // below rather than one aliased one.
-    layer_norm_eps: Option<f64>,
-    norm_eps: Option<f64>,
-    pad_token_id: u32,
-    global_attn_every_n_layers: usize,
-    hidden_activation: Option<String>,
+    // by `eps()` rather than one aliased one.
+    pub(crate) layer_norm_eps: Option<f64>,
+    pub(crate) norm_eps: Option<f64>,
+    pub(crate) pad_token_id: u32,
+    pub(crate) global_attn_every_n_layers: usize,
+    pub(crate) hidden_activation: Option<String>,
     // transformers 5.x moves the RoPE thetas into `rope_parameters` and stops
-    // writing the flat keys, so both spellings are optional here and merged
-    // below. A config carrying neither is an error, not a default: silently
-    // assuming a theta would produce wrong embeddings for every position.
-    global_rope_theta: Option<f64>,
-    local_attention: usize,
-    local_rope_theta: Option<f64>,
-    rope_parameters: Option<RopeParameters>,
+    // writing the flat keys, so both spellings are optional here and merged by
+    // `theta()`.
+    pub(crate) global_rope_theta: Option<f64>,
+    pub(crate) local_attention: usize,
+    pub(crate) local_rope_theta: Option<f64>,
+    pub(crate) rope_parameters: Option<RopeParameters>,
+}
+
+/// Which attention kind a theta belongs to, naming both spellings of it.
+#[derive(Clone, Copy)]
+pub(crate) enum Attention {
+    Global,
+    Local,
+}
+
+impl RawConfig {
+    /// The LayerNorm epsilon under whichever name it arrived, or HF's default.
+    /// The two agree wherever both appear.
+    pub(crate) fn eps(&self) -> f64 {
+        self.layer_norm_eps.or(self.norm_eps).unwrap_or(1e-5)
+    }
+
+    /// The RoPE theta for one attention kind, from either spelling.
+    ///
+    /// `None` when the config carries neither. That is an error for every caller,
+    /// not a default: assuming a theta would produce wrong embeddings for every
+    /// position without saying so.
+    pub(crate) fn theta(&self, kind: Attention) -> Option<f64> {
+        let (nested, flat) = match kind {
+            Attention::Global => (
+                self.rope_parameters
+                    .as_ref()
+                    .and_then(|p| p.full_attention.as_ref()),
+                self.global_rope_theta,
+            ),
+            Attention::Local => (
+                self.rope_parameters
+                    .as_ref()
+                    .and_then(|p| p.sliding_attention.as_ref()),
+                self.local_rope_theta,
+            ),
+        };
+        nested.and_then(|t| t.rope_theta).or(flat)
+    }
+
+    /// The flat name of a kind's theta, for an error message.
+    pub(crate) fn theta_name(kind: Attention) -> &'static str {
+        match kind {
+            Attention::Global => "global_rope_theta",
+            Attention::Local => "local_rope_theta",
+        }
+    }
+
+    pub(crate) fn activation(&self) -> std::result::Result<Activation, String> {
+        Activation::from_name(self.hidden_activation.as_deref())
+    }
 }
 
 /// The transformers 5.x spelling of the RoPE settings: one entry per attention
 /// kind, each carrying its own theta.
 #[derive(serde::Deserialize)]
-struct RopeParameters {
+pub(crate) struct RopeParameters {
     full_attention: Option<RopeTheta>,
     sliding_attention: Option<RopeTheta>,
 }
 
 #[derive(serde::Deserialize)]
-struct RopeTheta {
+pub(crate) struct RopeTheta {
     rope_theta: Option<f64>,
 }
 
 impl<'de> Deserialize<'de> for Config {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let r = RawConfig::deserialize(d)?;
-        let rope = r.rope_parameters.as_ref();
-        let theta = |kind: fn(&RopeParameters) -> &Option<RopeTheta>,
-                     flat: Option<f64>,
-                     name: &str|
-         -> std::result::Result<f64, D::Error> {
-            rope.and_then(|p| kind(p).as_ref())
-                .and_then(|t| t.rope_theta)
-                .or(flat)
-                .ok_or_else(|| {
-                    serde::de::Error::custom(format!(
-                        "config has neither `rope_parameters` nor `{name}`"
-                    ))
-                })
+        let theta = |kind: Attention| -> std::result::Result<f64, D::Error> {
+            r.theta(kind).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "config has neither `rope_parameters` nor `{}`",
+                    RawConfig::theta_name(kind)
+                ))
+            })
         };
-        // An unknown name is an error rather than a fallback: the wrong
-        // nonlinearity still produces plausible-looking vectors.
-        let activation = match r.hidden_activation.as_deref() {
-            None | Some("gelu") => Activation::Gelu,
-            Some("silu") => Activation::Silu,
-            Some(other) => {
-                return Err(serde::de::Error::custom(format!(
-                    "hidden_activation `{other}` is not supported; \
-                     Kohagi implements gelu and silu"
-                )))
-            }
-        };
-        let global_rope_theta = theta(
-            |p| &p.full_attention,
-            r.global_rope_theta,
-            "global_rope_theta",
-        )?;
-        let local_rope_theta = theta(
-            |p| &p.sliding_attention,
-            r.local_rope_theta,
-            "local_rope_theta",
-        )?;
+        let activation = r.activation().map_err(serde::de::Error::custom)?;
+        let global_rope_theta = theta(Attention::Global)?;
+        let local_rope_theta = theta(Attention::Local)?;
         Ok(Config {
             vocab_size: r.vocab_size,
             hidden_size: r.hidden_size,
@@ -148,9 +208,7 @@ impl<'de> Deserialize<'de> for Config {
             num_attention_heads: r.num_attention_heads,
             intermediate_size: r.intermediate_size,
             max_position_embeddings: r.max_position_embeddings,
-            // Prefer the explicit `layer_norm_eps`; fall back to `norm_eps`,
-            // then to HF's default. The two agree wherever both appear.
-            layer_norm_eps: r.layer_norm_eps.or(r.norm_eps).unwrap_or(1e-5),
+            layer_norm_eps: r.eps(),
             pad_token_id: r.pad_token_id,
             global_attn_every_n_layers: r.global_attn_every_n_layers,
             activation,

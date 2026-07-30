@@ -991,7 +991,7 @@ fn the_whole_encoder_matches_the_python_conversion() {
         global_every: 3,
         local_rope_theta: 10_000.0,
         global_rope_theta: 160_000.0,
-        max_positions: None,
+        max_positions: 8192,
         activation: kohagi::coreml_export::modernbert::Activation::Gelu,
     };
     let seq = 128;
