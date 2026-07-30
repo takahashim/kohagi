@@ -3,7 +3,8 @@
 //! one goal of "get usable bucket models onto disk and into memory":
 //!
 //! - **download** the preferred form of each bucket from the Hub ([`fetch_from_hub`]),
-//! - **locate** the `seq-<N>` bundles in a directory ([`collect_buckets`]),
+//! - **locate** the `seq-<N>` and `buckets-<N>-<N>…` bundles in a directory
+//!   ([`collect_buckets`]),
 //! - **load** each bucket, compiling a `.mlpackage` when needed ([`load_bucket`]).
 //!
 //! Running the loaded models lives in the parent module.
@@ -18,49 +19,99 @@ use objc2_foundation::{NSString, NSURL};
 
 use crate::config::CoreMlForm;
 
+/// Where one bucket's model lives: the bundle, and the CoreML function to load
+/// from it. `function` is `None` for a single-length `seq-<N>` bundle, whose
+/// only function is the default one, and `Some("seq_<N>")` for a multi-function
+/// `buckets-<N>-<N>…` bundle, where every length is a function in one file.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Located {
+    pub path: PathBuf,
+    pub function: Option<String>,
+}
+
 /// A bucket's two possible on-disk forms: the compiled `.mlmodelc` and the
 /// portable `.mlpackage`.
-type BucketForms = (Option<PathBuf>, Option<PathBuf>);
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct BucketForms {
+    pub compiled: Option<Located>,
+    pub package: Option<Located>,
+}
 
-/// Parse a bucket bundle name like `seq-128.mlmodelc` into `(length, form)`.
-/// The single source of truth for the `seq-<N>.<ext>` naming scheme.
-fn parse_bucket(name: &str) -> Option<(usize, &str)> {
+/// Parse a bundle name into the bucket lengths it serves and its form. The
+/// single source of truth for both naming schemes:
+///
+/// - `seq-128.mlpackage` — one length, in the model's default function.
+/// - `buckets-128-256-512.mlpackage` — three lengths in one multi-function
+///   bundle, as `seq_128` / `seq_256` / `seq_512`. Converting this way shares
+///   one copy of the weights between the lengths instead of repeating them per
+///   file, which is most of the download for a large-vocabulary model.
+fn parse_bundle(name: &str) -> Option<(Vec<usize>, &str)> {
     let (stem, ext) = name.rsplit_once('.')?;
     if ext != "mlmodelc" && ext != "mlpackage" {
         return None;
     }
-    let seq = stem.strip_prefix("seq-")?.parse().ok()?;
-    Some((seq, ext))
+    if let Some(single) = stem.strip_prefix("seq-") {
+        return Some((vec![single.parse().ok()?], ext));
+    }
+    let seqs: Vec<usize> = stem
+        .strip_prefix("buckets-")?
+        .split('-')
+        .map(|s| s.parse().ok())
+        .collect::<Option<_>>()?;
+    (!seqs.is_empty()).then_some((seqs, ext))
 }
 
-/// Parse a repo-relative path (`compiled/seq-128.mlmodelc/...` or
-/// `seq-128.mlpackage/...`) into its bucket `(length, form)`.
-fn bucket_of(rfilename: &str) -> Option<(usize, &str)> {
+/// The CoreML function a bucket of length `seq` lives in, for a bundle serving
+/// `count` lengths. One place so the converter's naming and this side agree.
+fn function_name(seq: usize, count: usize) -> Option<String> {
+    (count > 1).then(|| format!("seq_{seq}"))
+}
+
+/// Parse a repo-relative path (`compiled/seq-128.mlmodelc/...`,
+/// `seq-128.mlpackage/...`, `buckets-128-256.mlpackage/...`) into the bucket
+/// lengths it serves and its form.
+fn bucket_of(rfilename: &str) -> Option<(Vec<usize>, &str)> {
     let rel = rfilename.strip_prefix("compiled/").unwrap_or(rfilename);
-    parse_bucket(rel.split('/').next()?)
+    parse_bundle(rel.split('/').next()?)
 }
 
-/// Scan one directory for `seq-<N>` bucket bundles, recording each into `found`
-/// keyed by sequence length: `.mlmodelc` in the compiled slot, `.mlpackage` in
-/// the package slot.
+/// Scan one directory for bucket bundles, recording each into `found` keyed by
+/// sequence length: `.mlmodelc` in the compiled slot, `.mlpackage` in the
+/// package slot. A multi-function bundle records the same path under every
+/// length it serves, each with its own function name.
 pub(super) fn collect_buckets(
     dir: &Path,
     found: &mut BTreeMap<usize, BucketForms>,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        let Some((seq, ext)) = path
+        let Some((seqs, ext)) = path
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(parse_bucket)
+            .and_then(parse_bundle)
         else {
             continue;
         };
-        let slot = found.entry(seq).or_default();
-        match ext {
-            "mlmodelc" => slot.0 = Some(path),
-            "mlpackage" => slot.1 = Some(path),
-            _ => {}
+        for &seq in &seqs {
+            let found_here = Located {
+                path: path.clone(),
+                function: function_name(seq, seqs.len()),
+            };
+            let slot = found.entry(seq).or_default();
+            let target = match ext {
+                "mlmodelc" => &mut slot.compiled,
+                "mlpackage" => &mut slot.package,
+                _ => continue,
+            };
+            // A dedicated `seq-<N>` bundle wins over a multi-function one for
+            // the same length, so a directory holding both resolves the same
+            // way whatever order the filesystem lists it in.
+            if target
+                .as_ref()
+                .is_none_or(|held| held.function.is_some() && found_here.function.is_none())
+            {
+                *target = Some(found_here);
+            }
         }
     }
     Ok(())
@@ -71,29 +122,30 @@ pub(super) fn collect_buckets(
 /// inserts a bucket when it finds a file).
 pub(super) fn load_bucket(
     seq: usize,
-    compiled: Option<&Path>,
-    package: Option<&Path>,
+    compiled: Option<&Located>,
+    package: Option<&Located>,
 ) -> Result<Retained<MLModel>> {
     if let Some(c) = compiled {
         match load_model(c) {
             Ok(model) => return Ok(model),
             Err(e) if package.is_some() => {
                 eprintln!(
-                    "kohagi: seq-{seq}.mlmodelc did not load ({e:#}); \
-                     compiling seq-{seq}.mlpackage instead"
+                    "kohagi: the compiled bundle for seq-{seq} did not load ({e:#}); \
+                     compiling its .mlpackage instead"
                 );
             }
-            Err(e) => return Err(e).with_context(|| format!("loading {}", c.display())),
+            Err(e) => return Err(e).with_context(|| format!("loading {}", c.path.display())),
         }
     }
     let package = package.expect("load_bucket called with neither model form");
-    load_model(package).with_context(|| format!("loading {}", package.display()))
+    load_model(package).with_context(|| format!("loading {}", package.path.display()))
 }
 
 /// Load one model, pinned to CPU+ANE. A `.mlpackage` is compiled to a
 /// (temporary) `.mlmodelc` first; a `.mlmodelc` is loaded directly.
-fn load_model(path: &Path) -> Result<Retained<MLModel>> {
+fn load_model(located: &Located) -> Result<Retained<MLModel>> {
     let compiled;
+    let path = located.path.as_path();
     let target = if path.extension().and_then(|e| e.to_str()) == Some("mlpackage") {
         compiled = compile_package(path)?;
         compiled.as_path()
@@ -104,8 +156,15 @@ fn load_model(path: &Path) -> Result<Retained<MLModel>> {
         let url = file_url(target)?;
         let config = MLModelConfiguration::new();
         config.setComputeUnits(MLComputeUnits::CPUAndNeuralEngine);
-        MLModel::modelWithContentsOfURL_configuration_error(&url, &config)
-            .map_err(|e| anyhow::anyhow!("loading {}: {e}", path.display()))
+        if let Some(function) = &located.function {
+            config.setFunctionName(Some(&NSString::from_str(function)));
+        }
+        MLModel::modelWithContentsOfURL_configuration_error(&url, &config).map_err(|e| {
+            match &located.function {
+                Some(f) => anyhow::anyhow!("loading function {f} of {}: {e}", path.display()),
+                None => anyhow::anyhow!("loading {}: {e}", path.display()),
+            }
+        })
     }
 }
 
@@ -197,12 +256,14 @@ pub fn fetch_from_hub(repo: &str, prefer: CoreMlForm) -> Result<PathBuf> {
     // First pass: which forms does each bucket ship?
     let mut forms: BTreeMap<usize, (bool, bool)> = BTreeMap::new();
     for sibling in &info.siblings {
-        if let Some((seq, ext)) = bucket_of(&sibling.rfilename) {
-            let seen = forms.entry(seq).or_default();
-            match ext {
-                "mlmodelc" => seen.0 = true,
-                "mlpackage" => seen.1 = true,
-                _ => {}
+        if let Some((seqs, ext)) = bucket_of(&sibling.rfilename) {
+            for seq in seqs {
+                let seen = forms.entry(seq).or_default();
+                match ext {
+                    "mlmodelc" => seen.0 = true,
+                    "mlpackage" => seen.1 = true,
+                    _ => {}
+                }
             }
         }
     }
@@ -231,8 +292,10 @@ pub fn fetch_from_hub(repo: &str, prefer: CoreMlForm) -> Result<PathBuf> {
 /// just that). `forms` maps seq -> (has .mlmodelc, has .mlpackage).
 fn wanted(rfilename: &str, prefer: CoreMlForm, forms: &BTreeMap<usize, (bool, bool)>) -> bool {
     match bucket_of(rfilename) {
-        Some((seq, ext)) => {
-            let (has_compiled, has_package) = forms.get(&seq).copied().unwrap_or_default();
+        // Every length in a multi-function bundle is served by the same file, so
+        // the forms available for one of them stand for the whole bundle.
+        Some((seqs, ext)) => {
+            let (has_compiled, has_package) = forms.get(&seqs[0]).copied().unwrap_or_default();
             let chosen = match prefer {
                 CoreMlForm::Compiled if has_compiled => "mlmodelc",
                 CoreMlForm::Compiled => "mlpackage",
@@ -287,14 +350,64 @@ mod tests {
     }
 
     #[test]
-    fn parse_bucket_reads_length_and_form() {
-        assert_eq!(parse_bucket("seq-128.mlpackage"), Some((128, "mlpackage")));
-        assert_eq!(parse_bucket("seq-512.mlmodelc"), Some((512, "mlmodelc")));
-        assert_eq!(parse_bucket("config.json"), None);
-        assert_eq!(parse_bucket("seq-xyz.mlpackage"), None);
+    fn parse_bundle_reads_lengths_and_form() {
+        let one = |v: Vec<usize>, e| Some((v, e));
+        assert_eq!(
+            parse_bundle("seq-128.mlpackage"),
+            one(vec![128], "mlpackage")
+        );
+        assert_eq!(parse_bundle("seq-512.mlmodelc"), one(vec![512], "mlmodelc"));
+        assert_eq!(parse_bundle("config.json"), None);
+        assert_eq!(parse_bundle("seq-xyz.mlpackage"), None);
         assert_eq!(
             bucket_of("compiled/seq-256.mlmodelc/x/y"),
-            Some((256, "mlmodelc"))
+            one(vec![256], "mlmodelc")
+        );
+
+        // A multi-function bundle names every length it serves.
+        assert_eq!(
+            parse_bundle("buckets-128-256-512.mlpackage"),
+            one(vec![128, 256, 512], "mlpackage")
+        );
+        assert_eq!(
+            bucket_of("compiled/buckets-128-256.mlmodelc/weights/weight.bin"),
+            one(vec![128, 256], "mlmodelc")
+        );
+        assert_eq!(parse_bundle("buckets-.mlpackage"), None);
+        assert_eq!(parse_bundle("buckets-128-x.mlpackage"), None);
+
+        // Only a multi-length bundle needs a function name; a `seq-<N>` bundle
+        // is loaded through the model's default function.
+        assert_eq!(function_name(128, 1), None);
+        assert_eq!(function_name(256, 3), Some("seq_256".to_string()));
+    }
+
+    #[test]
+    fn collect_prefers_a_dedicated_bundle_over_a_multi_function_one() {
+        let dir = std::env::temp_dir().join(format!("kohagi-collect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("buckets-128-256.mlpackage")).unwrap();
+        std::fs::create_dir_all(dir.join("seq-128.mlpackage")).unwrap();
+
+        let mut found = BTreeMap::new();
+        collect_buckets(&dir, &mut found).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 128 ships both ways, so the dedicated bundle wins and needs no
+        // function; 256 only exists inside the multi-function bundle.
+        assert_eq!(
+            found[&128].package,
+            Some(Located {
+                path: dir.join("seq-128.mlpackage"),
+                function: None,
+            })
+        );
+        assert_eq!(
+            found[&256].package,
+            Some(Located {
+                path: dir.join("buckets-128-256.mlpackage"),
+                function: Some("seq_256".into()),
+            })
         );
     }
 }

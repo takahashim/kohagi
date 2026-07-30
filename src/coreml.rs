@@ -22,7 +22,6 @@
 mod provision;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use half::f16;
@@ -62,9 +61,13 @@ impl CoreMlEncoder {
     /// `compiled/` (a flat `.mlmodelc` at the top level is also accepted). When
     /// both forms are present [`provision::load_bucket`] prefers the `.mlmodelc`
     /// and falls back to compiling the `.mlpackage`.
+    ///
+    /// A single `buckets-<N>-<N>…` bundle holding one CoreML function per length
+    /// works the same way and is the compact form: the lengths share one copy of
+    /// the weights, which for a large-vocabulary model is most of the bytes.
     pub fn load(dir: &std::path::Path, dim: usize) -> Result<Self> {
         // seq -> (compiled .mlmodelc, portable .mlpackage)
-        let mut found: BTreeMap<usize, (Option<PathBuf>, Option<PathBuf>)> = BTreeMap::new();
+        let mut found: BTreeMap<usize, provision::BucketForms> = BTreeMap::new();
         provision::collect_buckets(dir, &mut found)
             .with_context(|| format!("reading CoreML model dir {}", dir.display()))?;
         let compiled_dir = dir.join("compiled");
@@ -74,8 +77,9 @@ impl CoreMlEncoder {
         }
         if found.is_empty() {
             return Err(UnsupportedRequest::new(format!(
-                "no `seq-<N>.mlpackage` bucket models found in {} — CoreML needs \
-                 pre-converted fixed-shape models (see scripts/convert_coreml.py)",
+                "no `seq-<N>.mlpackage` or `buckets-<N>-<N>….mlpackage` bucket models \
+                 found in {} — CoreML needs pre-converted fixed-shape models (see \
+                 scripts/convert_coreml.py)",
                 dir.display()
             ))
             .into());
@@ -83,8 +87,9 @@ impl CoreMlEncoder {
 
         // BTreeMap iterates in ascending seq order, so buckets end up sorted.
         let mut buckets = Vec::new();
-        for (seq, (compiled, package)) in found {
-            let model = provision::load_bucket(seq, compiled.as_deref(), package.as_deref())?;
+        for (seq, forms) in found {
+            let model =
+                provision::load_bucket(seq, forms.compiled.as_ref(), forms.package.as_ref())?;
             buckets.push(Bucket { seq, model });
         }
         Ok(Self { buckets, dim })
