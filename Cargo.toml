@@ -47,6 +47,10 @@ objc2-foundation = { version = "0.3", optional = true, features = [
 objc2-core-ml = { version = "0.3", optional = true, features = [
     "MLModel", "MLModelConfiguration", "MLMultiArray", "MLFeatureValue",
     "MLFeatureProvider", "MLDictionaryFeatureProvider",
+    # For the load-time shape check in src/coreml.rs: a bucket's declared
+    # hidden size and sequence length are validated against the model's own
+    # output constraint, so a mismatched config.json fails loudly.
+    "MLModelDescription", "MLFeatureDescription", "MLMultiArrayConstraint",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

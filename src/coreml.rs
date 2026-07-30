@@ -29,8 +29,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::AllocAnyThread;
 use objc2_core_ml::{
-    MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel, MLMultiArray,
-    MLMultiArrayDataType,
+    MLDictionaryFeatureProvider, MLFeatureDescription, MLFeatureProvider, MLFeatureValue, MLModel,
+    MLMultiArray, MLMultiArrayDataType,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 
@@ -90,6 +90,7 @@ impl CoreMlEncoder {
         for (seq, forms) in found {
             let model =
                 provision::load_bucket(seq, forms.compiled.as_ref(), forms.package.as_ref())?;
+            check_io(&model, seq, dim)?;
             buckets.push(Bucket { seq, model });
         }
         Ok(Self { buckets, dim })
@@ -155,6 +156,84 @@ impl CoreMlEncoder {
                 .context("CoreML 'hidden' is not a multiarray")?;
             read_f32(&arr)
         }
+    }
+}
+
+/// Check a loaded bucket against what this backend is about to assume of it:
+/// the two input names it feeds, the output name it reads, and the output shape
+/// `[1, seq, dim]`.
+///
+/// The `dim` comes from the directory's `config.json`, which nothing else ties to
+/// the model itself. A directory whose `config.json` belonged to a
+/// different checkpoint would either panic in [`crate::model`] (declared `dim`
+/// too large) or silently return vectors pooled over the wrong stride
+/// (declared `dim` too small). The same goes for `seq`, which comes from the
+/// *file name*: a `seq-128.mlpackage` holding a 256-long model would pad and
+/// pool against the wrong length. Both are cheap to rule out here, where the
+/// model's own description is at hand and no input has been read yet.
+fn check_io(model: &MLModel, seq: usize, dim: usize) -> Result<()> {
+    let describe = |kind: &str, name: &str| {
+        format!("this CoreML bucket (seq-{seq}) has no {kind} named `{name}`")
+    };
+    unsafe {
+        let desc = model.modelDescription();
+
+        let inputs = desc.inputDescriptionsByName();
+        for name in ["input_ids", "attention_mask"] {
+            if inputs.objectForKey(&NSString::from_str(name)).is_none() {
+                let have = feature_names(&inputs);
+                return Err(UnsupportedRequest::new(format!(
+                    "{} (it has: {have}) — CoreML models for kohagi take \
+                     `input_ids` and `attention_mask`; see scripts/convert_coreml.py",
+                    describe("input", name)
+                ))
+                .into());
+            }
+        }
+
+        let outputs = desc.outputDescriptionsByName();
+        let Some(hidden) = outputs.objectForKey(&NSString::from_str("hidden")) else {
+            let have = feature_names(&outputs);
+            return Err(UnsupportedRequest::new(format!(
+                "{} (it has: {have}) — kohagi reads the encoder's hidden states \
+                 from an output named `hidden` and pools them itself",
+                describe("output", "hidden")
+            ))
+            .into());
+        };
+        let shape: Vec<usize> = hidden
+            .multiArrayConstraint()
+            .context("CoreML output `hidden` is not a multiarray")?
+            .shape()
+            .iter()
+            .map(|n| n.as_isize().max(0) as usize)
+            .collect();
+
+        // A fixed-shape encoder output is [1, seq, dim]. Anything else means the
+        // bundle is not what this backend runs, so say what was found rather
+        // than indexing into it.
+        if shape != [1, seq, dim] {
+            return Err(UnsupportedRequest::new(format!(
+                "CoreML bucket seq-{seq} outputs `hidden` with shape {shape:?}, \
+                 but kohagi expected [1, {seq}, {dim}] — {seq} comes from the bundle's \
+                 file name and {dim} from `hidden_size` in config.json, so one of the \
+                 three disagrees with the model. Check that config.json belongs to the \
+                 converted checkpoint and that the bundle is named for its real length"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// The feature names in a model description dictionary, for an error message.
+unsafe fn feature_names(d: &NSDictionary<NSString, MLFeatureDescription>) -> String {
+    let mut names: Vec<String> = d.keys().map(|k| k.to_string()).collect();
+    names.sort();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
     }
 }
 
