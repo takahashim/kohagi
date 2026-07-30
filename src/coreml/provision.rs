@@ -183,8 +183,10 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 /// A repo may ship, per bucket, a compiled `.mlmodelc`, a portable
 /// `.mlpackage`, or both. To avoid downloading the redundant form when both are
 /// present, we fetch only the preferred one for each bucket (`prefer`), falling
-/// back to the other when a bucket ships just one. `config.json` and
-/// `tokenizer.json` are always fetched; other repo files are skipped.
+/// back to the other when a bucket ships just one. The metadata a converted
+/// directory needs — `config.json`, `tokenizer.json`, and the
+/// `1_Pooling/config.json` a checkpoint declares its pooling in — is always
+/// fetched; other repo files are skipped.
 pub fn fetch_from_hub(repo: &str, prefer: CoreMlForm) -> Result<PathBuf> {
     let api = hf_hub::api::sync::Api::new().context("initializing Hugging Face Hub client")?;
     let handle = api.model(repo.to_string());
@@ -224,9 +226,9 @@ pub fn fetch_from_hub(repo: &str, prefer: CoreMlForm) -> Result<PathBuf> {
         .context("downloaded config.json has no parent directory")
 }
 
-/// Whether to download a given repo file: `config.json` / `tokenizer.json`
-/// always, and for each bucket only the preferred form (or the other one if the
-/// bucket ships just that). `forms` maps seq -> (has .mlmodelc, has .mlpackage).
+/// Whether to download a given repo file: the metadata files always, and for
+/// each bucket only the preferred form (or the other one if the bucket ships
+/// just that). `forms` maps seq -> (has .mlmodelc, has .mlpackage).
 fn wanted(rfilename: &str, prefer: CoreMlForm, forms: &BTreeMap<usize, (bool, bool)>) -> bool {
     match bucket_of(rfilename) {
         Some((seq, ext)) => {
@@ -239,7 +241,14 @@ fn wanted(rfilename: &str, prefer: CoreMlForm, forms: &BTreeMap<usize, (bool, bo
             };
             ext == chosen
         }
-        None => rfilename == "config.json" || rfilename == "tokenizer.json",
+        // `1_Pooling/config.json` is what [`crate::model`] reads the declared
+        // pooling from, by the same path convention as a local checkpoint. Skip
+        // it and a Hub-hosted conversion warns that it may not be a
+        // sentence-embedding model, however faithfully it was converted.
+        None => matches!(
+            rfilename,
+            "config.json" | "tokenizer.json" | "1_Pooling/config.json"
+        ),
     }
 }
 
@@ -272,6 +281,7 @@ mod tests {
         // Metadata is always fetched; unrelated repo chrome is not.
         assert!(get("config.json", CoreMlForm::Compiled));
         assert!(get("tokenizer.json", CoreMlForm::Compiled));
+        assert!(get("1_Pooling/config.json", CoreMlForm::Compiled));
         assert!(!get("README.md", CoreMlForm::Compiled));
         assert!(!get(".gitattributes", CoreMlForm::Compiled));
     }
