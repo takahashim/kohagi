@@ -66,18 +66,29 @@ def time_kohagi(binary: str, texts: list[str], args) -> dict:
 
     # A 2-record run is almost entirely startup plus model load, so it
     # isolates the fixed cost that the full run also pays.
+    #
+    # Take the fastest of two probes. The probe runs in its own process before
+    # the full run, so a one-time cost that lands on the *first* invocation of a
+    # model — a cold page cache, or the OS caching the CoreML compile of an
+    # uncompiled .mlpackage — would be counted as load and then not paid by the
+    # full run, pushing `encode` (total - load) below zero. Timing two probes
+    # and keeping the smaller one measures the cost the full run actually
+    # shares.
     head = "".join(stdin.splitlines(keepends=True)[:2])
-    t0 = time.perf_counter()
-    subprocess.run(cmd, input=head, capture_output=True, text=True, check=True)
-    load = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    r = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
-    total = time.perf_counter() - t0
-    if r.returncode != 0:
-        sys.exit(f"Kohagi failed ({r.returncode}): {r.stderr.strip()}")
+    load = min(run_kohagi(cmd, head) for _ in range(2))
+    total = run_kohagi(cmd, stdin)
 
     return {"load": load, "encode": total - load, "total": total}
+
+
+def run_kohagi(cmd: list[str], stdin: str) -> float:
+    """One Kohagi invocation, timed end to end."""
+    t0 = time.perf_counter()
+    r = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
+    elapsed = time.perf_counter() - t0
+    if r.returncode != 0:
+        sys.exit(f"Kohagi failed ({r.returncode}): {r.stderr.strip()}")
+    return elapsed
 
 
 # Run torch in a fresh process, exactly as Kohagi is run. Timing it in-process
@@ -166,6 +177,19 @@ def main() -> int:
     print(f"\n{'':<14}{'load':>9}{'encode':>9}{'total':>9}")
     for name, load, encode, total in rows:
         print(f"{name:<14}{load:>8.2f}s{encode:>8.2f}s{total:>8.2f}s")
+
+    # `encode` is a subtraction, so it can still come out non-positive when the
+    # load estimate is unstable across processes — say a run so short that
+    # startup swamps it, or a machine busy enough that the probes and the full
+    # run see different conditions. Say so rather than let a negative number
+    # pass for a measurement.
+    for name, load, encode, _ in rows:
+        if encode <= 0:
+            print(
+                f"\nWARNING: {name} encode is {encode:.2f}s — the {load:.2f}s load "
+                "estimate reached the full run, so this row measures startup, not "
+                "compute. Raise --count, or quiet the machine, and re-run."
+            )
 
     if len(rows) == 2:
         k, t = rows[0], rows[1]
