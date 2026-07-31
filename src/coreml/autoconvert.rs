@@ -19,10 +19,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::config::CoreMlQuantize as Quantize;
-use crate::coreml_export::{encoder, modernbert::Activation, Provenance};
+use crate::coreml_export::{bundle_name, encoder, Checkpoint};
 
 /// The emitted graph's version, part of the cache key.
 ///
@@ -42,54 +42,22 @@ fn options(quantize: Quantize) -> encoder::Options {
     }
 }
 
-/// A checkpoint to convert, already resolved to files on disk.
+/// What distinguishes one state of a checkpoint from another, for the cache key.
 ///
-/// `crate::model` does the resolving, because a Hub checkpoint is downloaded the
-/// same way for every backend and a local one is just paths.
-pub struct Checkpoint {
-    /// `model.safetensors`.
-    pub weights: PathBuf,
-    /// `config.json`.
-    pub config: PathBuf,
-    /// `tokenizer.json`.
-    pub tokenizer: PathBuf,
-    /// `1_Pooling/config.json`, when the checkpoint ships one. A reranker or a
-    /// base LM does not, and the loader falls back to mean pooling with a warning.
-    pub pooling: Option<PathBuf>,
-    /// How to name this checkpoint in the cache and in the bundle's provenance:
-    /// the Hub id, or the path for a local one.
-    pub source: String,
-}
-
-impl Checkpoint {
-    /// What distinguishes one state of this checkpoint from another.
-    ///
-    /// For a Hub download that is the snapshot commit, which sits in the cache
-    /// path — an upstream update lands in a different directory, so the key
-    /// changes without hashing 500MB. For a local checkpoint there is no revision
-    /// to read, so the weights' size and modification time stand in, as the
-    /// compile cache already does for a package.
-    fn revision(&self) -> String {
-        if let Some(sha) = snapshot_commit(&self.weights) {
-            return sha;
-        }
-        let mut h = 0xcbf2_9ce4_8422_2325u64;
-        let mut mix = |bytes: &[u8]| {
-            for &b in bytes {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        };
-        if let Ok(meta) = std::fs::metadata(&self.weights) {
-            mix(&meta.len().to_le_bytes());
-            if let Ok(t) = meta.modified() {
-                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
-                    mix(&d.as_nanos().to_le_bytes());
-                }
-            }
-        }
-        format!("local{h:016x}")
+/// For a Hub download that is the snapshot commit, which sits in the cache path —
+/// an upstream update lands in a different directory, so the key changes without
+/// hashing 500MB. For a local checkpoint there is no revision to read, so the
+/// weights' size and modification time stand in, as the compile cache already
+/// does for a package.
+fn revision(checkpoint: &Checkpoint) -> String {
+    if let Some(sha) = snapshot_commit(&checkpoint.weights) {
+        return sha;
     }
+    let mut h = crate::fnv::Hasher::new();
+    if let Ok(meta) = std::fs::metadata(&checkpoint.weights) {
+        h.write_metadata(&meta);
+    }
+    format!("local{:016x}", h.finish())
 }
 
 /// The commit a Hugging Face cache path belongs to: the component right after
@@ -100,24 +68,40 @@ fn snapshot_commit(weights: &Path) -> Option<String> {
     (parts.next()?.as_os_str() == "snapshots").then(|| dir.to_string())
 }
 
+/// The outcome of [`provision`].
+///
+/// Either way the directory has the layout `--coreml-dir` expects, so the caller
+/// carries on through the ordinary loader.
+pub enum Provisioned {
+    /// Found in the cache; nothing was written.
+    Cached(PathBuf),
+    /// Converted by this call, which is when the one-time self-check is worth its
+    /// few seconds.
+    Converted(PathBuf),
+}
+
+impl Provisioned {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Cached(p) | Self::Converted(p) => p,
+        }
+    }
+}
+
 /// Convert `checkpoint` if the cache does not already hold that exact bundle, and
 /// return the directory to load from.
 ///
 /// The returned directory has the layout `--coreml-dir` expects, so the caller
 /// carries on through the ordinary loader.
-///
-/// The second element is whether this call converted, as opposed to finding the
-/// bundle already cached — which is what decides whether the caller runs the
-/// one-time self-check.
 pub fn provision(
     checkpoint: &Checkpoint,
     buckets: &[usize],
     quantize: Quantize,
-) -> Result<(PathBuf, bool)> {
+) -> Result<Provisioned> {
     let entry = cache_entry(checkpoint, buckets, quantize);
     if let Some(entry) = &entry {
         if entry.join(bundle_name(buckets)).is_dir() {
-            return Ok((entry.clone(), false));
+            return Ok(Provisioned::Cached(entry.clone()));
         }
     }
 
@@ -141,7 +125,7 @@ pub fn provision(
     result?;
 
     let Some(entry) = entry else {
-        return Ok((staged, true));
+        return Ok(Provisioned::Converted(staged));
     };
     if let Some(parent) = entry.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -150,7 +134,7 @@ pub fn provision(
     match std::fs::rename(&staged, &entry) {
         Ok(()) => {
             evict_superseded(&entry);
-            Ok((entry, true))
+            Ok(Provisioned::Converted(entry))
         }
         Err(e) => {
             // The conversion succeeded, so run from the staging copy rather than
@@ -160,22 +144,9 @@ pub fn provision(
                  this run will use a temporary copy",
                 entry.display()
             );
-            Ok((staged, true))
+            Ok(Provisioned::Converted(staged))
         }
     }
-}
-
-/// The bundle file name for a set of buckets, matching `coreml-convert`'s so that
-/// a cached directory and a hand-converted one are the same thing.
-fn bundle_name(buckets: &[usize]) -> String {
-    format!(
-        "buckets-{}.mlpackage",
-        buckets
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join("-")
-    )
 }
 
 /// Where this exact conversion belongs, or `None` if there is no usable cache
@@ -186,7 +157,7 @@ fn cache_entry(checkpoint: &Checkpoint, buckets: &[usize], quantize: Quantize) -
         .join("converted")
         .join(slug(&checkpoint.source));
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join(entry_name(&checkpoint.revision(), buckets, quantize)))
+    Some(dir.join(entry_name(&revision(checkpoint), buckets, quantize)))
 }
 
 /// `<revision>-b<buckets>-<quantization>-g<graph version>`.
@@ -251,68 +222,27 @@ fn evict_superseded(keep: &Path) {
     }
 }
 
-/// Emit the bundle and copy the metadata a loader needs beside it.
+/// Emit the bundle, reporting what is about to take twenty seconds.
+///
+/// The conversion itself is `coreml_export::convert`, shared with the
+/// `coreml-convert` binary so that an automatic bundle and a hand-converted one
+/// are the same artifact.
 fn convert_into(
     dir: &Path,
     checkpoint: &Checkpoint,
     buckets: &[usize],
     quantize: Quantize,
 ) -> Result<()> {
-    let text = std::fs::read_to_string(&checkpoint.config)
-        .with_context(|| format!("reading {}", checkpoint.config.display()))?;
-    let cfg = encoder::EncoderConfig::from_json(&text)?;
-
-    // Before reading 500MB of weights: a bucket past the trained positions has no
-    // RoPE frequencies behind it, and `emit_with` would refuse anyway.
-    let max = cfg.max_positions;
-    if let Some(&over) = buckets.iter().find(|&&b| b > max) {
-        anyhow::bail!(
-            "bucket {over} is longer than {}'s {max} trained positions; \
-             lower --coreml-buckets",
-            checkpoint.source
-        );
-    }
-
     eprintln!(
-        "kohagi: converting {} for the Neural Engine ({} wide, {} layers, gate {}, \
-         buckets {}) — first run only ...",
+        "kohagi: converting {} for the Neural Engine (buckets {}) — first run only ...",
         checkpoint.source,
-        cfg.hidden,
-        cfg.layers,
-        cfg.activation.name(),
         buckets
             .iter()
             .map(usize::to_string)
             .collect::<Vec<_>>()
             .join(", ")
     );
-
-    let weights = crate::coreml_export::safetensors::Checkpoint::open(&checkpoint.weights)?;
-    let provenance = Provenance {
-        source: checkpoint.source.clone(),
-        lengths: buckets.to_vec(),
-        quantized_embeddings: quantize != Quantize::None,
-        quantized_projections: quantize == Quantize::All,
-        activation: (cfg.activation != Activation::default()).then(|| cfg.activation.name()),
-    };
-    let (model, blob) =
-        encoder::emit_with(&cfg, &weights, buckets, &provenance, &options(quantize))?;
-
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    crate::coreml_export::write_package(&dir.join(bundle_name(buckets)), &model, &blob)?;
-
-    // The loader reads all three from the directory, so a cached bundle has to be
-    // self-contained: the HF cache it came from may be cleared independently.
-    std::fs::copy(&checkpoint.config, dir.join("config.json"))
-        .with_context(|| format!("copying {}", checkpoint.config.display()))?;
-    std::fs::copy(&checkpoint.tokenizer, dir.join("tokenizer.json"))
-        .with_context(|| format!("copying {}", checkpoint.tokenizer.display()))?;
-    if let Some(pooling) = &checkpoint.pooling {
-        let into = dir.join("1_Pooling");
-        std::fs::create_dir_all(&into).with_context(|| format!("creating {}", into.display()))?;
-        std::fs::copy(pooling, into.join("config.json"))
-            .with_context(|| format!("copying {}", pooling.display()))?;
-    }
+    crate::coreml_export::convert(dir, checkpoint, buckets, &options(quantize))?;
     Ok(())
 }
 
@@ -367,12 +297,12 @@ mod tests {
             pooling: None,
             source: dir.display().to_string(),
         };
-        let first = checkpoint.revision();
+        let first = revision(&checkpoint);
         assert!(first.starts_with("local"), "{first}");
         // A different size gives a different revision, so an edited checkpoint is
         // reconverted rather than served from the cache.
         std::fs::write(&weights, b"another").unwrap();
-        assert_ne!(first, checkpoint.revision());
+        assert_ne!(first, revision(&checkpoint));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

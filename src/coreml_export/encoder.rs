@@ -37,6 +37,71 @@ pub struct EncoderConfig {
     pub activation: Activation,
 }
 
+/// What a `config.json` says that this emitter's fixed graph cannot honour, other
+/// than the values it reads.
+///
+/// Separate from reading because none of it produces a value: these are the keys
+/// `crate::encoder` has no opinion on, since the runtime never builds a graph from
+/// them. Returned as a list so an unsupported checkpoint reports everything wrong
+/// with it at once.
+fn graph_assumptions(v: &serde_json::Value, global_every: usize) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // Every `linear` this emitter writes takes a zero bias, and every norm has
+    // gamma without beta.
+    for (key, what) in [
+        ("attention_bias", "attention projections"),
+        ("mlp_bias", "feed-forward projections"),
+        ("norm_bias", "layer normalizations"),
+    ] {
+        if v.get(key).and_then(serde_json::Value::as_bool) == Some(true) {
+            out.push(format!(
+                "{key}: true, but the emitted graph gives the {what} no bias"
+            ));
+        }
+    }
+
+    // The emitted RoPE has no scaling, so a `rope_type` other than default would be
+    // applied by the reference and not here.
+    if let Some(rope) = v.get("rope_parameters") {
+        for kind in ["full_attention", "sliding_attention"] {
+            match rope
+                .get(kind)
+                .and_then(|k| k.get("rope_type"))
+                .and_then(serde_json::Value::as_str)
+            {
+                None | Some("default") => {}
+                Some(other) => out.push(format!(
+                    "rope_parameters.{kind}.rope_type: {other}, and the emitted RoPE \
+                     has no scaling"
+                )),
+            }
+        }
+    }
+
+    // Where `layer_types` is present it, not the interval, is authoritative — so a
+    // disagreement means the interval this emitter follows is the wrong rule.
+    if let Some(types) = v.get("layer_types").and_then(serde_json::Value::as_array) {
+        let mismatch: Vec<usize> = types
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| {
+                let global = t.as_str() == Some("full_attention");
+                global != (global_every != 0 && i.is_multiple_of(global_every))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !mismatch.is_empty() {
+            out.push(format!(
+                "layer_types: layers {mismatch:?} disagree with \
+                 global_attn_every_n_layers {global_every}, and the emitter follows \
+                 the interval"
+            ));
+        }
+    }
+    out
+}
+
 impl EncoderConfig {
     /// Read a Hugging Face `config.json`, refusing anything this emitter would
     /// silently get wrong.
@@ -86,20 +151,7 @@ impl EncoderConfig {
             );
         }
 
-        // Every `linear` this emitter writes takes a zero bias, and every norm has
-        // gamma without beta. The runtime has no opinion on these because it never
-        // builds a graph from them.
-        for (key, what) in [
-            ("attention_bias", "attention projections"),
-            ("mlp_bias", "feed-forward projections"),
-            ("norm_bias", "layer normalizations"),
-        ] {
-            if v.get(key).and_then(serde_json::Value::as_bool) == Some(true) {
-                unsupported.push(format!(
-                    "{key}: true, but the emitted graph gives the {what} no bias"
-                ));
-            }
-        }
+        unsupported.extend(graph_assumptions(&v, global_every));
 
         // Collected rather than returned, so an unsupported checkpoint reports
         // everything wrong with it at once.
@@ -120,45 +172,6 @@ impl EncoderConfig {
         };
         let global_rope_theta = theta(crate::encoder::Attention::Global);
         let local_rope_theta = theta(crate::encoder::Attention::Local);
-
-        // The emitted RoPE has no scaling, so a `rope_type` other than default
-        // would be applied by the reference and not here.
-        if let Some(rope) = v.get("rope_parameters") {
-            for kind in ["full_attention", "sliding_attention"] {
-                match rope
-                    .get(kind)
-                    .and_then(|k| k.get("rope_type"))
-                    .and_then(serde_json::Value::as_str)
-                {
-                    None | Some("default") => {}
-                    Some(other) => unsupported.push(format!(
-                        "rope_parameters.{kind}.rope_type: {other}, and the emitted RoPE \
-                         has no scaling"
-                    )),
-                }
-            }
-        }
-
-        // Where `layer_types` is present it, not the interval, is authoritative — so
-        // a disagreement means the interval this emitter follows is the wrong rule.
-        if let Some(types) = v.get("layer_types").and_then(serde_json::Value::as_array) {
-            let mismatch: Vec<usize> = types
-                .iter()
-                .enumerate()
-                .filter(|(i, t)| {
-                    let global = t.as_str() == Some("full_attention");
-                    global != (global_every != 0 && i.is_multiple_of(global_every))
-                })
-                .map(|(i, _)| i)
-                .collect();
-            if !mismatch.is_empty() {
-                unsupported.push(format!(
-                    "layer_types: layers {mismatch:?} disagree with \
-                     global_attn_every_n_layers {global_every}, and the emitter follows \
-                     the interval"
-                ));
-            }
-        }
 
         if !unsupported.is_empty() {
             anyhow::bail!(
@@ -962,13 +975,6 @@ mod tests {
         }
     }
 
-    /// FNV-1a, so a golden value can be written down without a hashing dependency.
-    fn digest(bytes: &[u8]) -> u64 {
-        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
-    }
-
     fn tiny() -> EncoderConfig {
         EncoderConfig {
             hidden: 16,
@@ -1012,12 +1018,16 @@ mod tests {
 
         assert_eq!(encoded.len(), 56_051, "model.mlmodel size");
         assert_eq!(
-            digest(&encoded),
+            crate::fnv::hash(&encoded),
             0x9925_5c8f_5909_d196,
             "model.mlmodel digest"
         );
         assert_eq!(blob.len(), 13_760, "weight.bin size");
-        assert_eq!(digest(&blob), 0x979d_60e1_49a0_dad6, "weight.bin digest");
+        assert_eq!(
+            crate::fnv::hash(&blob),
+            0x979d_60e1_49a0_dad6,
+            "weight.bin digest"
+        );
     }
 
     /// The operation count is fixed by the configuration alone: 12 for the prologue,

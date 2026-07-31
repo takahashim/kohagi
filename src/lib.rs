@@ -38,6 +38,9 @@ pub mod coreml_export;
 mod coreml_proto;
 mod encoder;
 mod errors;
+// Only the CoreML caches and the emitter's golden test need a stable hash.
+#[cfg(any(feature = "coreml", test))]
+mod fnv;
 mod fused;
 mod model;
 pub mod stdio;

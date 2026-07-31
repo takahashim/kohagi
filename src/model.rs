@@ -275,27 +275,19 @@ impl Embedder {
     /// Every unsupported condition is caught here, before any input is read.
     #[cfg(feature = "coreml")]
     fn load_coreml(source: &ModelSource, opts: Options) -> Result<Self> {
-        // `converted` is set only when this run did the conversion, which is when
-        // the self-check below is worth its few seconds.
-        #[cfg(feature = "coreml-export")]
-        let mut converted: Option<&ModelSource> = None;
-        let dir = match source {
-            ModelSource::CoreMl { dir } => dir.clone(),
-            ModelSource::CoreMlHub { repo } => {
-                crate::coreml::fetch_from_hub(repo, opts.coreml_form)?
-            }
+        // `converted` says whether this run did the conversion, which is when the
+        // self-check below is worth its few seconds.
+        let (dir, converted) = match source {
+            ModelSource::CoreMl { dir } => (dir.clone(), false),
+            ModelSource::CoreMlHub { repo } => (
+                crate::coreml::fetch_from_hub(repo, opts.coreml_form)?,
+                false,
+            ),
             ModelSource::CoreMlConvert {
                 checkpoint,
                 buckets,
                 quantize,
-            } => {
-                let (dir, _fresh) = convert_for_coreml(checkpoint, buckets, *quantize)?;
-                #[cfg(feature = "coreml-export")]
-                if _fresh {
-                    converted = Some(checkpoint.as_ref());
-                }
-                dir
-            }
+            } => convert_for_coreml(checkpoint, buckets, *quantize)?,
             _ => {
                 return Err(UnsupportedRequest::new(
                     "`--device coreml` needs a CoreML model directory (`--coreml-dir`) \
@@ -334,9 +326,14 @@ impl Embedder {
             dim,
         };
         #[cfg(feature = "coreml-export")]
-        if let Some(checkpoint) = converted {
-            embedder.self_check(checkpoint);
+        if converted {
+            if let ModelSource::CoreMlConvert { checkpoint, .. } = source {
+                embedder.self_check(checkpoint);
+            }
         }
+        // Only a conversion sets it, and only this feature can convert.
+        #[cfg(not(feature = "coreml-export"))]
+        let _ = converted;
         Ok(embedder)
     }
 
@@ -369,17 +366,25 @@ impl Embedder {
              both benchmarks that were measured.",
         ];
 
-        let Ok(reference) = Self::load(
+        // Every failure here is reported and then dropped: a check that cannot run
+        // must not stop a working model from loading, but a silent skip would leave
+        // no way to tell "checked and fine" from "never checked".
+        let skip = |e: &anyhow::Error| {
+            eprintln!("kohagi: could not compare the converted model against float32 ({e:#})");
+        };
+        let reference = match Self::load(
             checkpoint,
             Options {
                 backend: Backend::Cpu,
                 ..self.opts
             },
-        ) else {
-            return;
+        ) {
+            Ok(r) => r,
+            Err(e) => return skip(&e),
         };
-        let (Ok(theirs), Ok(ours)) = (reference.embed(&PROBES), self.embed(&PROBES)) else {
-            return;
+        let (theirs, ours) = match (reference.embed(&PROBES), self.embed(&PROBES)) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(e), _) | (_, Err(e)) => return skip(&e),
         };
         let worst = theirs
             .iter()
@@ -706,7 +711,7 @@ fn convert_for_coreml(
                 eprintln!("kohagi: downloading {repo} (safetensors; first run only) ...");
             }
             let files = fetch_checkpoint(repo)?;
-            autoconvert::Checkpoint {
+            crate::coreml_export::Checkpoint {
                 config: beside(&files.weights, "config.json")?,
                 weights: files.weights,
                 tokenizer: files.tokenizer,
@@ -714,7 +719,7 @@ fn convert_for_coreml(
                 source: repo.clone(),
             }
         }
-        ModelSource::Files { model, tokenizer } => autoconvert::Checkpoint {
+        ModelSource::Files { model, tokenizer } => crate::coreml_export::Checkpoint {
             config: beside(model, "config.json")?,
             weights: model.clone(),
             tokenizer: tokenizer.clone(),
@@ -733,7 +738,11 @@ fn convert_for_coreml(
             .into())
         }
     };
-    autoconvert::provision(&resolved, buckets, quantize)
+    let provisioned = autoconvert::provision(&resolved, buckets, quantize)?;
+    Ok((
+        provisioned.path().to_path_buf(),
+        matches!(provisioned, autoconvert::Provisioned::Converted(_)),
+    ))
 }
 
 #[cfg(all(feature = "coreml", not(feature = "coreml-export")))]

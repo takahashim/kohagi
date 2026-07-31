@@ -24,10 +24,12 @@ pub mod mil;
 pub mod modernbert;
 pub mod safetensors;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use prost::Message;
+
+use modernbert::Activation;
 
 use crate::coreml_proto::{
     array_feature_type, feature_type, model, ArrayFeatureType, FeatureDescription, FeatureType,
@@ -328,6 +330,99 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     } else {
         std::fs::copy(from, to).map(|_| ())
     }
+}
+
+/// A checkpoint's files, resolved on disk, and how to name it.
+///
+/// Both callers of [`convert`] arrive at these differently — the CLI downloads or
+/// takes paths, `--device coreml` reuses whatever the candle path resolved — but
+/// what the conversion needs from a checkpoint is the same either way.
+pub struct Checkpoint {
+    /// `model.safetensors`.
+    pub weights: PathBuf,
+    /// `config.json`.
+    pub config: PathBuf,
+    /// `tokenizer.json`.
+    pub tokenizer: PathBuf,
+    /// `1_Pooling/config.json`, when the checkpoint ships one. A reranker or a
+    /// base LM does not, and Kohagi falls back to mean pooling with a warning.
+    pub pooling: Option<PathBuf>,
+    /// The Hub id, or the path for a local checkpoint. Recorded in the bundle's
+    /// provenance.
+    pub source: String,
+}
+
+/// The file name a bundle of these lengths gets.
+///
+/// One function because a cached conversion is found by this name: spelling it
+/// differently in two places would turn every cache hit into a silent miss.
+pub fn bundle_name(lengths: &[usize]) -> String {
+    format!(
+        "buckets-{}.mlpackage",
+        lengths
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join("-")
+    )
+}
+
+/// Convert a checkpoint into `dir`, leaving a directory Kohagi can load.
+///
+/// The whole procedure in one place: read the config, refuse a bucket the
+/// checkpoint was not trained for before opening 500MB of weights, emit, and copy
+/// the metadata a loader needs beside the bundle. `--device coreml` and
+/// `coreml-convert` both go through here, so a bundle is the same artifact
+/// whichever produced it.
+///
+/// Returns the emitted config, which the caller has already had to read to report
+/// anything about the model.
+pub fn convert(
+    dir: &Path,
+    checkpoint: &Checkpoint,
+    lengths: &[usize],
+    opts: &encoder::Options,
+) -> Result<encoder::EncoderConfig> {
+    let text = std::fs::read_to_string(&checkpoint.config)
+        .with_context(|| format!("reading {}", checkpoint.config.display()))?;
+    let cfg = encoder::EncoderConfig::from_json(&text)?;
+
+    let max = cfg.max_positions;
+    if let Some(&over) = lengths.iter().find(|&&s| s > max) {
+        anyhow::bail!(
+            "sequence length {over} is past {}'s {max} trained positions; the \
+             checkpoint has no RoPE frequencies that far and the model would run \
+             and be wrong",
+            checkpoint.source
+        );
+    }
+
+    let weights = safetensors::Checkpoint::open(&checkpoint.weights)?;
+    let provenance = Provenance {
+        source: checkpoint.source.clone(),
+        lengths: lengths.to_vec(),
+        quantized_embeddings: opts.quantize_embeddings,
+        quantized_projections: opts.quantize_projections,
+        activation: (cfg.activation != Activation::default()).then(|| cfg.activation.name()),
+    };
+    let (model, blob) = encoder::emit_with(&cfg, &weights, lengths, &provenance, opts)?;
+
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    write_package(&dir.join(bundle_name(lengths)), &model, &blob)?;
+
+    // A converted directory has to be self-contained: the checkpoint it came from
+    // may be a Hugging Face cache entry that is cleared independently.
+    std::fs::copy(&checkpoint.config, dir.join("config.json"))
+        .with_context(|| format!("copying {}", checkpoint.config.display()))?;
+    std::fs::copy(&checkpoint.tokenizer, dir.join("tokenizer.json"))
+        .with_context(|| format!("copying {}", checkpoint.tokenizer.display()))?;
+    if let Some(pooling) = &checkpoint.pooling {
+        let into = dir.join("1_Pooling");
+        std::fs::create_dir_all(&into).with_context(|| format!("creating {}", into.display()))?;
+        std::fs::copy(pooling, into.join("config.json"))
+            .with_context(|| format!("copying {}", pooling.display()))?;
+    }
+    Ok(cfg)
 }
 
 #[cfg(test)]

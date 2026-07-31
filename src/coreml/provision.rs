@@ -319,55 +319,35 @@ fn evict_superseded(keep: &Path) {
     }
 }
 
-/// FNV-1a. Written out rather than taken from `DefaultHasher`, whose algorithm is
-/// explicitly allowed to change between Rust releases — that would silently
-/// invalidate every user's cache on a toolchain bump.
-fn mix(h: &mut u64, bytes: &[u8]) {
-    for &b in bytes {
-        *h ^= u64::from(b);
-        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-}
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-
 /// Which package this is: its canonical path.
 fn identity(pkg: &Path) -> Option<u64> {
-    let mut h = FNV_OFFSET;
-    mix(
-        &mut h,
-        pkg.canonicalize().ok()?.as_os_str().as_encoded_bytes(),
-    );
-    Some(h)
+    let mut h = crate::fnv::Hasher::new();
+    h.write(pkg.canonicalize().ok()?.as_os_str().as_encoded_bytes());
+    Some(h.finish())
 }
 
 /// What is in it: every file's name, size and modification time.
 fn contents(pkg: &Path) -> Option<u64> {
-    fn walk(dir: &Path, h: &mut u64) -> std::io::Result<()> {
+    fn walk(dir: &Path, h: &mut crate::fnv::Hasher) -> std::io::Result<()> {
         // Sorted, so the hash does not depend on directory order.
         let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .collect();
         entries.sort();
         for path in entries {
-            mix(h, path.file_name().unwrap_or_default().as_encoded_bytes());
+            h.write(path.file_name().unwrap_or_default().as_encoded_bytes());
             let meta = std::fs::metadata(&path)?;
             if meta.is_dir() {
                 walk(&path, h)?;
             } else {
-                mix(h, &meta.len().to_le_bytes());
-                if let Ok(t) = meta.modified() {
-                    if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
-                        mix(h, &d.as_nanos().to_le_bytes());
-                    }
-                }
+                h.write_metadata(&meta);
             }
         }
         Ok(())
     }
-    let mut h = FNV_OFFSET;
+    let mut h = crate::fnv::Hasher::new();
     walk(pkg, &mut h).ok()?;
-    Some(h)
+    Some(h.finish())
 }
 
 /// Move a directory, falling back to copy-then-delete when `rename` cannot

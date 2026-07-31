@@ -30,17 +30,12 @@
 //! result, so shipping one only moves ~20 s off the first run at the cost of
 //! doubling the download.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use kohagi::coreml_export::{
-    encoder::{self, EncoderConfig, Options},
-    modernbert::Activation,
-    safetensors::Checkpoint,
-    write_package, Provenance,
-};
+use kohagi::coreml_export::{bundle_name, convert, encoder::Options, Checkpoint};
 
 #[derive(Parser)]
 #[command(
@@ -108,27 +103,12 @@ struct Args {
     compiled: bool,
 }
 
-/// The files a converted directory carries beside the bundle, and whether Kohagi
-/// can manage without one.
-const METADATA: [(&str, bool); 3] = [
-    ("config.json", true),
-    ("tokenizer.json", true),
-    // Kohagi falls back to mean pooling and warns when this is absent, which is
-    // alarming for a faithfully converted encoder — so it is fetched when the
-    // checkpoint has one, and merely noted when it does not.
-    ("1_Pooling/config.json", false),
-];
-
-/// What a conversion needs on disk before it can start.
-struct Sources {
-    weights: PathBuf,
-    config: String,
-    /// Metadata files to place beside the bundle, as `(name, source path)`.
-    metadata: Vec<(&'static str, PathBuf)>,
-}
-
-/// Resolve the checkpoint and the metadata files, downloading if needed.
-fn gather(args: &Args) -> Result<Sources> {
+/// Resolve the checkpoint's files, downloading if needed.
+///
+/// The shape of the result is `coreml_export::Checkpoint`, the same thing
+/// `--device coreml` builds from an already-resolved model, so both go through
+/// one conversion.
+fn gather(args: &Args) -> Result<Checkpoint> {
     if let Some(repo) = &args.model_id {
         let api =
             hf_hub::api::sync::Api::new().context("initializing the Hugging Face Hub client")?;
@@ -138,61 +118,39 @@ fn gather(args: &Args) -> Result<Sources> {
                 .get(name)
                 .with_context(|| format!("fetching {name} from {repo}"))
         };
-        let weights = fetch("model.safetensors")?;
-        let mut files = Vec::new();
-        for (name, required) in METADATA {
-            match fetch(name) {
-                Ok(path) => files.push((name, path)),
-                Err(e) if !required => eprintln!("  no {name} ({e:#})"),
-                Err(e) => return Err(e),
-            }
-        }
-        let config = files
-            .iter()
-            .find(|(name, _)| *name == "config.json")
-            .map(|(_, path)| std::fs::read_to_string(path))
-            .transpose()?
-            .context("the repo has no config.json")?;
-        return Ok(Sources {
-            weights,
-            config,
-            metadata: files,
+        // Optional: a reranker or a base LM ships no pooling declaration, and a
+        // 404 there is information rather than an error.
+        let pooling = fetch("1_Pooling/config.json")
+            .inspect_err(|e| eprintln!("  no 1_Pooling/config.json ({e:#})"))
+            .ok();
+        return Ok(Checkpoint {
+            weights: fetch("model.safetensors")?,
+            config: fetch("config.json")?,
+            tokenizer: fetch("tokenizer.json")?,
+            pooling,
+            source: repo.clone(),
         });
     }
 
     let Some(weights) = args.model_path.clone() else {
         bail!("pass either --model-id or --model-path with --config-path");
     };
-    let config_path = args.config_path.clone().expect("clap requires it");
-    let config = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("reading {}", config_path.display()))?;
-    let mut files = vec![("config.json", config_path)];
-    if let Some(tokenizer) = &args.tokenizer_path {
-        files.push(("tokenizer.json", tokenizer.clone()));
-    } else {
-        eprintln!(
-            "  no --tokenizer-path; the output will need a tokenizer.json copied in \
-             before Kohagi can use it"
+    let Some(tokenizer) = args.tokenizer_path.clone() else {
+        bail!(
+            "--model-path needs --tokenizer-path: a converted directory Kohagi can \
+             load carries its own tokenizer.json"
         );
-    }
-    Ok(Sources {
+    };
+    Ok(Checkpoint {
+        config: args.config_path.clone().expect("clap requires it"),
+        pooling: weights
+            .parent()
+            .map(|d| d.join("1_Pooling").join("config.json"))
+            .filter(|p| p.is_file()),
+        source: weights.display().to_string(),
         weights,
-        config,
-        metadata: files,
+        tokenizer,
     })
-}
-
-/// Copy `from` to `<out>/<name>`, creating the parent directory a nested name
-/// needs. Dereferences, since the Hub cache is a tree of symlinks and the output
-/// is meant to be uploadable as it stands.
-fn place(out: &Path, name: &str, from: &Path) -> Result<()> {
-    let to = out.join(name);
-    if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::copy(from, &to).with_context(|| format!("copying {name} into {}", out.display()))?;
-    Ok(())
 }
 
 fn run(args: &Args) -> Result<()> {
@@ -203,8 +161,23 @@ fn run(args: &Args) -> Result<()> {
         bail!("--sequence-lengths must be positive");
     }
 
-    let sources = gather(args)?;
-    let cfg = EncoderConfig::from_json(&sources.config)?;
+    let checkpoint = gather(args)?;
+    let opts = Options {
+        quantize_embeddings: args.quantize_embeddings || args.quantize_all,
+        quantize_projections: args.quantize_all,
+    };
+    eprintln!(
+        "emitting: {} as one bundle from {} ...",
+        lengths
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        checkpoint.source
+    );
+
+    let cfg = convert(&args.out_dir, &checkpoint, &lengths, &opts)?;
+    let name = bundle_name(&lengths);
     eprintln!(
         "config  : hidden {}, {} layers, {} heads, vocab {}, gate {}",
         cfg.hidden,
@@ -213,63 +186,13 @@ fn run(args: &Args) -> Result<()> {
         cfg.vocab,
         cfg.activation.name()
     );
-
-    // Before opening a 500MB checkpoint: a bucket past the trained positions has no
-    // RoPE frequencies behind it, and `emit_all` would refuse anyway.
-    let max = cfg.max_positions;
-    if let Some(&over) = lengths.iter().find(|&&s| s > max) {
-        bail!(
-            "--sequence-lengths {over} is past this checkpoint's \
-             max_position_embeddings ({max})"
-        );
-    }
-
-    let checkpoint = Checkpoint::open(&sources.weights)?;
-    let source = args
-        .model_id
-        .clone()
-        .unwrap_or_else(|| sources.weights.display().to_string());
-    let opts = Options {
-        quantize_embeddings: args.quantize_embeddings || args.quantize_all,
-        quantize_projections: args.quantize_all,
-    };
-    let provenance = Provenance {
-        source: source.clone(),
-        lengths: lengths.clone(),
-        quantized_embeddings: opts.quantize_embeddings,
-        quantized_projections: opts.quantize_projections,
-        activation: (cfg.activation != Activation::default()).then(|| cfg.activation.name()),
-    };
-
-    eprintln!(
-        "emitting: {} as one bundle from {source} ...",
-        lengths
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let (model, blob) = encoder::emit_with(&cfg, &checkpoint, &lengths, &provenance, &opts)?;
-
-    let name = format!(
-        "buckets-{}.mlpackage",
-        lengths
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join("-")
-    );
-    let bundle = args.out_dir.join(&name);
-    std::fs::create_dir_all(&args.out_dir)
-        .with_context(|| format!("creating {}", args.out_dir.display()))?;
-    write_package(&bundle, &model, &blob)?;
-    eprintln!("wrote   : {name} ({:.1} MB)", blob.len() as f64 / 1e6);
+    eprintln!("wrote   : {name}");
 
     if args.compiled {
         #[cfg(feature = "coreml")]
         {
             eprintln!("compiling (this takes ~20s per bucket) ...");
-            let out = kohagi::coreml_export::compile_beside(&bundle)?;
+            let out = kohagi::coreml_export::compile_beside(&args.out_dir.join(&name))?;
             eprintln!(
                 "  compiled {}",
                 out.strip_prefix(&args.out_dir).unwrap_or(&out).display()
@@ -277,11 +200,6 @@ fn run(args: &Args) -> Result<()> {
         }
         #[cfg(not(feature = "coreml"))]
         bail!("--compiled needs a build with `--features coreml,coreml-export`");
-    }
-
-    for (file, from) in &sources.metadata {
-        place(&args.out_dir, file, from)?;
-        eprintln!("  copied {file}");
     }
 
     eprintln!("\ndone -> {}", args.out_dir.display());

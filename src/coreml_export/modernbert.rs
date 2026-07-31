@@ -260,9 +260,23 @@ pub fn block(
     mask: &Tensor,
     epsilon: &Tensor,
 ) -> Tensor {
+    let attended = attention(b, cfg, layer, input, w, mask, epsilon);
+    feed_forward(b, cfg, layer, &attended, w, epsilon)
+}
+
+/// Operations 1-16: the pre-norm, the fused QKV, RoPE, masked attention, the
+/// output projection and the residual. The result is the feed-forward's input.
+fn attention(
+    b: &mut Builder,
+    cfg: &Config,
+    layer: usize,
+    input: &Tensor,
+    w: &BlockOffsets,
+    mask: &Tensor,
+    epsilon: &Tensor,
+) -> Tensor {
     let (h, heads, seq) = (cfg.hidden, cfg.heads, cfg.seq);
     let d = cfg.head_dim();
-    let inter = cfg.intermediate;
     let tag = |s: &str| format!("l{layer}_{s}");
     let hidden_shape = [1, seq, h];
     let per_head = [1, heads, seq, d];
@@ -434,20 +448,33 @@ pub fn block(
         Tensor::new(tag("attn_out"), DType::Fp16, &hidden_shape),
         &[("x", &flat), ("weight", &wo), ("bias", &wo_bias)],
     );
-    let attn_residual = b.op(
+    b.op(
         "add",
         Tensor::new(tag("attn_residual"), DType::Fp16, &hidden_shape),
         &[("x", input), ("y", &projected)],
-    );
+    )
+}
 
-    // 17-23. The gated feed-forward and its residual.
+/// Operations 17-23: the pre-norm, the gated feed-forward and its residual.
+fn feed_forward(
+    b: &mut Builder,
+    cfg: &Config,
+    layer: usize,
+    input: &Tensor,
+    w: &BlockOffsets,
+    epsilon: &Tensor,
+) -> Tensor {
+    let (h, seq, inter) = (cfg.hidden, cfg.seq, cfg.intermediate);
+    let tag = |s: &str| format!("l{layer}_{s}");
+    let hidden_shape = [1, seq, h];
+
     let mlp_gamma = b.const_blob(Tensor::new(tag("mlp_norm"), DType::Fp16, &[h]), w.mlp_norm);
     let mlp_axes = b.const_i32(Tensor::new(tag("mlp_norm_axes"), DType::Int32, &[1]), &[-1]);
     let mlp_normed = b.op(
         "layer_norm",
         Tensor::new(tag("mlp_normed"), DType::Fp16, &hidden_shape),
         &[
-            ("x", &attn_residual),
+            ("x", input),
             ("axes", &mlp_axes),
             ("epsilon", epsilon),
             ("gamma", &mlp_gamma),
@@ -512,7 +539,7 @@ pub fn block(
     b.op(
         "add",
         Tensor::new(tag("out"), DType::Fp16, &hidden_shape),
-        &[("x", &attn_residual), ("y", &mlp_out)],
+        &[("x", input), ("y", &mlp_out)],
     )
 }
 
