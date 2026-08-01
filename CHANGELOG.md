@@ -76,6 +76,13 @@
   per-operation Neural Engine placement, per-bucket latency, and output parity
   between two configurations).
 
+- **An OpenAI-compatible endpoint, in `examples/`.** `openai_proxy.py`,
+  `.rb` and `.ts` each serve `/v1/embeddings` in front of Kohagi, so an existing
+  OpenAI client works by swapping `base_url` and nothing else — which is what
+  that compatibility is actually worth. They stay examples rather than a
+  `--serve` flag: the HTTP layer is the caller's to choose, and Kohagi's
+  contract stays "spawn a process, write JSONL".
+
 - **`--format openai`** writes one OpenAI `/v1/embeddings` response object for
   the whole run instead of the JSONL stream, so code already written against
   that API can read Kohagi's output unchanged. Embeddings are identified by

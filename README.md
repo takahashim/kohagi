@@ -135,11 +135,32 @@ Use the `id` field to match each result with its input record.
 A complete Ruby example is available in [`examples/rails_open3.rb`](examples/rails_open3.rb).
 See [PROTOCOL.md](PROTOCOL.md) for the exit-code semantics.
 
-If the calling code is already written against OpenAI's `/v1/embeddings`,
-`--format openai` writes one response object for the whole run instead of the
-JSONL stream — `data[i].embedding` where `i` is the input position, plus `model`
-and `usage`. Input is unchanged; ids are not carried, since that API identifies
-embeddings by position.
+### An OpenAI-compatible endpoint
+
+If the calling code is already written against OpenAI's `/v1/embeddings`, the
+value of that compatibility is swapping `base_url` and changing nothing else.
+Kohagi has no HTTP mode, so the examples supply one — the same ~150-line proxy in
+[Python](examples/openai_proxy.py), [Ruby](examples/openai_proxy.rb) and
+[TypeScript](examples/openai_proxy.ts):
+
+```bash
+python3 examples/openai_proxy.py --kohagi ./target/release/kohagi
+```
+
+```python
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+client.embeddings.create(model="ruri-v3-130m", input=["…", "…"])
+```
+
+Each spawns one Kohagi per request with `--format openai` — which writes the
+OpenAI response object rather than the JSONL stream — and returns its stdout
+verbatim. That costs a model load per request, about 0.3 s warm on CPU; a
+long-lived process is not an option, because Kohagi's protocol is a batch one
+that flushes at 1024 records or at end of input, so a server holding the pipe
+open would wait forever. Two caveats before pointing production at it: an
+existing index has to be rebuilt, since `ruri-v3-130m` returns 512 dimensions
+where `text-embedding-3-small` returns 1536, and the request's `model` is
+ignored — the flags passed to Kohagi decide which checkpoint runs.
 
 ### Ruby
 
