@@ -223,7 +223,7 @@ impl Builder {
     }
 
     /// A `const` whose bytes live in `weights/weight.bin`. `offset` is the blob's
-    /// **metadata** offset, which is what [`super::blob::Writer::write`] returns.
+    /// **metadata** offset, which is what [`super::blob::Writer::write_fp16`] returns.
     pub fn const_blob(&mut self, out: Tensor, offset: u64) -> Tensor {
         use crate::coreml_proto::mil_spec::value::BlobFileValue;
         let val = Value {

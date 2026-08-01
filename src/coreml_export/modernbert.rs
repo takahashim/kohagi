@@ -107,7 +107,7 @@ pub struct BlockOffsets {
 ///
 /// Each is `[1, 1, seq, head_dim]` with the angles duplicated across the two
 /// halves of the last axis, which is the layout the `x1`/`x2` split in
-/// [`rotate_half`] expects.
+/// `rotate_half` expects.
 pub fn rope_tables(cfg: &Config) -> (Vec<f32>, Vec<f32>) {
     let d = cfg.head_dim();
     let half = d / 2;

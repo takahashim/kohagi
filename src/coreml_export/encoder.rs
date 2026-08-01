@@ -16,6 +16,28 @@ use super::modernbert::{self, Activation, BlockOffsets, Config, Stored};
 use super::Io;
 
 /// A ModernBERT config, as far as emitting needs it.
+///
+/// What [`Self::from_json`] accepts is wider than what has been checked against
+/// Kohagi's CPU path. The values below have been; anything else inside the
+/// accepted set is expected to work and has not been shown to. Widening a check
+/// means measuring the value you are widening it to, not reasoning about it.
+///
+/// | field | verified |
+/// |---|---|
+/// | `hidden` | 256 to 1024 |
+/// | `layers` | 12 to 28 |
+/// | `vocab` | 82 to 256000 |
+/// | head dimension | 32, 64. Even is required; 26 and 80 exist on the Hub and are untested |
+/// | `local_attention` | 128, 256 |
+/// | `global_every` | 1, 3 |
+/// | rope theta | 10000/160000 and 160000/160000, in both config spellings |
+/// | `activation` | both; anything else is refused |
+/// | bucket length | up to [`Self::MAX_SEQUENCE_LENGTH`] |
+///
+/// Eleven real checkpoints, ten of which match the CPU path to fp16 rounding.
+/// The eleventh, `nomic-ai/modernbert-embed-base`, diverges by 7e-3 — but by the
+/// same amount under coremltools, so it is that checkpoint's own sensitivity to
+/// fp16 rather than anything this emitter does.
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderConfig {
     pub hidden: usize,

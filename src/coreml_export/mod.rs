@@ -181,7 +181,7 @@ impl Provenance {
     }
 }
 
-/// Assemble a [`Model`] around a program.
+/// Assemble a `Model` around a program.
 pub fn model(program: crate::coreml_proto::mil_spec::Program, io: Io) -> Model {
     model_with(program, io, &Provenance::default())
 }
@@ -206,7 +206,7 @@ pub fn model_with(
     }
 }
 
-/// Assemble a [`Model`] whose program holds several functions, one per bucket
+/// Assemble a `Model` whose program holds several functions, one per bucket
 /// length.
 ///
 /// A multi-function model describes each function separately rather than through

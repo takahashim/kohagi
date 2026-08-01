@@ -114,8 +114,8 @@ pub enum Precision {
     #[default]
     F32,
     /// The four projection `Linear`s in bf16, plus the vectorized softmax,
-    /// GeGLU and sliding-window attention that come with them (see
-    /// [`crate::bf16`]). Measured on an 8-core Zen 4: 2.3× faster on short
+    /// GeGLU and sliding-window attention that come with them (the `bf16`
+    /// module, which exists on x86_64 only). Measured on an 8-core Zen 4: 2.3× faster on short
     /// texts, 2.0× on 512-token ones, at cosine ≈ 0.99999 against f32 — and it
     /// halves the memory the weights occupy. Requires x86_64 with AVX512-BF16
     /// (Zen 4, Sapphire Rapids or newer); [`Embedder::load`] fails clearly
@@ -147,7 +147,7 @@ pub enum Backend {
     /// [`ModelSource::CoreMlHub`] repo, or a [`ModelSource::CoreMlConvert`]
     /// checkpoint this converts itself.
     /// Runs batch=1 per bucket length; unsupported requests fail fast with
-    /// [`UnsupportedRequest`] rather than falling back. See [`crate::coreml`].
+    /// [`UnsupportedRequest`] rather than falling back.
     CoreML,
 }
 
@@ -157,7 +157,7 @@ pub struct Options {
     /// `None` (the default) takes the pooling from the checkpoint's
     /// `1_Pooling/config.json`, falling back to mean with a warning when the
     /// model publishes none. `Some(p)` forces `p`, warning if it disagrees
-    /// with what the checkpoint declares. See [`resolve_pooling`].
+    /// with what the checkpoint declares.
     pub pooling: Option<Pooling>,
     /// L2-normalize each embedding (unit length, so dot = cosine).
     pub normalize: bool,
