@@ -4,29 +4,64 @@
 
 ### Added
 
+- **`--device coreml` converts a checkpoint itself.** The Neural Engine backend
+  used to need a bundle someone had already converted (`--coreml-dir` or
+  `--coreml-model-id`). Given neither, `kohagi --device coreml` now converts the
+  same `--model-id` the CPU path would take, caches it, and loads it — no Python,
+  nothing to publish first. The first run reports each slow step and takes about
+  20 s to convert; later runs load from the cache in about 0.3 s. Caches live in
+  `~/Library/Caches/kohagi/coreml` (`$KOHAGI_COREML_CACHE` to relocate) and are
+  safe to delete.
+
+  `--coreml-buckets` sets the sequence lengths, `64,128,256,512` by default and
+  up to 4096; past that CoreML's compiler stops finishing in any usable time, so
+  it is refused rather than left to hang. The lengths share one copy of the
+  weights, so the set costs no disk, but each is a model to open — match it to
+  the lengths your texts actually are, because a bucket nothing lands in is pure
+  overhead. `--coreml-quantize {embeddings,all}` stores the weights as int8 —
+  264.8 MB to 212.3 MB, or to 132.6 MB for all of them. fp16 stays the default
+  because **a quantized bundle's vectors are not interchangeable with an fp16
+  one's**, so the two must not share an index; loading a quantized bundle says so.
+
+- **`coreml-export` feature: a CoreML converter in Rust.** Reads a ModernBERT
+  checkpoint's safetensors directly instead of going through
+  `scripts/convert_coreml.py` and its PyTorch install. For `cl-nagoya/ruri-v3-130m`
+  the output is bit-identical to the Python conversion, and it is verified against
+  ten ModernBERT checkpoints from 256 to 1024 wide. Every sequence length is one
+  CoreML function over a single copy of the weights, so three buckets come to
+  264.8 MB against 794 MB for separate packages.
+
+  ```console
+  cargo run --release --bin coreml-convert --features coreml-export -- \
+      --model-id cl-nagoya/ruri-v3-130m --out-dir ./coreml \
+      --sequence-lengths 64,128,256,512
+  ```
+
+  A checkpoint the converter cannot honour is refused before anything is written,
+  naming every reason at once. The emitter is also reachable as the
+  `kohagi::coreml_export` module.
+
+- **A converted model is checked against its own float32 output, once.** After
+  converting, Kohagi compares four probes on the ANE and the CPU and warns if they
+  differ by more than fp16 rounding explains. Some checkpoints are themselves
+  sensitive to fp16 — `nomic-ai/modernbert-embed-base` drifts by 7e-3 under this
+  converter and under coremltools alike — which no converter can know in advance.
+
 - **Compiled CoreML models are cached between runs.** `--device coreml` used to
-  compile every `.mlpackage` bucket into a throwaway temporary directory, so a
-  converted model that ships only the portable form paid ~20 s per bucket on
-  every run. The compile now lands in `~/Library/Caches/kohagi/coreml`
-  (`$KOHAGI_COREML_CACHE` to relocate it), keyed by the package's path and the
-  size and mtime of its contents, so only the first run pays — 8.1 s to 0.2 s on
-  an M2. A repository can therefore ship the `.mlpackage` alone instead of
-  doubling its size with a `compiled/` copy. Re-converting a model supersedes its
-  entry rather than adding one, so the cache holds at most one compile per bucket
-  per directory. The cache is not load-bearing: if it cannot be read or written,
-  or a cached bundle no longer loads after an OS update, Kohagi compiles as
+  compile every `.mlpackage` bucket into a temporary directory, paying ~20 s per
+  bucket on every run; now only the first run pays (8.1 s to 0.2 s on an M2). A
+  repository can therefore ship the `.mlpackage` alone instead of doubling its
+  size with a `compiled/` copy. If the cache cannot be used, Kohagi compiles as
   before.
-- **CoreML development jigs** under `tools/coreml-jigs`, for checking a converted
-  directory before publishing it: `coreml-inspect` (declared inputs, outputs and
-  converter provenance, read without compiling), `milblob` (validate, round-trip
-  and diff a `weight.bin`), `computeplan` (per-operation ANE placement, with a
-  recorded baseline to diff against), `mil-inventory` (operation inventory and
-  order, from either MIL form), `bucket-latency` and `parity`. They sit outside
-  the workspace and are not part of the published crate.
-- **Windows NVIDIA GPU support.** The new `cuda` feature and `--device cuda`
-  run Candle's CUDA backend on NVIDIA GPUs. Windows x64 release builds now
-  bundle that backend, and CI compiles both the default Windows build and the
-  CUDA release build. AMD and Intel GPUs remain unsupported.
+
+- **`hidden_activation: "silu"` is supported** on every device, which opens the
+  `ibm-granite/granite-embedding-*-r2` family. An activation Kohagi does not
+  implement is still an error rather than a silent fall back to gelu.
+
+- **Windows NVIDIA GPU support.** The new `cuda` feature and `--device cuda` run
+  Candle's CUDA backend on NVIDIA GPUs, and Windows x64 release builds bundle it.
+  AMD and Intel GPUs remain unsupported.
+
 - **Truncation visibility.** Text longer than `--max-seq-length` is truncated
   before embedding; that used to be silent. The stderr summary now always ends
   with `truncated=N`, and `--report-tokens` adds `n_tokens` and `truncated` to
@@ -35,125 +70,44 @@
   shape. New library method `Embedder::embed_with_tokens` returns the same
   vectors plus a `TokenInfo` per text.
 
-- **`coreml-export` feature.** Generates a CoreML `.mlpackage` for a
-  ModernBERT encoder from Rust, reading the checkpoint's safetensors directly
-  instead of going through `scripts/convert_coreml.py`. For `cl-nagoya/ruri-v3-130m`
-  at sequence length 128 the result is bit-identical to the Python conversion's
-  output, with the same 735 operations in the same order and the same Neural
-  Engine placement. The protobuf bindings are
-  committed under `src/coreml_proto/generated/`, so building Kohagi needs neither
-  `protoc` nor a build script. A `coreml-convert` binary drives it:
-
-  ```console
-  cargo run --release --bin coreml-convert --features coreml-export -- \
-      --model-id cl-nagoya/ruri-v3-130m --out-dir ./coreml \
-      --sequence-lengths 128,256,512
-  ```
-
-  Verified against ten ModernBERT checkpoints from 256 to 1024 wide; nine match
-  Kohagi's CPU path to fp16 rounding, and the tenth
-  (`nomic-ai/modernbert-embed-base`) diverges identically under the Python
-  conversion, so that one is the checkpoint's own fp16 sensitivity rather than a
-  converter difference. `--compiled` also emits `compiled/<name>.mlmodelc`, which
-  needs a build with `--features coreml,coreml-export`.
-
-  Every length is one CoreML function over a single copy of the weights, so the
-  three buckets come to 264.8 MB against 794 MB for the published per-length
-  packages. `required-features` keeps the binary out of the default build and the
-  release archives, though the macOS build enables the feature so that
-  `--device coreml` can convert for itself; the emitter is also reachable as the
-  `kohagi::coreml_export` module. `--quantize-embeddings` stores the embedding table as int8 with
-  a scale per row, dequantized inside the graph: 264.8 MB to 212.3 MB for
-  ruri-v3-130m, at 1.7e-5 cosine distance from the CPU path against 3.6e-6 for
-  fp16, and `--quantize-all` extends it to the projections for 132.6 MB at 1.6e-4.
-  A quantized bundle's vectors are not interchangeable with an fp16 one's, so the
-  model records which it is. Measured on JaCWIR (750 queries, 68,078 documents),
-  quantizing the embeddings costs nothing — MAP@10 0.8592 to 0.8599 and JQaRA
-  nDCG@10 0.7112 to 0.7122 — while quantizing everything costs 0.001 to 0.002 on
-  both for half the size.
-
-- **`--device coreml` converts a checkpoint itself.** The Neural Engine backend
-  used to need a bundle someone had already converted (`--coreml-dir` or
-  `--coreml-model-id`). Given neither, it now emits one from the same
-  `--model-id` the CPU path would take, caches it, and loads it — so
-  `kohagi --device coreml` works on any supported ModernBERT checkpoint with no
-  Python and nothing published. The first run reports each slow step
-  (download, convert, compile) and takes about 20 s to convert; later runs load
-  from the cache in about 0.3 s. `--coreml-buckets` sets the sequence lengths and
-  `--coreml-quantize {embeddings,all}` the quantization; fp16 stays the default
-  because a quantized bundle's vectors are not interchangeable with an fp16
-  one's. The cache key covers the checkpoint revision, the buckets, the
-  quantization and a graph version, and superseding only removes the entries a
-  new one replaces. macOS release binaries now include the converter.
-
-- **A converted model is checked against its own float32 output, once.** Right
-  after converting, Kohagi embeds four probes on both the ANE and the CPU and
-  warns if they differ by more than fp16 rounding explains. This catches what no
-  converter can know in advance: `nomic-ai/modernbert-embed-base` drifts by 7e-3
-  under this converter *and* under coremltools, because the checkpoint itself is
-  sensitive to fp16. Loading a quantized bundle also says so, since its vectors
-  cannot be mixed with an fp16 bundle's in one index.
-
-- **`examples/eval_retrieval.py` measures JaCWIR and JQaRA.** The retrieval
-  quality behind the quantization numbers is now reproducible from the
-  repository: it fetches the datasets, runs any Kohagi configuration passed after
-  `--`, and reports MAP@10/HIT@10 or nDCG@10.
-
-- **`hidden_activation: "silu"` is supported.** ModernBERT's MLP activates the
-  gate of a gated feed-forward, so this choice is what makes the block a GeGLU or
-  a SwiGLU. Both paths now read it from the config: Candle's `gelu_erf` or `silu`
-  on CPU, a second fused Metal kernel, and the `gelu` or `silu` MIL operation in
-  the CoreML emitter. That opens `ibm-granite/granite-embedding-*-r2`, the most
-  downloaded ModernBERT embedding family Kohagi previously refused. Verified at
-  every level: the emitted block matches an independent f32 reference on both
-  activations, the fused Metal kernel matches the split path to 2.4e-13, and
-  `granite-embedding-97m-multilingual-r2`'s CoreML bundle matches the CPU path to
-  1.0e-5 with 97.4% of operations on the Neural Engine. An activation Kohagi does
-  not implement is still an error rather than a silent fall back to gelu.
+- **`examples/eval_retrieval.py`** measures JaCWIR and JQaRA for any Kohagi
+  configuration, and **`tools/coreml-jigs`** inspects a converted directory
+  before publishing it (declared I/O and provenance, `weight.bin` validation,
+  per-operation Neural Engine placement, per-bucket latency, and output parity
+  between two configurations).
 
 ### Changed
 
 - **A `config.json` Kohagi cannot honour is refused rather than assumed.** An
   unknown `hidden_activation` fails the parse instead of silently running gelu,
   and a config carrying neither `rope_parameters` nor the flat RoPE thetas fails
-  instead of defaulting one. Both would otherwise produce plausible-looking
+  instead of defaulting one; both would otherwise produce plausible-looking
   vectors. The converter additionally requires `max_position_embeddings` and
-  `pad_token_id`, which it previously ignored — converting a checkpoint Kohagi
-  cannot then load is worse than failing at conversion — and rejects a config
-  with a duplicate key rather than taking the last value.
-
-- **Loading a quantized CoreML bundle says so.** Its vectors are close enough to
-  an fp16 bundle's to score the same on a retrieval benchmark but are not the
-  same vectors, so mixing them in one index degrades quietly.
+  `pad_token_id`, and rejects a config with a duplicate key rather than taking the
+  last value.
 
 ### Fixed
 
 - **transformers 5.x configs load again.** transformers 5.x writes the RoPE
   thetas into `rope_parameters` and stops writing `global_rope_theta` /
   `local_rope_theta`, which Kohagi's config reader required — so every ModernBERT
-  checkpoint saved with transformers 5.x (94 of the 690 surveyed on the Hub)
-  failed to load on any device. Both spellings are now read, and a config
-  carrying neither is an error rather than a silent default. Found by surveying
-  every ModernBERT config on the Hub against the converter
-  (`scripts/survey_modernbert.py`).
+  checkpoint saved with it (94 of the 690 published on the Hub, and growing)
+  failed to load on any device.
 
 - **CoreML output is read through its strides.** `--device coreml` copied the
   hidden states straight off `MLMultiArray`'s `dataPointer`, which is only correct
   when the array is densely packed. CoreML may pad an axis, and reading a padded
-  array that way interleaves values with padding. No shipped model was affected —
-  512 and 768 are already aligned — so this was silent and would have stayed
-  silent until a model whose hidden size is not. Found while checking a
-  Rust-generated model's output against a reference.
+  array that way builds the embedding partly out of padding. No shipped model was
+  affected — 512 and 768 are already aligned — so it would have stayed silent
+  until a model whose hidden size is not.
 
 - **A mismatched CoreML directory now fails at load instead of returning wrong
   vectors.** `--device coreml` took the embedding width from the directory's
-  `config.json` and the bucket lengths from the bundles' file names, without
-  checking either against the models. A `config.json` from a different
-  checkpoint would panic if its `hidden_size` was larger and silently return
-  garbage vectors if it was smaller, and a bundle named for the wrong length was
-  padded and pooled at that wrong length. Each bucket's input names, output name
-  and output shape `[1, seq, dim]` are now verified against the model's own
-  description before any input is read.
+  `config.json` and the bucket lengths from file names without checking either
+  against the models, so a `config.json` from a different checkpoint returned
+  vectors pooled over the wrong stride. Each bucket's input names, output name and
+  output shape are now verified against the model's own description before any
+  input is read.
 
 ## [0.4.0] - 2026-07-24
 

@@ -165,8 +165,10 @@ struct Args {
     /// Fixed sequence lengths to emit when `--device coreml` converts a
     /// checkpoint itself (that is, when neither --coreml-dir nor
     /// --coreml-model-id is given). Each becomes one CoreML function over a
-    /// single shared copy of the weights.
-    #[arg(long, value_delimiter = ',', default_values_t = [128usize, 256, 512])]
+    /// single shared copy of the weights, so the set costs no disk; what it
+    /// costs is one model to open per length. Match it to the lengths your
+    /// texts actually are — a bucket nothing lands in is pure overhead.
+    #[arg(long, value_delimiter = ',', default_values_t = [64usize, 128, 256, 512])]
     coreml_buckets: Vec<usize>,
     /// Quantize the model when `--device coreml` converts it. `embeddings`
     /// halves a large-vocabulary bundle at no measured retrieval cost;

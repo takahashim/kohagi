@@ -200,6 +200,44 @@ impl EncoderConfig {
         })
     }
 
+    /// The longest bucket this emitter will produce.
+    ///
+    /// The sliding-window condition is baked as a `seq * seq` bool constant, so the
+    /// specification grows with the square of the length: 167 KB at 128, 17 MB at
+    /// 4096, 67 MB at 8192. At 4096 CoreML compiles it in seconds; at 8192 its
+    /// compiler had not finished after ten minutes on an M2, with no error and no
+    /// way for a caller to tell a slow compile from a stuck one.
+    ///
+    /// Measured rather than derived, so this is the longest length shown to work
+    /// rather than the shortest shown to fail. Raising it means measuring the value
+    /// you want to raise it to.
+    pub const MAX_SEQUENCE_LENGTH: usize = 4096;
+
+    /// Refuse a bucket set this emitter cannot serve, before anything is written.
+    ///
+    /// Both callers check before opening the checkpoint, so a bad `--sequence-lengths`
+    /// costs a config read rather than 500MB of weights.
+    pub fn check_lengths(&self, lengths: &[usize]) -> Result<()> {
+        anyhow::ensure!(!lengths.is_empty(), "a bundle needs at least one length");
+        if let Some(&over) = lengths.iter().find(|&&s| s > self.max_positions) {
+            anyhow::bail!(
+                "sequence length {over} is past `max_position_embeddings` {}; the \
+                 checkpoint has no RoPE frequencies trained that far, and the model \
+                 would run and be wrong",
+                self.max_positions
+            );
+        }
+        if let Some(&over) = lengths.iter().find(|&&s| s > Self::MAX_SEQUENCE_LENGTH) {
+            anyhow::bail!(
+                "sequence length {over} is past the longest this emitter can produce \
+                 ({}); the window condition is a {over}x{over} constant, which CoreML's \
+                 compiler does not get through in any usable time",
+                Self::MAX_SEQUENCE_LENGTH
+            );
+        }
+        Ok(())
+    }
+
     fn block(&self, seq: usize, global: bool) -> Config {
         Config {
             hidden: self.hidden,
@@ -667,15 +705,7 @@ pub fn emit_with(
     provenance: &super::Provenance,
     opts: &Options,
 ) -> Result<(crate::coreml_proto::Model, Vec<u8>)> {
-    anyhow::ensure!(!lengths.is_empty(), "a bundle needs at least one length");
-    let max = cfg.max_positions;
-    if let Some(&over) = lengths.iter().find(|&&s| s > max) {
-        anyhow::bail!(
-            "sequence length {over} is past `max_position_embeddings` {max}; the \
-             checkpoint has no RoPE frequencies trained that far, and the model \
-             would run and be wrong"
-        );
-    }
+    cfg.check_lengths(lengths)?;
     let mut sorted = lengths.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
@@ -897,6 +927,35 @@ mod tests {
             );
             assert!(err.contains(expected), "{extra} -> {err}");
         }
+    }
+
+    #[test]
+    fn a_bucket_the_emitter_cannot_serve_is_refused() {
+        let cfg = EncoderConfig::from_json(&json("")).expect("supported");
+        assert_eq!(cfg.max_positions, 8192);
+
+        cfg.check_lengths(&[128, 256, EncoderConfig::MAX_SEQUENCE_LENGTH])
+            .expect("up to the emitter's limit");
+
+        // Past what CoreML's compiler gets through, but still inside the positions
+        // the checkpoint was trained for — so the two limits are separate reasons and
+        // each says which one it is.
+        let err = format!(
+            "{:#}",
+            cfg.check_lengths(&[EncoderConfig::MAX_SEQUENCE_LENGTH + 1])
+                .expect_err("past the emitter's limit")
+        );
+        assert!(err.contains("longest this emitter can produce"), "{err}");
+
+        let err = format!(
+            "{:#}",
+            cfg.check_lengths(&[8193])
+                .expect_err("past the trained positions")
+        );
+        assert!(err.contains("max_position_embeddings"), "{err}");
+
+        let err = format!("{:#}", cfg.check_lengths(&[]).expect_err("no lengths"));
+        assert!(err.contains("at least one length"), "{err}");
     }
 
     #[test]

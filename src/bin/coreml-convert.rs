@@ -6,7 +6,7 @@
 //! cargo run --release --bin coreml-convert --features coreml-export -- \
 //!     --model-id cl-nagoya/ruri-v3-130m \
 //!     --out-dir models/ruri-v3-130m-coreml \
-//!     --sequence-lengths 128,256,512
+//!     --sequence-lengths 64,128,256,512
 //! ```
 //!
 //! A separate binary rather than a `kohagi` subcommand: writing a bundle to a
@@ -67,10 +67,12 @@ struct Args {
 
     /// Fixed sequence lengths to serve, as CoreML functions in one bundle.
     ///
-    /// The largest is the ceiling on Kohagi's `--max-seq-length`. ANE latency is
-    /// not monotonic in length, so measure a candidate set with
+    /// The largest is the ceiling on Kohagi's `--max-seq-length`. The lengths
+    /// share one copy of the weights, so a longer list costs no disk — but each
+    /// is a model to open, so a bucket nothing lands in is pure overhead. ANE
+    /// latency is also not monotonic in length, so measure a candidate set with
     /// `tools/coreml-jigs`' `bucket-latency` rather than assuming.
-    #[arg(long, value_delimiter = ',', default_value = "128,256,512")]
+    #[arg(long, value_delimiter = ',', default_value = "64,128,256,512")]
     sequence_lengths: Vec<usize>,
 
     /// Store the embedding table as int8 instead of fp16, dequantized inside the

@@ -387,15 +387,9 @@ pub fn convert(
         .with_context(|| format!("reading {}", checkpoint.config.display()))?;
     let cfg = encoder::EncoderConfig::from_json(&text)?;
 
-    let max = cfg.max_positions;
-    if let Some(&over) = lengths.iter().find(|&&s| s > max) {
-        anyhow::bail!(
-            "sequence length {over} is past {}'s {max} trained positions; the \
-             checkpoint has no RoPE frequencies that far and the model would run \
-             and be wrong",
-            checkpoint.source
-        );
-    }
+    // Before opening 500MB of weights.
+    cfg.check_lengths(lengths)
+        .with_context(|| format!("converting {}", checkpoint.source))?;
 
     let weights = safetensors::Checkpoint::open(&checkpoint.weights)?;
     let provenance = Provenance {

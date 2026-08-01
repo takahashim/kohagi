@@ -205,10 +205,9 @@ though peak RSS does drop.
 
 ### `--device coreml` on the Apple Neural Engine
 
-Build with `--features coreml` to enable the Core ML backend for the Apple
-Neural Engine (ANE). On an M2, it is about 4× faster than Metal at 512
-tokens, with cosine similarity of approximately 0.99999 against the CPU
-output. For short inputs, the multicore CPU backend may still be faster.
+Build with `--features coreml`. On an M2 it is about 4× faster than Metal at 512
+tokens, with cosine similarity of approximately 0.99999 against the CPU output.
+For short inputs the multicore CPU backend may still be faster.
 
 The ANE needs fixed input shapes, so it runs a converted model rather than the
 safetensors the other devices read. A release build converts one for itself:
@@ -218,91 +217,61 @@ kohagi --device coreml < texts.jsonl
 kohagi --device coreml --model-id answerdotai/ModernBERT-large < texts.jsonl
 ```
 
-The first run downloads the checkpoint if it is not already cached, converts it
-(about 20 seconds), and compiles it for the Neural Engine; later runs load the
-cached bundle in about 0.3 s. Both caches live under
-`~/Library/Caches/kohagi/coreml`, or `$KOHAGI_COREML_CACHE`, and are safe to
-delete. `--coreml-buckets` chooses the sequence lengths (default
-`128,256,512`; the largest caps `--max-seq-length`), and `--coreml-quantize
-embeddings` roughly halves a large-vocabulary bundle at no measured retrieval
-cost — though a quantized bundle's vectors are not interchangeable with an fp16
-one's, which is why it is not the default.
+The first run downloads the checkpoint, converts it (~20 s) and compiles it;
+later runs load in about 0.3 s from `~/Library/Caches/kohagi/coreml`
+(`$KOHAGI_COREML_CACHE` to relocate), which is safe to delete. A checkpoint the
+converter cannot honour is refused before anything is written, naming every
+reason at once.
 
-This works for ModernBERT checkpoints Kohagi's converter supports; one it does
-not is refused before anything is written, naming every reason at once. Of the
-690 ModernBERT configs published on the Hub with at least 50 downloads, 670 are
-accepted; [`scripts/survey_modernbert.py`](scripts/survey_modernbert.py) is what
-measures that.
+`--coreml-buckets` sets the sequence lengths (default `64,128,256,512`; the
+largest caps `--max-seq-length`, and 4096 is the longest the converter will
+produce).
+`--coreml-quantize embeddings` roughly halves a large-vocabulary bundle at no
+measured retrieval cost, but a quantized bundle's vectors are not interchangeable
+with an fp16 one's, so the two must not share an index — which is why it is not
+the default.
 
-#### Converting ahead of time
-
-Two converters can also write a bundle to a directory.
-[`src/bin/coreml-convert.rs`](src/bin/coreml-convert.rs) is the same pure-Rust
-emitter the automatic path uses, behind the `coreml-export` feature;
-[`scripts/convert_coreml.py`](scripts/convert_coreml.py) goes through PyTorch and
-`coremltools`, and every model published for Kohagi so far was made with it. For
-`cl-nagoya/ruri-v3-130m` the two produce bit-identical output with the same
-Neural Engine placement.
+To convert ahead of time instead, into a directory to publish or share:
 
 ```bash
 cargo run --release --bin coreml-convert --features coreml-export -- \
     --model-id cl-nagoya/ruri-v3-130m --out-dir models/ruri-v3-130m-coreml \
-    --sequence-lengths 128,256,512
+    --sequence-lengths 64,128,256,512
 
 kohagi --device coreml --coreml-dir models/ruri-v3-130m-coreml < texts.jsonl
-```
-
-Or with the Python converter:
-
-```bash
-python scripts/convert_coreml.py --model-id cl-nagoya/ruri-v3-130m \
-    --out-dir models/ruri-v3-130m-coreml \
-    --buckets 64 128 192 256 512 --multi-function --compiled
-
-kohagi --device coreml --coreml-dir models/ruri-v3-130m-coreml < texts.jsonl
-```
-
-`--multi-function` puts every bucket length in one bundle as its own Core ML
-function, sharing a single copy of the weights instead of repeating them per
-length. On `bekko-embedding-v1-a25m` that is 237MB for five buckets against
-235MB *each* without it, output bit-identical and latency unchanged — which
-also makes a finer bucket set affordable, worth ~10% on a corpus whose lengths
-cluster below 192 tokens. `--compiled` doubles the directory but halves nothing
-a user downloads, since Kohagi fetches one form per bucket; without it, every
-load compiles the `.mlpackage` afresh. The largest bucket caps
-`--max-seq-length`, so keep 512 in the set unless you know your inputs are
-shorter.
-
-Or load the same directory layout from Hugging Face Hub:
-
-```bash
 kohagi --device coreml --coreml-model-id takahashim/ruri-v3-130m-coreml < texts.jsonl
 ```
 
-Measured against PyTorch on the same machine — M2, `ruri-v3-130m`, median of
-three runs, from `examples/benchmark.py --device mps --coreml-model-id
-takahashim/ruri-v3-130m-coreml`:
+The lengths share one copy of the weights, so the set costs no disk — four
+buckets are the same 260 MB as three. What it costs is one model to open per
+length: going from `128,256,512` to the default's `64,128,256,512` took load
+from 0.48 s to 0.56 s, and paid for itself after about a hundred short texts by
+cutting the per-text cost from 4.3 ms to 3.5 ms. **Match the set to the lengths
+your texts actually are.** A bucket nothing lands in is pure overhead — adding
+192 to the default, on a corpus where every text is under 32 tokens, cost 0.25 s
+of load and bought nothing. [`scripts/convert_coreml.py`](scripts/convert_coreml.py)
+does the same conversion through PyTorch and `coremltools`, bit-identical for
+`cl-nagoya/ruri-v3-130m`; every model published for Kohagi so far was made with it.
 
-| Input                   | kohagi (CPU) | kohagi (`--device coreml`) | torch (MPS) |
-| ----------------------- | -----------: | -------------------------: | ----------: |
-| 1200 short (~36 tokens) |       9.9 s  |                 **5.6 s**  |      4.4 s  |
-| 240 long (512 tokens)   |      37.0 s  |                 **6.5 s**  |     19.3 s  |
+Measured against PyTorch on the same machine — M2, `ruri-v3-130m`, the default
+buckets, median of three runs, from `examples/benchmark.py`:
 
-Those are encode times, with startup and model load excluded. At 512 tokens the
-ANE is 3.0× torch/MPS and 5.7× Kohagi's own CPU path. On the short inputs
-torch/MPS computes *faster* than the ANE, which pads every row to the 128-token
-bucket while torch pads only to its batch's longest row.
+| Input                   |    kohagi (CPU) | kohagi (`--device coreml`) |    torch (MPS) |
+| ----------------------- | --------------: | -------------------------: | -------------: |
+| 1200 short (~30 tokens) |  7.1 s / 7.4 s  |       **4.0 s / 4.7 s**    | 4.3 s / 13.7 s |
+| 240 long (512 tokens)   | 30.8 s / 31.5 s |       **5.9 s / 6.6 s**    | 15.2 s / 24.9 s|
 
-Startup swings it back the other way. Torch spends about 12 s importing and
-loading per process against Kohagi's 0.6 s, so on the totals a rake task or a
-per-batch subprocess actually pays, `--device coreml` comes out 2.8× (short) and
-4.4× (long) ahead. Those 0.6 s assume the buckets are already compiled. A converted directory can
-ship compiled `seq-<N>.mlmodelc` bundles, as `--compiled` emits and the repo
-above contains, in which case they are loaded directly. Otherwise Kohagi compiles
-each `.mlpackage` on first use — ~20 s per bucket — and caches the result under
-`~/Library/Caches/kohagi/coreml` (or `$KOHAGI_COREML_CACHE`), so only the first
-run pays it. Shipping `compiled/` doubles a repository's size to move that cost
-off the first run as well.
+Encode / total, where total adds startup and model load. At 512 tokens the ANE
+encodes 2.6× faster than torch/MPS and 5.2× faster than Kohagi's own CPU path.
+On short inputs the two are within noise of each other on encode, because what
+the ANE gains per token it gives back padding each row to its bucket. The totals
+go the other way throughout: torch spends 9–10 s importing and loading per
+process against Kohagi's under a second, so a rake task or a per-batch
+subprocess sees 2.9× (short) and 3.8× (long).
+
+These moved by a factor of two between runs on the same machine while other work
+was going on, so treat them as an order of magnitude rather than a ranking, and
+compare against a run of your own.
 
 ### `--precision bf16` on AVX512-BF16 CPUs
 
