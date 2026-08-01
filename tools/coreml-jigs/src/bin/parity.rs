@@ -5,7 +5,7 @@
 //!            --a "" \
 //!            --b "--device coreml --coreml-model-id takahashim/ruri-v3-130m-coreml"
 //!
-//! Unlike `examples/parity_check.py`, which checks Kohagi against the PyTorch
+//! Unlike `tools/parity_check.py`, which checks Kohagi against the PyTorch
 //! reference, this compares Kohagi against itself on two devices. The CoreML
 //! path should match the CPU path to fp16 rounding, and `1 - cosine` above about
 //! `1e-5` means something other than precision changed.

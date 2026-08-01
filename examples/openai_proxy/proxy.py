@@ -1,36 +1,13 @@
 """An OpenAI-compatible /v1/embeddings endpoint in front of Kohagi.
 
-    python3 examples/openai_proxy.py --kohagi ./target/release/kohagi
-
-Then point any OpenAI client at it and nothing else in your code changes:
+    python3 examples/openai_proxy/proxy.py --kohagi ./target/release/kohagi
 
     from openai import OpenAI
     client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
-    r = client.embeddings.create(model="ruri-v3-130m", input=["…", "…"])
+    client.embeddings.create(model="ruri-v3-130m", input=["…", "…"])
 
-That `base_url` swap is the point. Kohagi has no HTTP mode — it speaks JSONL
-over a pipe, which is a smaller contract and works from any language that can
-spawn a process. This file is the bridge, so declining to build a server into
-Kohagi does not cost anyone the OpenAI ecosystem.
-
-## How it works
-
-One long-lived Kohagi, so the model is loaded once. Each request writes its
-records, then a blank line — Kohagi's "that is one batch" signal — and reads
-back exactly one line, which with `--format openai` is that batch's complete
-response. There is no envelope to assemble here and no counting of records: the
-blank line is what makes a batch a request. Serving a request costs about 0.03 s
-warm, against 0.3 s if the process were spawned each time.
-
-## Before swapping a production base_url
-
-- **Dimensions differ.** `ruri-v3-130m` returns 512 where `text-embedding-3-small`
-  returns 1536, so an existing index has to be rebuilt. The compatibility is in
-  the protocol, not in the vectors.
-- **`model` in the request is ignored.** Which checkpoint runs is decided by the
-  flags this proxy passes to Kohagi. The response says which one actually ran.
-
-Standard library only.
+See README.md in this directory for what this is for, how it works, and what to
+know before pointing production at it. Standard library only.
 """
 
 import argparse

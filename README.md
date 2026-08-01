@@ -89,7 +89,7 @@ kohagi --model-id nomic-ai/modernbert-embed-base \
 
 `cl-nagoya/ruri-v3-310m`, which produces 768-dimensional vectors, works in the
 same way. To check whether a given model produces usable embeddings under
-Kohagi, run [`examples/model_check.py`](examples/model_check.py) against it.
+Kohagi, run [`tools/model_check.py`](tools/model_check.py) against it.
 
 Pooling is taken from the model. Kohagi reads the checkpoint's
 `1_Pooling/config.json` and uses the mode it declares, so a CLS-pooled model
@@ -140,11 +140,11 @@ See [PROTOCOL.md](PROTOCOL.md) for the exit-code semantics.
 If the calling code is already written against OpenAI's `/v1/embeddings`, the
 value of that compatibility is swapping `base_url` and changing nothing else.
 Kohagi has no HTTP mode, so the examples supply one — the same ~150-line proxy in
-[Python](examples/openai_proxy.py), [Ruby](examples/openai_proxy.rb) and
-[TypeScript](examples/openai_proxy.ts):
+[Python](examples/openai_proxy/proxy.py), [Ruby](examples/openai_proxy/proxy.rb) and
+[TypeScript](examples/openai_proxy/proxy.ts):
 
 ```bash
-python3 examples/openai_proxy.py --kohagi ./target/release/kohagi
+python3 examples/openai_proxy/proxy.py --kohagi ./target/release/kohagi
 ```
 
 ```python
@@ -212,7 +212,7 @@ The CLI is built on the same API, and its `main.rs` is ~100 lines.
 * `--max-seq-length` has the largest effect on throughput because attention cost grows quadratically with sequence length.
 
 Throughput is worth measuring on your own machine and texts rather than taking
-numbers on faith. [`examples/benchmark.py`](examples/benchmark.py) times Kohagi against
+numbers on faith. [`tools/benchmark.py`](tools/benchmark.py) times Kohagi against
 Sentence Transformers on the same corpus and settings; see
 [`examples/README.md`](examples/README.md) for measured results on Apple Silicon.
 
@@ -279,7 +279,7 @@ does the same conversion through PyTorch and `coremltools`, bit-identical for
 `cl-nagoya/ruri-v3-130m`; every model published for Kohagi so far was made with it.
 
 Measured against PyTorch on the same machine — M2, `ruri-v3-130m`, the default
-buckets, median of three runs, from `examples/benchmark.py`:
+buckets, median of three runs, from `tools/benchmark.py`:
 
 | Input                   |    kohagi (CPU) | kohagi (`--device coreml`) |    torch (MPS) |
 | ----------------------- | --------------: | -------------------------: | -------------: |
@@ -304,7 +304,7 @@ On Zen 4 (Sapphire Rapids) and newer CPUs, `--precision bf16` uses `bf16` for pr
 
 Measured on a Ryzen 7 8745H (Zen 4, 8 cores) running Linux, `ruri-v3-130m`,
 median of five runs alternating between the two precisions
-(`examples/benchmark.py --precision bf16 --skip-torch` produces the times;
+(`tools/benchmark.py --precision bf16 --skip-torch` produces the times;
 peak RSS is from `/usr/bin/time -v`). Times are totals, including startup and
 model load. The f32 column drifts a few percent between sessions, so read the
 ratios rather than the seconds.
@@ -337,7 +337,7 @@ Unsupported CPUs, including Apple Silicon, reject `--precision bf16` at startup 
 Kohagi's f32 output matches the Sentence Transformers and PyTorch reference implementation to within f32 rounding error.
 On 512-token inputs, `1 - cosine ≈ 3e-12`.
 
-You can verify this on your own texts using [`examples/parity_check.py`](examples/parity_check.py).
+You can verify this on your own texts using [`tools/parity_check.py`](tools/parity_check.py).
 See [`examples/README.md`](examples/README.md) for the measured results and the three settings that must match for the comparison to be meaningful.
 
 ## The name

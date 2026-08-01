@@ -1,8 +1,8 @@
 [workspace]
-# `tools/` holds macOS-only development jigs for the CoreML backend. Excluded
-# rather than made a member so their dependencies stay out of Kohagi's
-# Cargo.lock; build them with
-# `cargo build --manifest-path tools/coreml-jigs/Cargo.toml`.
+# `tools/` holds what measures and verifies Kohagi rather than what ships: the
+# Python check scripts, and the macOS-only CoreML jigs. Excluded rather than made
+# a member so the jigs' dependencies stay out of Kohagi's Cargo.lock; build them
+# with `cargo build --manifest-path tools/coreml-jigs/Cargo.toml`.
 exclude = ["tools"]
 
 [package]

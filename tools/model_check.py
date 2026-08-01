@@ -6,7 +6,7 @@ script points Kohagi at one and checks that the embeddings are actually usable,
 not merely that the process exited 0 — a retrieval model always returns
 plausible floats, so "it ran" proves nothing.
 
-    python examples/model_check.py --kohagi ./target/release/kohagi \
+    python tools/model_check.py --kohagi ./target/release/kohagi \
         Alibaba-NLP/gte-modernbert-base
 
 What it checks:

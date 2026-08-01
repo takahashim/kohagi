@@ -1,6 +1,6 @@
 """Time Kohagi against the sentence-transformers / PyTorch reference.
 
-    python examples/benchmark.py --kohagi ./target/release/kohagi
+    python tools/benchmark.py --kohagi ./target/release/kohagi
 
 Both sides are pinned to Kohagi's defaults — mean pooling, L2 normalize,
 max_seq_length 512, batch size 64 — because a throughput comparison between

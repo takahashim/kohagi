@@ -70,7 +70,7 @@
   shape. New library method `Embedder::embed_with_tokens` returns the same
   vectors plus a `TokenInfo` per text.
 
-- **`examples/eval_retrieval.py`** measures JaCWIR and JQaRA for any Kohagi
+- **`tools/eval_retrieval.py`** measures JaCWIR and JQaRA for any Kohagi
   configuration, and **`tools/coreml-jigs`** inspects a converted directory
   before publishing it (declared I/O and provenance, `weight.bin` validation,
   per-operation Neural Engine placement, per-bucket latency, and output parity
@@ -149,7 +149,7 @@
   under HF's `norm_eps` spelling as well as `layer_norm_eps` (ruri ships both),
   and a config carrying neither falls back to the default rather than failing to
   load. Lets more ModernBERT checkpoints run unchanged.
-- `examples/model_check.py` — smoke-test Kohagi against any ModernBERT sentence
+- `tools/model_check.py` — smoke-test Kohagi against any ModernBERT sentence
   encoder on the Hub, checking retrieval and paraphrase structure rather than
   just that the process exited 0.
 

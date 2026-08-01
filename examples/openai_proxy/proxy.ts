@@ -1,37 +1,15 @@
 /**
  * An OpenAI-compatible /v1/embeddings endpoint in front of kohagi.
  *
- *     node --experimental-strip-types examples/openai_proxy.ts --kohagi ./target/release/kohagi
- *     deno run -A examples/openai_proxy.ts --kohagi ./target/release/kohagi
- *     bun examples/openai_proxy.ts --kohagi ./target/release/kohagi
- *
- * Then point any OpenAI client at it and nothing else in your code changes:
+ *     node --experimental-strip-types examples/openai_proxy/proxy.ts --kohagi ./target/release/kohagi
+ *     deno run -A examples/openai_proxy/proxy.ts --kohagi ./target/release/kohagi
+ *     bun examples/openai_proxy/proxy.ts --kohagi ./target/release/kohagi
  *
  *     const client = new OpenAI({ baseURL: "http://127.0.0.1:8080/v1", apiKey: "unused" });
- *     const r = await client.embeddings.create({ model: "ruri-v3-130m", input: ["…", "…"] });
+ *     await client.embeddings.create({ model: "ruri-v3-130m", input: ["…", "…"] });
  *
- * That baseURL swap is the point. kohagi has no HTTP mode — it speaks JSONL
- * over a pipe, which is a smaller contract and works from any language that can
- * spawn a process. This file is the bridge.
- *
- * ## How it works
- *
- * One long-lived kohagi, so the model is loaded once. Each request writes its
- * records, then a blank line — kohagi's "that is one batch" signal — and reads
- * back exactly one line, which with `--format openai` is that batch's complete
- * response. There is no envelope to assemble here and no counting of records:
- * the blank line is what makes a batch a request. Serving a request costs about
- * 0.03 s warm, against 0.3 s if the process were spawned each time.
- *
- * ## Before swapping a production baseURL
- *
- * - Dimensions differ. ruri-v3-130m returns 512 where text-embedding-3-small
- *   returns 1536, so an existing index has to be rebuilt. The compatibility is
- *   in the protocol, not in the vectors.
- * - `model` in the request is ignored. Which checkpoint runs is decided by the
- *   flags this proxy passes to kohagi. The response says which one actually ran.
- *
- * No dependencies; `node:http` and `node:child_process` only.
+ * See README.md in this directory for what this is for, how it works, and what
+ * to know before pointing production at it. No dependencies.
  */
 
 import { spawn } from "node:child_process";

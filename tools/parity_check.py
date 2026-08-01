@@ -4,7 +4,7 @@ Kohagi's claim is that its f32 output *is* the reference output, to f32
 rounding. This script verifies that on your own machine and texts.
 
     pip install sentence-transformers
-    python examples/parity_check.py --kohagi ./target/release/kohagi
+    python tools/parity_check.py --kohagi ./target/release/kohagi
 
 Both sides must be configured identically or the comparison is meaningless.
 The three settings that actually bite:

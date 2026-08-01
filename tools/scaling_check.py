@@ -1,7 +1,7 @@
 """Measure how Kohagi's CPU throughput scales with worker threads.
 
     cargo build --release
-    python examples/scaling_check.py --kohagi ./target/release/kohagi
+    python tools/scaling_check.py --kohagi ./target/release/kohagi
 
 Kohagi fans length-bucketed batches across a rayon pool sized to physical
 cores. On an 8-core M2 that measured only ~2x over serial, which is either a

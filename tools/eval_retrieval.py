@@ -7,12 +7,12 @@ change to the encoder, the converter or the quantization can be checked against
 the same metric rather than against a remembered figure.
 
     # the float32 CPU reference, which reproduces the recorded baselines
-    python3 examples/eval_retrieval.py --benchmark jacwir -- --device cpu
-    python3 examples/eval_retrieval.py --benchmark jqara  -- --device cpu
+    python3 tools/eval_retrieval.py --benchmark jacwir -- --device cpu
+    python3 tools/eval_retrieval.py --benchmark jqara  -- --device cpu
 
     # anything else, compared against it
-    python3 examples/eval_retrieval.py --benchmark jacwir -- --device coreml
-    python3 examples/eval_retrieval.py --benchmark jacwir -- \\
+    python3 tools/eval_retrieval.py --benchmark jacwir -- --device coreml
+    python3 tools/eval_retrieval.py --benchmark jacwir -- \\
         --device coreml --coreml-quantize embeddings
 
 Everything after `--` is passed to Kohagi verbatim, so any device, model or

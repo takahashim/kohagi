@@ -1,35 +1,13 @@
 # An OpenAI-compatible /v1/embeddings endpoint in front of kohagi.
 #
-#     ruby examples/openai_proxy.rb --kohagi ./target/release/kohagi
-#
-# Then point any OpenAI client at it and nothing else in your code changes:
+#     ruby examples/openai_proxy/proxy.rb --kohagi ./target/release/kohagi
 #
 #     client = OpenAI::Client.new(uri_base: "http://127.0.0.1:8080", access_token: "unused")
 #     client.embeddings(parameters: { model: "ruri-v3-130m", input: ["…", "…"] })
 #
-# That base URL swap is the point. kohagi has no HTTP mode — it speaks JSONL
-# over a pipe, which is a smaller contract and works from any language that can
-# spawn a process. This file is the bridge.
-#
-# ## How it works
-#
-# One long-lived kohagi, so the model is loaded once. Each request writes its
-# records, then a blank line — kohagi's "that is one batch" signal — and reads
-# back exactly one line, which with `--format openai` is that batch's complete
-# response. There is no envelope to assemble here and no counting of records:
-# the blank line is what makes a batch a request. Serving a request costs about
-# 0.03 s warm, against 0.3 s if the process were spawned each time.
-#
-# ## Before swapping a production base URL
-#
-# - Dimensions differ. ruri-v3-130m returns 512 where text-embedding-3-small
-#   returns 1536, so an existing index has to be rebuilt. The compatibility is
-#   in the protocol, not in the vectors.
-# - `model` in the request is ignored. Which checkpoint runs is decided by the
-#   flags this proxy passes to kohagi. The response says which one actually ran.
-#
-# Standard library only (webrick is a bundled gem on Ruby 3; `gem install
-# webrick` if require fails).
+# See README.md in this directory for what this is for, how it works, and what
+# to know before pointing production at it. Standard library only (webrick is a
+# bundled gem on Ruby 3; `gem install webrick` if require fails).
 
 require "json"
 require "open3"

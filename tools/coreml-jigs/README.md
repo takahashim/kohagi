@@ -186,7 +186,7 @@ parity --kohagi ./target/release/kohagi --texts texts.txt \
        --b "--device coreml --coreml-dir <dir>"
 ```
 
-`examples/parity_check.py` は PyTorch 参照との一致を見るもので、こちらは kohagi 同士をデバイス違いで比較する。
+`tools/parity_check.py` は PyTorch 参照との一致を見るもので、こちらは kohagi 同士をデバイス違いで比較する。
 CoreML パスは CPU パスと fp16 の丸め分だけ違うはずで、`1 - cosine` が `1e-5` を大きく超えるなら精度以外の何かが変わっている。
 
 比較を無意味にする設定は `--a` / `--b` ではなく **`--common`** に入れる。
