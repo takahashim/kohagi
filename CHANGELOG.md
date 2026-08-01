@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] - 2026-08-01
 
 ### Added
 
@@ -35,7 +35,7 @@
   shape. New library method `Embedder::embed_with_tokens` returns the same
   vectors plus a `TokenInfo` per text.
 
-- **`coreml-export` feature (in progress).** Generates a CoreML `.mlpackage` for a
+- **`coreml-export` feature.** Generates a CoreML `.mlpackage` for a
   ModernBERT encoder from Rust, reading the checkpoint's safetensors directly
   instead of going through `scripts/convert_coreml.py`. For `cl-nagoya/ruri-v3-130m`
   at sequence length 128 the result is bit-identical to the Python conversion's
@@ -60,7 +60,9 @@
   Every length is one CoreML function over a single copy of the weights, so the
   three buckets come to 264.8 MB against 794 MB for the published per-length
   packages. `required-features` keeps the binary out of the default build and the
-  release archives. `--quantize-embeddings` stores the embedding table as int8 with
+  release archives, though the macOS build enables the feature so that
+  `--device coreml` can convert for itself; the emitter is also reachable as the
+  `kohagi::coreml_export` module. `--quantize-embeddings` stores the embedding table as int8 with
   a scale per row, dequantized inside the graph: 264.8 MB to 212.3 MB for
   ruri-v3-130m, at 1.7e-5 cosine distance from the CPU path against 3.6e-6 for
   fp16, and `--quantize-all` extends it to the projections for 132.6 MB at 1.6e-4.
@@ -69,8 +71,6 @@
   quantizing the embeddings costs nothing — MAP@10 0.8592 to 0.8599 and JQaRA
   nDCG@10 0.7112 to 0.7122 — while quantizing everything costs 0.001 to 0.002 on
   both for half the size.
-
-### Fixed
 
 - **`--device coreml` converts a checkpoint itself.** The Neural Engine backend
   used to need a bundle someone had already converted (`--coreml-dir` or
@@ -110,6 +110,23 @@
   `granite-embedding-97m-multilingual-r2`'s CoreML bundle matches the CPU path to
   1.0e-5 with 97.4% of operations on the Neural Engine. An activation Kohagi does
   not implement is still an error rather than a silent fall back to gelu.
+
+### Changed
+
+- **A `config.json` Kohagi cannot honour is refused rather than assumed.** An
+  unknown `hidden_activation` fails the parse instead of silently running gelu,
+  and a config carrying neither `rope_parameters` nor the flat RoPE thetas fails
+  instead of defaulting one. Both would otherwise produce plausible-looking
+  vectors. The converter additionally requires `max_position_embeddings` and
+  `pad_token_id`, which it previously ignored — converting a checkpoint Kohagi
+  cannot then load is worse than failing at conversion — and rejects a config
+  with a duplicate key rather than taking the last value.
+
+- **Loading a quantized CoreML bundle says so.** Its vectors are close enough to
+  an fp16 bundle's to score the same on a retrieval benchmark but are not the
+  same vectors, so mixing them in one index degrades quietly.
+
+### Fixed
 
 - **transformers 5.x configs load again.** transformers 5.x writes the RoPE
   thetas into `rope_parameters` and stops writing `global_rope_theta` /
@@ -227,6 +244,7 @@
 - Hardened CI: `cargo fmt` / `--locked` checks, per-target release builds, and a
   Metal lint.
 
+[0.5.0]: https://github.com/takahashim/kohagi/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/takahashim/kohagi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/takahashim/kohagi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/takahashim/kohagi/compare/v0.1.0...v0.2.0
