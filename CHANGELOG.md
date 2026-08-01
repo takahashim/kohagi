@@ -76,6 +76,15 @@
   per-operation Neural Engine placement, per-bucket latency, and output parity
   between two configurations).
 
+- **`--format openai`** writes one OpenAI `/v1/embeddings` response object for
+  the whole run instead of the JSONL stream, so code already written against
+  that API can read Kohagi's output unchanged. Embeddings are identified by
+  `index` (the input position) rather than by id, because that is what the API
+  means; `usage.prompt_tokens` carries the token total. The document is written
+  in pieces rather than buffered, so memory stays flat — but an aborted run
+  leaves it incomplete, where JSONL would have left a shorter valid file. The
+  default is unchanged.
+
 ### Changed
 
 - **A `config.json` Kohagi cannot honour is refused rather than assumed.** An

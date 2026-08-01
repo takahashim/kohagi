@@ -56,6 +56,116 @@ pub fn write_record(
     Ok(())
 }
 
+/// The shape stdout takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Format {
+    /// One `{"id", "embedding"}` object per line — PROTOCOL.md.
+    #[default]
+    Jsonl,
+    /// One OpenAI `/v1/embeddings` response object for the whole run, so that
+    /// code written against that API can read Kohagi's output unchanged.
+    OpenAi,
+}
+
+/// One item of an OpenAI response's `data` array.
+///
+/// `index` is the position among the records that were embedded, which is what
+/// the API means by it. Input ids have no place in this shape: a caller that
+/// needs them wants [`Format::Jsonl`].
+#[derive(Serialize)]
+struct OpenAiItem<'a> {
+    object: &'static str,
+    index: usize,
+    embedding: &'a [f32],
+}
+
+/// Writes records in whichever [`Format`] was asked for.
+///
+/// The OpenAI shape is a single object holding every embedding, which would
+/// ordinarily mean buffering the whole run. It does not here: the envelope is
+/// written in pieces — head, then one item per record, then `model` and `usage`
+/// — so resident memory stays one chunk's worth either way. The cost is that an
+/// aborted run leaves an incomplete JSON document, where JSONL would have left
+/// a shorter but valid one.
+pub struct Writer<W: Write> {
+    out: W,
+    format: Format,
+    model: String,
+    report_tokens: bool,
+    written: usize,
+    prompt_tokens: usize,
+}
+
+impl<W: Write> Writer<W> {
+    pub fn new(out: W, format: Format, model: &str, report_tokens: bool) -> Self {
+        Self {
+            out,
+            format,
+            model: model.to_string(),
+            report_tokens,
+            written: 0,
+            prompt_tokens: 0,
+        }
+    }
+
+    /// Write one embedding. `tokens` is always supplied — the OpenAI shape needs
+    /// the count for `usage` whether or not `--report-tokens` asked to see it.
+    pub fn record(&mut self, id: &Value, embedding: &[f32], tokens: &TokenInfo) -> Result<()> {
+        self.prompt_tokens += tokens.n_tokens;
+        match self.format {
+            Format::Jsonl => {
+                write_record(
+                    &mut self.out,
+                    id,
+                    embedding,
+                    self.report_tokens.then_some(tokens),
+                )?;
+            }
+            Format::OpenAi => {
+                self.out.write_all(if self.written == 0 {
+                    b"{\"object\":\"list\",\"data\":["
+                } else {
+                    b","
+                })?;
+                serde_json::to_writer(
+                    &mut self.out,
+                    &OpenAiItem {
+                        object: "embedding",
+                        index: self.written,
+                        embedding,
+                    },
+                )?;
+            }
+        }
+        self.written += 1;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.out.flush()?;
+        Ok(())
+    }
+
+    /// Close the document. For JSONL there is nothing to close; for OpenAI this
+    /// is where `model` and `usage` go, since the token total is only known now.
+    pub fn finish(mut self) -> Result<()> {
+        if self.format == Format::OpenAi {
+            if self.written == 0 {
+                self.out.write_all(b"{\"object\":\"list\",\"data\":[")?;
+            }
+            self.out.write_all(b"],\"model\":")?;
+            serde_json::to_writer(&mut self.out, &self.model)?;
+            writeln!(
+                self.out,
+                ",\"usage\":{{\"prompt_tokens\":{n},\"total_tokens\":{n}}}}}",
+                n = self.prompt_tokens
+            )?;
+        }
+        self.out.flush()?;
+        Ok(())
+    }
+}
+
 /// One accepted input line: the opaque id and the raw text.
 struct InRecord {
     id: Value,
@@ -101,9 +211,8 @@ fn flush_chunk(
     embedder: &mut Option<Embedder>,
     load: &impl Fn() -> Result<Embedder>,
     prefix: &str,
-    report_tokens: bool,
     chunk: &mut Vec<InRecord>,
-    out: &mut impl Write,
+    out: &mut Writer<impl Write>,
 ) -> Result<Flushed> {
     if chunk.is_empty() {
         return Ok(Flushed {
@@ -126,7 +235,7 @@ fn flush_chunk(
     let mut truncated = 0usize;
     for ((record, vector), info) in chunk.iter().zip(&vectors).zip(&tokens) {
         truncated += info.truncated as usize;
-        write_record(out, &record.id, vector, report_tokens.then_some(info))?;
+        out.record(&record.id, vector, info)?;
     }
     // Flush per chunk so the caller can consume output as it is produced.
     out.flush()?;
@@ -144,10 +253,16 @@ pub fn run(
     prefix: &str,
     report_tokens: bool,
     model_label: &str,
+    format: Format,
 ) -> Result<usize> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
+    let mut out = Writer::new(
+        BufWriter::new(stdout.lock()),
+        format,
+        model_label,
+        report_tokens,
+    );
 
     let mut embedder: Option<Embedder> = None;
     let mut chunk: Vec<InRecord> = Vec::new();
@@ -161,14 +276,7 @@ pub fn run(
             Ok(Some(record)) => {
                 chunk.push(record);
                 if chunk.len() >= CHUNK_ROWS {
-                    let f = flush_chunk(
-                        &mut embedder,
-                        &load,
-                        prefix,
-                        report_tokens,
-                        &mut chunk,
-                        &mut out,
-                    )?;
+                    let f = flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
                     n_out += f.written;
                     truncated += f.truncated;
                 }
@@ -180,14 +288,8 @@ pub fn run(
             }
         }
     }
-    let f = flush_chunk(
-        &mut embedder,
-        &load,
-        prefix,
-        report_tokens,
-        &mut chunk,
-        &mut out,
-    )?;
+    let f = flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
+    out.finish()?;
     n_out += f.written;
     truncated += f.truncated;
 
@@ -240,6 +342,69 @@ mod tests {
         assert_eq!(
             full,
             b"{\"id\":1,\"embedding\":[0.5,0.5],\"n_tokens\":7,\"truncated\":false}\n"
+        );
+    }
+
+    /// The OpenAI shape, including the two things that make it awkward to
+    /// stream: the envelope has to open before the first record and close after
+    /// the last, and `usage` is only known at the end.
+    #[test]
+    fn the_openai_shape_is_one_document_written_in_pieces() {
+        fn run(n: usize) -> serde_json::Value {
+            let mut buf = Vec::new();
+            let mut w = Writer::new(&mut buf, Format::OpenAi, "some/model", false);
+            for i in 0..n {
+                let info = TokenInfo {
+                    n_tokens: 3 + i,
+                    truncated: false,
+                };
+                w.record(&Value::from(format!("id-{i}")), &[0.5, -0.5], &info)
+                    .unwrap();
+            }
+            w.finish().unwrap();
+            serde_json::from_slice(&buf).expect("one valid JSON document")
+        }
+
+        // Empty input is still a document, not an empty file.
+        let none = run(0);
+        assert_eq!(none["object"], "list");
+        assert_eq!(none["data"].as_array().unwrap().len(), 0);
+        assert_eq!(none["usage"]["prompt_tokens"], 0);
+
+        let two = run(2);
+        assert_eq!(two["model"], "some/model");
+        let data = two["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        // Position, not the input id — that is what the API means by `index`.
+        assert_eq!(data[0]["index"], 0);
+        assert_eq!(data[1]["index"], 1);
+        assert_eq!(data[1]["object"], "embedding");
+        assert!(data[0].get("id").is_none());
+        // usage totals every record, whatever `--report-tokens` asked for.
+        assert_eq!(two["usage"]["prompt_tokens"], 7);
+        assert_eq!(two["usage"]["total_tokens"], 7);
+    }
+
+    /// The default shape is unchanged by the writer sitting in front of it.
+    #[test]
+    fn the_jsonl_writer_still_emits_protocol_1_lines() {
+        let info = TokenInfo {
+            n_tokens: 7,
+            truncated: true,
+        };
+        let mut plain = Vec::new();
+        let mut w = Writer::new(&mut plain, Format::Jsonl, "some/model", false);
+        w.record(&Value::from(1), &[0.5, 0.5], &info).unwrap();
+        w.finish().unwrap();
+        assert_eq!(plain, b"{\"id\":1,\"embedding\":[0.5,0.5]}\n");
+
+        let mut full = Vec::new();
+        let mut w = Writer::new(&mut full, Format::Jsonl, "some/model", true);
+        w.record(&Value::from(1), &[0.5, 0.5], &info).unwrap();
+        w.finish().unwrap();
+        assert_eq!(
+            full,
+            b"{\"id\":1,\"embedding\":[0.5,0.5],\"n_tokens\":7,\"truncated\":true}\n"
         );
     }
 

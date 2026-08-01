@@ -80,6 +80,32 @@ to raise `--max-seq-length` or chunk those documents, not an error.
 | 1 | fatal: model load failure, bad flags, I/O error. Output may be truncated at a line boundary (never mid-line). |
 | 3 | the requested CoreML backend (`--device coreml`) cannot serve this request: built without the `coreml` feature, no `--coreml-dir`, no converted bucket for `--max-seq-length`, or a missing model. Detected before any input is read, so no output is produced — the caller can retry on `--device cpu`. Only ever returned when `--device coreml` is passed. |
 
+## `--format openai`
+
+For code already written against OpenAI's `/v1/embeddings`, `--format openai`
+replaces the JSONL stream with one response object for the whole run:
+
+```json
+{"object": "list",
+ "data": [{"object": "embedding", "index": 0, "embedding": [0.0123, …]}],
+ "model": "cl-nagoya/ruri-v3-130m",
+ "usage": {"prompt_tokens": 15, "total_tokens": 15}}
+```
+
+Everything on stdin is unchanged — the input is still this protocol's JSONL.
+What changes on stdout:
+
+- **Embeddings are identified by `index`, not by id.** `index` is the position
+  among the records that were embedded, which is what the API means by it, so a
+  skipped input line shifts every index after it. Input ids are not carried; if
+  you need them, use the default format.
+- **`--report-tokens` is refused**, because the item shape has nowhere to put
+  per-record counts. `usage.prompt_tokens` carries the total instead, and the
+  summary line still reports `truncated=N`.
+- **An aborted run leaves an incomplete JSON document.** JSONL degrades to a
+  shorter but valid file; a single object does not. Kohagi still writes the
+  document in pieces rather than buffering, so memory stays flat either way.
+
 ## Versioning
 
 The protocol is backward compatible; a breaking change would come with an

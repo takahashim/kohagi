@@ -135,6 +135,12 @@ Use the `id` field to match each result with its input record.
 A complete Ruby example is available in [`examples/rails_open3.rb`](examples/rails_open3.rb).
 See [PROTOCOL.md](PROTOCOL.md) for the exit-code semantics.
 
+If the calling code is already written against OpenAI's `/v1/embeddings`,
+`--format openai` writes one response object for the whole run instead of the
+JSONL stream — `data[i].embedding` where `i` is the input position, plus `model`
+and `usage`. Input is unchanged; ids are not carried, since that API identifies
+embeddings by position.
+
 ### Ruby
 
 In Ruby, [kohagi-ruby](https://github.com/takahashim/kohagi-ruby)

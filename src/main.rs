@@ -84,6 +84,23 @@ impl From<CoreMlFormArg> for CoreMlForm {
 }
 
 #[derive(Copy, Clone, ValueEnum)]
+enum FormatArg {
+    /// Kohagi's JSONL protocol: one record per line, ids echoed.
+    Jsonl,
+    /// One OpenAI `/v1/embeddings` response object for the whole run.
+    Openai,
+}
+
+impl From<FormatArg> for stdio::Format {
+    fn from(f: FormatArg) -> Self {
+        match f {
+            FormatArg::Jsonl => stdio::Format::Jsonl,
+            FormatArg::Openai => stdio::Format::OpenAi,
+        }
+    }
+}
+
+#[derive(Copy, Clone, ValueEnum)]
 enum CoreMlQuantizeArg {
     /// The embedding table int8, one scale per row.
     Embeddings,
@@ -181,6 +198,13 @@ struct Args {
     /// portable). Only the chosen form is fetched.
     #[arg(long, value_enum, default_value_t = CoreMlFormArg::Compiled)]
     coreml_prefer: CoreMlFormArg,
+    /// Shape of stdout. `jsonl` is Kohagi's protocol, one record per line,
+    /// echoing each input's id. `openai` is one `/v1/embeddings` response
+    /// object for the whole run, so code written against that API can read it
+    /// unchanged — it identifies embeddings by position rather than by id, and
+    /// an aborted run leaves an incomplete JSON document.
+    #[arg(long, value_enum, default_value_t = FormatArg::Jsonl)]
+    format: FormatArg,
     /// Add `n_tokens` (tokens embedded, specials included) and `truncated`
     /// (text ran past --max-seq-length, so its tail was dropped) to each output
     /// record. Off by default, keeping the plain protocol-1 output. The summary
@@ -284,9 +308,9 @@ fn label_of(path: &Path) -> String {
     )
 }
 
-/// `--text` mode: embed the arguments and print the same JSONL that stdio
-/// mode would, with the argument positions as ids.
-fn embed_arguments(args: &Args, source: &ModelSource) -> anyhow::Result<()> {
+/// `--text` mode: embed the arguments and print what stdio mode would, with the
+/// argument positions as ids.
+fn embed_arguments(args: &Args, source: &ModelSource, label: &str) -> anyhow::Result<()> {
     let embedder = Embedder::load(source, args.options())?;
     let prefixed: Vec<String> = args
         .text
@@ -297,24 +321,37 @@ fn embed_arguments(args: &Args, source: &ModelSource) -> anyhow::Result<()> {
     let (vectors, tokens) = embedder.embed_with_tokens(&texts)?;
 
     // Same output shape as stdio mode; ids are the argument positions.
-    let mut out = std::io::stdout().lock();
+    let mut out = stdio::Writer::new(
+        std::io::stdout().lock(),
+        args.format.into(),
+        label,
+        args.report_tokens,
+    );
     for (id, (embedding, info)) in vectors.iter().zip(&tokens).enumerate() {
-        stdio::write_record(
-            &mut out,
-            &serde_json::Value::from(id),
-            embedding,
-            args.report_tokens.then_some(info),
-        )?;
+        out.record(&serde_json::Value::from(id), embedding, info)?;
     }
-    Ok(())
+    out.finish()
 }
 
 /// Returns the number of skipped input lines (0 in `--text` mode).
 fn run(args: Args) -> anyhow::Result<usize> {
     let (source, label) = args.source()?;
 
+    // The OpenAI item shape has nowhere to put per-record token counts, and
+    // dropping what was asked for silently is worse than saying so. The total is
+    // still reported, as `usage.prompt_tokens`.
+    if args.report_tokens && matches!(args.format, FormatArg::Openai) {
+        return Err(kohagi::UnsupportedRequest(
+            "--report-tokens has no place in the OpenAI response shape; \
+             usage.prompt_tokens carries the total, and per-record counts need \
+             --format jsonl"
+                .to_string(),
+        )
+        .into());
+    }
+
     if !args.text.is_empty() {
-        embed_arguments(&args, &source)?;
+        embed_arguments(&args, &source, &label)?;
         return Ok(0);
     }
 
@@ -324,6 +361,7 @@ fn run(args: Args) -> anyhow::Result<usize> {
         &args.prefix,
         args.report_tokens,
         &label,
+        args.format.into(),
     )
 }
 
