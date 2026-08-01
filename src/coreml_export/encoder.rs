@@ -994,11 +994,17 @@ mod tests {
 
     /// A frozen hash of both artifacts.
     ///
-    /// Generation is reproducible by design, so
-    /// any change to the graph, the constants, the blob layout or the manifest moves
-    /// these numbers. That is the point: a change that was meant to be a refactor
-    /// shows up here, and a change that was meant to alter the output has to be
-    /// acknowledged by updating them.
+    /// Generation is reproducible by design, so any change to the graph, the
+    /// constants or the blob layout moves these numbers. That is the point: a
+    /// change that was meant to be a refactor shows up here, and a change that was
+    /// meant to alter the output has to be acknowledged by updating them — and by
+    /// bumping `GRAPH_VERSION`, so that no cached conversion outlives the graph it
+    /// was emitted from.
+    ///
+    /// The provenance metadata is cleared first, because it carries
+    /// `CARGO_PKG_VERSION`: leaving it in would move these hashes on every release
+    /// and, through that convention, invalidate every user's conversion cache for a
+    /// graph that had not changed.
     ///
     /// If this fails and the change was intended, `mil-inventory --diff` and
     /// `milblob diff` (`tools/coreml-jigs`) say what moved.
@@ -1007,19 +1013,22 @@ mod tests {
         use prost::Message;
 
         let cfg = tiny();
-        let (model, blob) = emit_all(
+        let (mut model, blob) = emit_all(
             &cfg,
             &Synthetic,
             &[8, 16],
             &super::super::Provenance::default(),
         )
         .expect("emit");
+        if let Some(description) = model.description.as_mut() {
+            description.metadata = None;
+        }
         let encoded = model.encode_to_vec();
 
-        assert_eq!(encoded.len(), 56_051, "model.mlmodel size");
+        assert_eq!(encoded.len(), 55_944, "model.mlmodel size");
         assert_eq!(
             crate::fnv::hash(&encoded),
-            0x9925_5c8f_5909_d196,
+            0x77c6_381d_d954_3ad5,
             "model.mlmodel digest"
         );
         assert_eq!(blob.len(), 13_760, "weight.bin size");
