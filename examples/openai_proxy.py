@@ -13,23 +13,14 @@ over a pipe, which is a smaller contract and works from any language that can
 spawn a process. This file is the bridge, so declining to build a server into
 Kohagi does not cost anyone the OpenAI ecosystem.
 
-## How it works, and why this way
+## How it works
 
-One Kohagi process per request, with `--format openai`, and its stdout returned
-verbatim. The response is already the right shape, `usage` included, so there is
-no envelope to assemble here.
-
-The obvious alternative — one long-lived Kohagi, fed request by request — does
-not work, and it is worth knowing why before you try it. Kohagi's protocol is a
-batch protocol: it embeds in chunks of 1024 records and flushes when a chunk
-fills or when stdin closes. A request of two texts produces nothing until one of
-those happens, so a server holding the pipe open waits forever. Closing stdin is
-the only end-of-request signal there is, and closing it ends the process.
-
-The cost is a model load per request: about 0.3 s warm on CPU for
-`ruri-v3-130m`, more on the first call and more for a larger checkpoint. If that
-matters more than simplicity, batch your texts into fewer, larger requests —
-which is what the OpenAI API's array `input` is for anyway.
+One long-lived Kohagi, so the model is loaded once. Each request writes its
+records, then a blank line — Kohagi's "that is one batch" signal — and reads
+back exactly one line, which with `--format openai` is that batch's complete
+response. There is no envelope to assemble here and no counting of records: the
+blank line is what makes a batch a request. Serving a request costs about 0.03 s
+warm, against 0.3 s if the process were spawned each time.
 
 ## Before swapping a production base_url
 
@@ -45,26 +36,43 @@ Standard library only.
 import argparse
 import json
 import subprocess
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-ARGV = []
+KOHAGI = None
 MODEL = "kohagi"
 
 
-def embed(texts):
-    """Kohagi's own OpenAI response for `texts`, as bytes."""
-    payload = "\n".join(
-        json.dumps({"id": i, "text": t}, ensure_ascii=False) for i, t in enumerate(texts)
-    )
-    done = subprocess.run(
-        ARGV, input=payload.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    # Exit 2 means some lines were skipped; the records that did come back are
-    # still valid, but a proxy cannot return a short array as if nothing
-    # happened. See PROTOCOL.md for the exit codes.
-    if done.returncode != 0:
-        raise RuntimeError(done.stderr.decode(errors="replace").strip() or "kohagi failed")
-    return done.stdout
+class Kohagi:
+    """One long-lived Kohagi process, one request at a time.
+
+    The lock is not optional. Kohagi's stdout carries batches in the order the
+    batches were asked for, with nothing tying a reply to a requester, so two
+    overlapping requests would each read the other's response. Serializing here
+    keeps the model loaded once without needing a pool.
+    """
+
+    def __init__(self, argv):
+        self.proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
+        )
+        self.lock = threading.Lock()
+
+    def embed(self, texts):
+        """Kohagi's own OpenAI response for `texts`, as bytes."""
+        payload = "".join(
+            json.dumps({"id": i, "text": t}, ensure_ascii=False) + "\n"
+            for i, t in enumerate(texts)
+        )
+        with self.lock:
+            # The blank line ends the batch; without it Kohagi waits for 1024
+            # records before embedding anything.
+            self.proc.stdin.write(payload.encode() + b"\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError("kohagi exited; see its stderr")
+        return line
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -86,7 +94,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(400, "`input` must be a string or an array of strings")
 
         try:
-            self.send_bytes(200, embed(texts))
+            self.send_bytes(200, KOHAGI.embed(texts))
         except RuntimeError as e:
             self.fail(500, str(e))
 
@@ -133,15 +141,15 @@ def main():
     p.add_argument("--device", default="cpu")
     args, extra = p.parse_known_args()
 
-    global ARGV, MODEL
-    ARGV = [
+    global KOHAGI, MODEL
+    KOHAGI = Kohagi([
         args.kohagi,
         "--model-id", args.model_id,
         "--device", args.device,
         "--prefix", args.prefix,
         "--format", "openai",
         *extra,
-    ]
+    ])
     MODEL = args.model_id
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)

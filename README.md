@@ -152,12 +152,10 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
 client.embeddings.create(model="ruri-v3-130m", input=["…", "…"])
 ```
 
-Each spawns one Kohagi per request with `--format openai` — which writes the
-OpenAI response object rather than the JSONL stream — and returns its stdout
-verbatim. That costs a model load per request, about 0.3 s warm on CPU; a
-long-lived process is not an option, because Kohagi's protocol is a batch one
-that flushes at 1024 records or at end of input, so a server holding the pipe
-open would wait forever. Two caveats before pointing production at it: an
+Each keeps one Kohagi loaded and ends every request with a blank line, which is
+Kohagi's "embed what you have and reply now" signal; with `--format openai` the
+reply is that batch's complete response object, so there is nothing to assemble.
+A request costs about 40 ms warm. Two caveats before pointing production at it: an
 existing index has to be rebuilt, since `ruri-v3-130m` returns 512 dimensions
 where `text-embedding-3-small` returns 1536, and the request's `model` is
 ignored — the flags passed to Kohagi decide which checkpoint runs.

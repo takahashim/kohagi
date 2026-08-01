@@ -14,23 +14,14 @@
  * over a pipe, which is a smaller contract and works from any language that can
  * spawn a process. This file is the bridge.
  *
- * ## How it works, and why this way
+ * ## How it works
  *
- * One kohagi process per request, with `--format openai`, and its stdout
- * returned verbatim. The response is already the right shape, `usage` included,
- * so there is no envelope to assemble here.
- *
- * The obvious alternative — one long-lived kohagi, fed request by request —
- * does not work, and it is worth knowing why before you try it. kohagi's
- * protocol is a batch protocol: it embeds in chunks of 1024 records and flushes
- * when a chunk fills or when stdin closes. A request of two texts produces
- * nothing until one of those happens, so a server holding the pipe open waits
- * forever. Closing stdin is the only end-of-request signal there is, and
- * closing it ends the process.
- *
- * The cost is a model load per request: about 0.3 s warm on CPU for
- * ruri-v3-130m. If that matters more than simplicity, batch texts into fewer,
- * larger requests — which is what the API's array `input` is for anyway.
+ * One long-lived kohagi, so the model is loaded once. Each request writes its
+ * records, then a blank line — kohagi's "that is one batch" signal — and reads
+ * back exactly one line, which with `--format openai` is that batch's complete
+ * response. There is no envelope to assemble here and no counting of records:
+ * the blank line is what makes a batch a request. Serving a request costs about
+ * 0.03 s warm, against 0.3 s if the process were spawned each time.
  *
  * ## Before swapping a production baseURL
  *
@@ -76,28 +67,46 @@ const KOHAGI = [
   ...extra,
 ];
 
+/**
+ * One long-lived kohagi process, one request at a time.
+ *
+ * The queue is not optional. kohagi's stdout carries batches in the order the
+ * batches were asked for, with nothing tying a reply to a requester, so two
+ * overlapping requests would each read the other's response. Node serves
+ * requests concurrently, so they are chained onto one promise instead.
+ */
+const child = spawn(own["--kohagi"]!, KOHAGI, { stdio: ["pipe", "pipe", "inherit"] });
+child.stdout.setEncoding("utf8");
+
+/** Resolvers waiting for a reply, in the order their batches were sent. */
+const waiting: Array<(line: string) => void> = [];
+let pending = "";
+child.stdout.on("data", (chunk: string) => {
+  pending += chunk;
+  let nl: number;
+  while ((nl = pending.indexOf("\n")) >= 0) {
+    const line = pending.slice(0, nl);
+    pending = pending.slice(nl + 1);
+    waiting.shift()?.(line);
+  }
+});
+
+let queue: Promise<unknown> = Promise.resolve();
+
 /** kohagi's own OpenAI response for `texts`. */
 function embed(texts: string[]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(own["--kohagi"]!, KOHAGI);
-    let out = "";
-    let err = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (c: string) => (out += c));
-    child.stderr.on("data", (c: string) => (err += c));
-    child.on("error", reject);
-    child.on("close", (code) =>
-      // Exit 2 means some lines were skipped; the records that did come back
-      // are still valid, but a proxy cannot return a short array as if nothing
-      // happened. See PROTOCOL.md for the exit codes.
-      code === 0 ? resolve(out) : reject(new Error(err.trim() || "kohagi failed")),
-    );
-    child.stdin.end(
-      texts.map((text, id) => JSON.stringify({ id, text })).join("\n"),
-      "utf8",
-    );
-  });
+  const run = queue.then(
+    () =>
+      new Promise<string>((resolve) => {
+        waiting.push(resolve);
+        const payload = texts.map((text, id) => JSON.stringify({ id, text }) + "\n").join("");
+        // The blank line ends the batch; without it kohagi waits for 1024
+        // records before embedding anything.
+        child.stdin.write(payload + "\n", "utf8");
+      }),
+  );
+  queue = run.catch(() => {});
+  return run;
 }
 
 function send(res: ServerResponse, status: number, body: string) {

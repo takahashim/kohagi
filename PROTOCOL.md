@@ -29,6 +29,29 @@ embedded.
 - **Blank lines** (empty or whitespace-only) are silently ignored and not
   counted, so a trailing newline is always safe.
 
+## Batches (a blank line)
+
+A blank line on stdin means **embed what you have sent so far and reply now**,
+instead of waiting for an internal chunk to fill. Kohagi answers with the
+records for that batch followed by a blank line of its own, so a long-lived
+caller can send a request and read until the blank line:
+
+```
+{"id": 1, "text": "…"}      →   {"id": 1, "embedding": […]}
+{"id": 2, "text": "…"}          {"id": 2, "embedding": […]}
+                     ↵          ↵
+```
+
+The reply marker is what makes this safe to build on. Counting records instead
+would hang the moment one of them was skipped for being malformed, since the
+count would never be reached.
+
+Without a blank line nothing is lost: Kohagi still embeds in chunks of 1024 and
+at end of input, which is what `cat texts.jsonl | kohagi` relies on. A blank
+line is only needed when the caller wants an answer before then. An empty batch
+(a blank line with nothing buffered) is answered too, so a stray blank line
+costs a marker rather than a deadlock.
+
 ## Output (stdout, JSONL, one record per line)
 
 ```json
@@ -102,6 +125,11 @@ What changes on stdout:
 - **`--report-tokens` is refused**, because the item shape has nowhere to put
   per-record counts. `usage.prompt_tokens` carries the total instead, and the
   summary line still reports `truncated=N`.
+- **One document per batch.** A blank line closes the current response and
+  starts the next, with `index` counting from zero again and `usage` covering
+  that batch alone — one flush is one request's worth. With no blank lines the
+  whole run is one document, which is what `kohagi --format openai < in.jsonl >
+  out.json` produces.
 - **An aborted run leaves an incomplete JSON document.** JSONL degrades to a
   shorter but valid file; a single object does not. Kohagi still writes the
   document in pieces rather than buffering, so memory stays flat either way.

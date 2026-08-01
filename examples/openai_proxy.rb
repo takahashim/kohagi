@@ -11,23 +11,14 @@
 # over a pipe, which is a smaller contract and works from any language that can
 # spawn a process. This file is the bridge.
 #
-# ## How it works, and why this way
+# ## How it works
 #
-# One kohagi process per request, with `--format openai`, and its stdout
-# returned verbatim. The response is already the right shape, `usage` included,
-# so there is no envelope to assemble here.
-#
-# The obvious alternative — one long-lived kohagi, fed request by request — does
-# not work, and it is worth knowing why before you try it. kohagi's protocol is
-# a batch protocol: it embeds in chunks of 1024 records and flushes when a chunk
-# fills or when stdin closes. A request of two texts produces nothing until one
-# of those happens, so a server holding the pipe open waits forever. Closing
-# stdin is the only end-of-request signal there is, and closing it ends the
-# process.
-#
-# The cost is a model load per request: about 0.3 s warm on CPU for
-# ruri-v3-130m. If that matters more than simplicity, batch texts into fewer,
-# larger requests — which is what the API's array `input` is for anyway.
+# One long-lived kohagi, so the model is loaded once. Each request writes its
+# records, then a blank line — kohagi's "that is one batch" signal — and reads
+# back exactly one line, which with `--format openai` is that batch's complete
+# response. There is no envelope to assemble here and no counting of records:
+# the blank line is what makes a batch a request. Serving a request costs about
+# 0.03 s warm, against 0.3 s if the process were spawned each time.
 #
 # ## Before swapping a production base URL
 #
@@ -44,6 +35,33 @@ require "json"
 require "open3"
 require "optparse"
 require "webrick"
+
+# One long-lived kohagi process, one request at a time.
+#
+# The mutex is not optional. kohagi's stdout carries batches in the order the
+# batches were asked for, with nothing tying a reply to a requester, so two
+# overlapping requests would each read the other's response.
+class Kohagi
+  def initialize(argv)
+    @stdin, @stdout, @wait = Open3.popen2(*argv)
+    @mutex = Mutex.new
+  end
+
+  # kohagi's own OpenAI response for +texts+, as a String.
+  def embed(texts)
+    payload = texts.each_with_index.map { |t, i| "#{JSON.generate({ id: i, text: t })}\n" }.join
+    line = @mutex.synchronize do
+      # The blank line ends the batch; without it kohagi waits for 1024 records
+      # before embedding anything.
+      @stdin.write("#{payload}\n")
+      @stdin.flush
+      @stdout.gets
+    end
+    raise "kohagi exited; see its stderr" if line.nil?
+
+    line
+  end
+end
 
 options = {
   kohagi: "kohagi",
@@ -77,26 +95,14 @@ until argv.empty?
   end
 end
 
-ARGV_KOHAGI = [
+KOHAGI = Kohagi.new([
   options[:kohagi],
   "--model-id", options[:model_id],
   "--device", options[:device],
   "--prefix", options[:prefix],
   "--format", "openai",
   *extra
-].freeze
-
-# kohagi's own OpenAI response for +texts+, as a String.
-def embed(texts)
-  payload = texts.each_with_index.map { |t, i| JSON.generate({ id: i, text: t }) }.join("\n")
-  out, err, status = Open3.capture3(*ARGV_KOHAGI, stdin_data: payload)
-  # Exit 2 means some lines were skipped; the records that did come back are
-  # still valid, but a proxy cannot return a short array as if nothing happened.
-  # See PROTOCOL.md for the exit codes.
-  raise(err.strip.empty? ? "kohagi failed" : err.strip) unless status.success?
-
-  out
-end
+])
 
 def send_json(res, status, payload)
   res.status = status
@@ -136,7 +142,7 @@ server.mount_proc "/v1/embeddings" do |req, res|
   end
 
   begin
-    send_json(res, 200, embed(texts))
+    send_json(res, 200, KOHAGI.embed(texts))
   rescue RuntimeError => e
     send_error(res, 500, e.message)
   end

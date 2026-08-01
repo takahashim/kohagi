@@ -92,8 +92,14 @@ pub struct Writer<W: Write> {
     format: Format,
     model: String,
     report_tokens: bool,
+    /// Records in the batch being written now, which is also the next `index`.
     written: usize,
     prompt_tokens: usize,
+    /// An OpenAI envelope has been opened and not yet closed.
+    open: bool,
+    /// Batches completed, so that a run with no records at all still produces
+    /// one (empty) response rather than nothing.
+    batches: usize,
 }
 
 impl<W: Write> Writer<W> {
@@ -105,6 +111,8 @@ impl<W: Write> Writer<W> {
             report_tokens,
             written: 0,
             prompt_tokens: 0,
+            open: false,
+            batches: 0,
         }
     }
 
@@ -122,11 +130,12 @@ impl<W: Write> Writer<W> {
                 )?;
             }
             Format::OpenAi => {
-                self.out.write_all(if self.written == 0 {
-                    b"{\"object\":\"list\",\"data\":["
+                if !self.open {
+                    self.out.write_all(b"{\"object\":\"list\",\"data\":[")?;
+                    self.open = true;
                 } else {
-                    b","
-                })?;
+                    self.out.write_all(b",")?;
+                }
                 serde_json::to_writer(
                     &mut self.out,
                     &OpenAiItem {
@@ -141,6 +150,23 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
+    /// End the current batch and say so, so that a caller waiting on a reply
+    /// knows it has everything.
+    ///
+    /// Without this a long-lived reader has to count records, and a record that
+    /// was skipped for being malformed would leave it waiting for one that is
+    /// never coming. For JSONL the marker is a blank line, which no record can
+    /// be; for the OpenAI shape it is the close of that batch's response, since
+    /// one flush is one request's worth.
+    pub fn boundary(&mut self) -> Result<()> {
+        match self.format {
+            Format::Jsonl => self.out.write_all(b"\n")?,
+            Format::OpenAi => self.close_document()?,
+        }
+        self.out.flush()?;
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> Result<()> {
         self.out.flush()?;
         Ok(())
@@ -149,19 +175,31 @@ impl<W: Write> Writer<W> {
     /// Close the document. For JSONL there is nothing to close; for OpenAI this
     /// is where `model` and `usage` go, since the token total is only known now.
     pub fn finish(mut self) -> Result<()> {
-        if self.format == Format::OpenAi {
-            if self.written == 0 {
-                self.out.write_all(b"{\"object\":\"list\",\"data\":[")?;
-            }
-            self.out.write_all(b"],\"model\":")?;
-            serde_json::to_writer(&mut self.out, &self.model)?;
-            writeln!(
-                self.out,
-                ",\"usage\":{{\"prompt_tokens\":{n},\"total_tokens\":{n}}}}}",
-                n = self.prompt_tokens
-            )?;
+        // Close what is open; if nothing ever was, a run that embedded nothing
+        // should still answer with an empty response rather than an empty file.
+        if self.format == Format::OpenAi && (self.open || self.batches == 0) {
+            self.close_document()?;
         }
         self.out.flush()?;
+        Ok(())
+    }
+
+    /// Write `]`, `model` and `usage`, and start counting the next batch.
+    fn close_document(&mut self) -> Result<()> {
+        if !self.open {
+            self.out.write_all(b"{\"object\":\"list\",\"data\":[")?;
+        }
+        self.out.write_all(b"],\"model\":")?;
+        serde_json::to_writer(&mut self.out, &self.model)?;
+        writeln!(
+            self.out,
+            ",\"usage\":{{\"prompt_tokens\":{n},\"total_tokens\":{n}}}}}",
+            n = self.prompt_tokens
+        )?;
+        self.open = false;
+        self.batches += 1;
+        self.written = 0;
+        self.prompt_tokens = 0;
         Ok(())
     }
 }
@@ -172,11 +210,19 @@ struct InRecord {
     text: String,
 }
 
-/// Parse one physical line. `Ok(None)` = blank line (ignored, not counted);
-/// `Err` = skip with a warning (malformed JSON, missing id, empty/missing text).
-fn parse_line(line: &str) -> Result<Option<InRecord>, String> {
+/// What one physical line of input asks for.
+enum Line {
+    Record(InRecord),
+    /// A blank line: embed whatever is buffered now, do not wait for a full
+    /// chunk, and mark the boundary on the way out.
+    Flush,
+}
+
+/// Parse one physical line. `Err` = skip with a warning (malformed JSON,
+/// missing id, empty/missing text).
+fn parse_line(line: &str) -> Result<Line, String> {
     if line.trim().is_empty() {
-        return Ok(None);
+        return Ok(Line::Flush);
     }
     let v: Value = serde_json::from_str(line).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = v.as_object().ok_or("not a JSON object")?;
@@ -188,7 +234,7 @@ fn parse_line(line: &str) -> Result<Option<InRecord>, String> {
     if text.is_empty() {
         return Err("empty \"text\"".to_string());
     }
-    Ok(Some(InRecord {
+    Ok(Line::Record(InRecord {
         id,
         text: text.to_string(),
     }))
@@ -273,7 +319,7 @@ pub fn run(
     for (lineno, line) in stdin.lock().lines().enumerate() {
         let line = line.context("reading stdin")?;
         match parse_line(&line) {
-            Ok(Some(record)) => {
+            Ok(Line::Record(record)) => {
                 chunk.push(record);
                 if chunk.len() >= CHUNK_ROWS {
                     let f = flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
@@ -281,7 +327,15 @@ pub fn run(
                     truncated += f.truncated;
                 }
             }
-            Ok(None) => {}
+            // A blank line is the caller saying "that is one batch": embed what
+            // is buffered even though the chunk is short, and mark the boundary
+            // so a reader knows not to wait for more.
+            Ok(Line::Flush) => {
+                let f = flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
+                n_out += f.written;
+                truncated += f.truncated;
+                out.boundary()?;
+            }
             Err(why) => {
                 skipped += 1;
                 eprintln!("kohagi: skip line {}: {why}", lineno + 1);
@@ -308,16 +362,19 @@ pub fn run(
 mod tests {
     use super::*;
 
+    fn record(line: &str) -> InRecord {
+        match parse_line(line).expect("a record") {
+            Line::Record(r) => r,
+            Line::Flush => panic!("expected a record, got a batch boundary"),
+        }
+    }
+
     #[test]
     fn parse_accepts_int_and_string_ids() {
-        let r = parse_line(r#"{"id": 123, "text": "hello"}"#)
-            .unwrap()
-            .unwrap();
+        let r = record(r#"{"id": 123, "text": "hello"}"#);
         assert_eq!(r.id, Value::from(123));
         assert_eq!(r.text, "hello");
-        let r = parse_line(r#"{"id": "b-9", "text": "改行\nあり"}"#)
-            .unwrap()
-            .unwrap();
+        let r = record(r#"{"id": "b-9", "text": "改行\nあり"}"#);
         assert_eq!(r.id, Value::from("b-9"));
         assert_eq!(r.text, "改行\nあり");
     }
@@ -408,10 +465,66 @@ mod tests {
         );
     }
 
+    /// A blank line ends a batch, and the boundary is visible on the way out —
+    /// which is what lets a long-lived caller read a reply without counting
+    /// records that a skipped line would have made it wait for.
+    #[test]
+    fn a_blank_line_ends_a_batch_in_both_formats() {
+        fn batches(format: Format) -> Vec<u8> {
+            let mut buf = Vec::new();
+            let mut w = Writer::new(&mut buf, format, "some/model", false);
+            let info = TokenInfo {
+                n_tokens: 4,
+                truncated: false,
+            };
+            w.record(&Value::from(0), &[1.0], &info).unwrap();
+            w.boundary().unwrap();
+            w.record(&Value::from(1), &[2.0], &info).unwrap();
+            w.finish().unwrap();
+            buf
+        }
+
+        assert_eq!(
+            String::from_utf8(batches(Format::Jsonl)).unwrap(),
+            "{\"id\":0,\"embedding\":[1.0]}\n\n{\"id\":1,\"embedding\":[2.0]}\n"
+        );
+
+        // One flush is one request's worth, so each is a whole response with its
+        // own `index` from zero and its own `usage`.
+        let text = String::from_utf8(batches(Format::OpenAi)).unwrap();
+        let docs: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each line is a document"))
+            .collect();
+        assert_eq!(docs.len(), 2);
+        for d in &docs {
+            assert_eq!(d["data"].as_array().unwrap().len(), 1);
+            assert_eq!(d["data"][0]["index"], 0);
+            assert_eq!(d["usage"]["prompt_tokens"], 4);
+        }
+    }
+
+    /// An empty flush still answers, so a caller cannot hang waiting for a reply
+    /// to a request that happened to have nothing in it.
+    #[test]
+    fn an_empty_batch_still_answers() {
+        for format in [Format::Jsonl, Format::OpenAi] {
+            let mut buf = Vec::new();
+            let mut w = Writer::new(&mut buf, format, "some/model", false);
+            w.boundary().unwrap();
+            w.finish().unwrap();
+            assert_eq!(
+                String::from_utf8(buf).unwrap().lines().count(),
+                1,
+                "{format:?}"
+            );
+        }
+    }
+
     #[test]
     fn parse_skips_bad_lines_and_ignores_blank() {
-        assert!(parse_line("").unwrap().is_none());
-        assert!(parse_line("   ").unwrap().is_none());
+        assert!(matches!(parse_line(""), Ok(Line::Flush)));
+        assert!(matches!(parse_line("   "), Ok(Line::Flush)));
         assert!(parse_line("not json").is_err());
         assert!(parse_line(r#"[1,2]"#).is_err());
         assert!(parse_line(r#"{"text": "no id"}"#).is_err());

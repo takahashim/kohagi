@@ -83,6 +83,16 @@
   `--serve` flag: the HTTP layer is the caller's to choose, and Kohagi's
   contract stays "spawn a process, write JSONL".
 
+- **A blank line ends a batch.** Kohagi embeds in chunks of 1024 records and at
+  end of input, so a caller wanting an answer sooner had no way to ask for one:
+  a long-lived process fed two records returned nothing, and closing stdin —
+  the only signal available — ended the process. A blank line on stdin now means
+  "embed what you have and reply now", and Kohagi answers with a blank line of
+  its own so the caller knows it has everything. Counting records instead would
+  hang as soon as one was skipped for being malformed. Nothing changes for
+  `cat texts.jsonl | kohagi`, and with `--format openai` each batch is its own
+  complete response object.
+
 - **`--format openai`** writes one OpenAI `/v1/embeddings` response object for
   the whole run instead of the JSONL stream, so code already written against
   that API can read Kohagi's output unchanged. Embeddings are identified by
