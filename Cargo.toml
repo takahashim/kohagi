@@ -62,14 +62,17 @@ objc2-core-ml = { version = "0.3", optional = true, features = [
     "MLModelDescription", "MLFeatureDescription", "MLMultiArrayConstraint",
 ] }
 
+# Only for the `coreml-export` feature: the CoreML protobuf schema in
+# src/coreml_proto is generated prost code, so the runtime crate is needed to
+# encode and decode it. Not macOS-only: writing a `.mlmodel` is protobuf
+# serialization and nothing else, so it builds and is tested everywhere. The
+# generator (prost-build) is not a dependency — the generated code is committed,
+# see src/coreml_proto/mod.rs.
+prost = { version = "0.14", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.11", features = ["accelerate"] }
 
-# Only for the `coreml-export` feature: the CoreML protobuf schema in
-# src/coreml_proto is generated prost code, so the runtime crate is needed to
-# encode and decode it. The generator (prost-build) is not a dependency here —
-# the generated code is committed, see src/coreml_proto/mod.rs.
-prost = { version = "0.14", optional = true }
 
 [features]
 # NVIDIA GPU via Candle's CUDA backend: `cargo build --release --features cuda`,
