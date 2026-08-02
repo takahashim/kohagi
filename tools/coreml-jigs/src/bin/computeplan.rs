@@ -72,6 +72,11 @@ fn plan(model: &str, function: &str) -> Result<Vec<Op>, String> {
     let url = NSURL::fileURLWithPath(&NSString::from_str(model));
     let config = unsafe { MLModelConfiguration::new() };
     unsafe { config.setComputeUnits(MLComputeUnits::CPUAndNeuralEngine) };
+    // A multi-function bundle plans one function at a time. Without this the
+    // plan is built for the default function, and every operation of the one
+    // asked about comes back with no device at all — which reads as "placement
+    // changed" against a baseline rather than as "nothing was measured".
+    unsafe { config.setFunctionName(Some(&NSString::from_str(function))) };
 
     let plan = await_handler(|h| unsafe {
         MLComputePlan::loadContentsOfURL_configuration_completionHandler(&url, &config, h)
@@ -299,6 +304,19 @@ fn main() {
     };
     if ops.is_empty() {
         eprintln!("computeplan: function `{function}` has no schedulable operations");
+        exit(1);
+    }
+    // CoreML answers "no device" for every operation when it planned something
+    // other than what was asked about. Reported as a placement, that reads as
+    // "everything moved off the ANE"; against a baseline it reads as every
+    // operation having changed. Neither is true — nothing was measured.
+    if ops.iter().all(|op| op.preferred == "unknown") {
+        eprintln!(
+            "computeplan: CoreML returned no device for any of the {} operations in \
+             `{function}`, so nothing was measured. This is what a compute plan built \
+             for a different function looks like.",
+            ops.len()
+        );
         exit(1);
     }
 
