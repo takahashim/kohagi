@@ -6,13 +6,15 @@
 #     client.embeddings(parameters: { model: "ruri-v3-130m", input: ["…", "…"] })
 #
 # See README.md in this directory for what this is for, how it works, and what
-# to know before pointing production at it. Standard library only (webrick is a
-# bundled gem on Ruby 3; `gem install webrick` if require fails).
+# to know before pointing production at it. Needs `gem install puma`; everything
+# else is the standard library.
 
 require "json"
 require "open3"
 require "optparse"
-require "webrick"
+require "puma"
+require "puma/configuration"
+require "puma/launcher"
 
 # One long-lived kohagi process, one request at a time.
 #
@@ -82,33 +84,26 @@ KOHAGI = Kohagi.new([
   *extra
 ])
 
-def send_json(res, status, payload)
-  res.status = status
-  res["Content-Type"] = "application/json"
-  res.body = payload.is_a?(String) ? payload : JSON.generate(payload)
+JSON_HEADERS = { "content-type" => "application/json" }.freeze
+
+def reply(status, payload)
+  [status, JSON_HEADERS, [payload.is_a?(String) ? payload : JSON.generate(payload)]]
 end
 
 # The error shape OpenAI clients expect, so their exceptions carry the message
 # rather than "unknown error".
-def send_error(res, status, message)
-  send_json(res, status, { error: { message: message, type: "invalid_request_error" } })
+def fail_with(status, message)
+  reply(status, { error: { message: message, type: "invalid_request_error" } })
 end
 
-server = WEBrick::HTTPServer.new(
-  BindAddress: options[:host],
-  Port: options[:port],
-  AccessLog: [],
-  # kohagi's own stderr is the interesting log here.
-  Logger: WEBrick::Log.new(File::NULL)
-)
-
-server.mount_proc "/v1/embeddings" do |req, res|
-  next send_error(res, 405, "POST only") unless req.request_method == "POST"
+def embeddings(env)
+  return fail_with(405, "POST only") unless env["REQUEST_METHOD"] == "POST"
 
   begin
-    body = JSON.parse(req.body.to_s.empty? ? "{}" : req.body)
+    raw = env["rack.input"].read
+    body = JSON.parse(raw.to_s.empty? ? "{}" : raw)
   rescue JSON::ParserError => e
-    next send_error(res, 400, "invalid JSON: #{e.message}")
+    return fail_with(400, "invalid JSON: #{e.message}")
   end
 
   # The API takes a string or an array of them. Arrays of tokens are also legal
@@ -116,24 +111,34 @@ server.mount_proc "/v1/embeddings" do |req, res|
   given = body["input"]
   texts = given.is_a?(String) ? [given] : given
   unless texts.is_a?(Array) && !texts.empty? && texts.all?(String)
-    next send_error(res, 400, "`input` must be a string or an array of strings")
+    return fail_with(400, "`input` must be a string or an array of strings")
   end
 
   begin
-    send_json(res, 200, KOHAGI.embed(texts))
+    reply(200, KOHAGI.embed(texts))
   rescue RuntimeError => e
-    send_error(res, 500, e.message)
+    fail_with(500, e.message)
   end
 end
 
-# Some clients list models before their first call.
-server.mount_proc "/v1/models" do |_req, res|
-  send_json(res, 200, {
-              object: "list",
-              data: [{ id: options[:model_id], object: "model", owned_by: "kohagi" }]
-            })
+APP = lambda do |env|
+  case env["PATH_INFO"].sub(%r{/\z}, "")
+  when "/v1/embeddings" then embeddings(env)
+  # Some clients list models before their first call.
+  when "/v1/models"
+    reply(200, { object: "list",
+                 data: [{ id: options[:model_id], object: "model", owned_by: "kohagi" }] })
+  else fail_with(404, "only /v1/embeddings is served")
+  end
 end
 
-trap("INT") { server.shutdown }
+# Puma serves requests on a thread pool, which is why Kohagi is behind a mutex:
+# one process, one batch at a time, with the threads queueing on it.
+config = Puma::Configuration.new do |c|
+  c.bind "tcp://#{options[:host]}:#{options[:port]}"
+  c.app APP
+  c.log_requests false
+  c.environment "production"
+end
 puts "kohagi-openai-proxy: http://#{options[:host]}:#{options[:port]}/v1  (#{options[:model_id]})"
-server.start
+Puma::Launcher.new(config, events: Puma::Events.new).run

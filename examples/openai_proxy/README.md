@@ -9,8 +9,9 @@ matches the stack you already run:
 | [`proxy.rb`](proxy.rb) | `ruby examples/openai_proxy/proxy.rb --kohagi ./target/release/kohagi` |
 | [`proxy.ts`](proxy.ts) | `node --experimental-strip-types examples/openai_proxy/proxy.ts --kohagi ./target/release/kohagi` |
 
-Standard library only in all three (`proxy.ts` also runs under `deno run -A` and
-`bun`). Flags they do not recognize are passed through to Kohagi, so
+`proxy.rb` needs `gem install puma`; the other two are standard library only
+(`proxy.ts` also runs under `deno run -A` and `bun`). Flags they do not
+recognize are passed through to Kohagi, so
 `--device coreml` or `--max-seq-length 256` work without being redeclared.
 
 Then point any OpenAI client at it and nothing else in your code changes:
@@ -47,7 +48,9 @@ Kohagi.
 **One request at a time.** All three serialize — a lock in Python, a mutex in
 Ruby, a promise chain in TypeScript. Kohagi's stdout carries batches in the
 order the batches were asked for and nothing ties a reply to a requester, so two
-overlapping requests would each read the other's response.
+overlapping requests would each read the other's response. This is not
+theoretical for `proxy.rb`: Puma serves on a thread pool, so the threads queue
+on the mutex rather than racing.
 
 ## Before pointing production at one
 
