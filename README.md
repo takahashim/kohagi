@@ -352,7 +352,7 @@ In Saeko Himuro’s Heian-era novel series *Nante Suteki ni Japonésque* (『な
 
 Kohagiは[Ruri v3](https://huggingface.co/cl-nagoya/ruri-v3-130m) などのModernBERT系文埋め込みモデルをローカル環境で動かすためのCLI / Rustライブラリです。
 使い方はシンプルで、標準入力に`{"id","text"}`のJSONLを流すと、標準出力に`{"id","embedding"}`を返します。
-外部サービス等を使用せず、バイナリ単体で動作します。GPUも不要です。
+外部サービス等を使用せず、バイナリ単体で動作します。CPUのみでも動作しますし、Apple Neural EngineやCUDAもサポートしています。
 
 ```bash
 # インストール(リリースのバイナリ、または cargo install kohagi)
@@ -365,8 +365,8 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 - Apple Silicon では `--features metal` でビルドすると `--device metal` が使えます。CPUより高速です(出力は f32 のまま変わりません)
 - 同様に `--features coreml` でビルドすると `--device coreml` が使え、Apple Neural Engine (ANE) 上で動かせます。長い入力ほど高速で、CPU 出力に対し cosine ≈ 0.99999 です(短い入力では ANE が固定長にパディングする分、PyTorch (MPS) やマルチコア CPU の方が速いこともあります)。ローカルの変換済みモデルは `--coreml-dir`、Hugging Face Hub 上のものは `--coreml-model-id` で指定します
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
-- 入出力の契約・exit code(0/2/1)は [PROTOCOL.md](PROTOCOL.md) を参照してください。
-  Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) にあります。
+- 入出力の契約・exit code(0/1/2/3)は [PROTOCOL.md](PROTOCOL.md) を参照してください。
+  Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) に、OpenAI Embeddings API互換サーバのサンプルは[`examples/openapi_proxy/proxy.py`](examples/openapi_proxy/proxy.py)(Python)、[`examples/openapi_proxy/proxy.rb`](examples/openapi_proxy/proxy.rb)(Ruby)、[`examples/openapi_proxy/proxy.ts`](examples/openapi_proxy/proxy.ts)(TypeScript)にあります。
 
 また、Ruby では Kohagi 専用の gem である [kohagi-ruby](https://github.com/takahashim/kohagi-ruby)が使えます。
 
