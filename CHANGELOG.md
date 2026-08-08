@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **A converted CoreML model no longer returns NaN for a padded input on the
+  CPU.** The emitted attention mask blocked with fp16 `-inf`. A query position
+  further past the last real token than the local window's reach then has no key
+  left to attend to — padding either side, the window beyond that — and softmax
+  over an entirely `-inf` row is NaN. Pooling would have dropped those rows, but
+  the NaN does not stay in them: the next layer multiplies their values by an
+  exact zero, `0 * NaN` is NaN, and every real position goes with them. **The
+  whole embedding comes back NaN**, not part of it.
+
+  It needed three things at once, which is why it went unseen. Enough padding for
+  such a row to exist, which Kohagi's bucket routing only allows from `seq-256`
+  upward (the 256 bucket takes a 129-token text and pads it to 256; the 128 bucket
+  never pads more than the window's reach). A local layer to be reached. And the
+  CPU compute unit — the Neural Engine's fp16 saturates and returns finite values,
+  so the ANE path was never wrong.
+
+  The mask now blocks with a finite sentinel, as `transformers` and candle both do.
+  `GRAPH_VERSION` is bumped, so cached conversions are rebuilt rather than reused.
+  **Bundles converted by an earlier version carry the bug and should be
+  reconverted**, including any published to the Hub. Reported by a port of
+  `coreml-convert` to Swift, where the CPU is the ordinary case.
+
 ## [0.5.0] - 2026-08-01
 
 ### Added

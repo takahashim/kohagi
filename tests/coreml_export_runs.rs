@@ -50,6 +50,23 @@ fn load(package: &std::path::Path) -> Retained<MLModel> {
 
 /// The same, naming one function of a multi-function bundle.
 fn load_function(package: &std::path::Path, function: Option<&str>) -> Retained<MLModel> {
+    load_on(package, function, MLComputeUnits::CPUAndNeuralEngine)
+}
+
+/// The same, on the CPU alone.
+///
+/// Worth its own loader because the two compute units do not agree about the edges
+/// of fp16: the ANE saturates where the CPU produces an infinity, so a graph that
+/// divides by one can pass on the Neural Engine and return NaN here.
+fn load_on_cpu(package: &std::path::Path) -> Retained<MLModel> {
+    load_on(package, None, MLComputeUnits::CPUOnly)
+}
+
+fn load_on(
+    package: &std::path::Path,
+    function: Option<&str>,
+    units: MLComputeUnits,
+) -> Retained<MLModel> {
     let compiled = unsafe {
         #[allow(deprecated)]
         MLModel::compileModelAtURL_error(&url(package))
@@ -57,7 +74,7 @@ fn load_function(package: &std::path::Path, function: Option<&str>) -> Retained<
     .unwrap_or_else(|e| panic!("CoreML rejected {}: {e}", package.display()));
     let path = compiled.path().expect("a compiled path");
     let config = unsafe { MLModelConfiguration::new() };
-    unsafe { config.setComputeUnits(MLComputeUnits::CPUAndNeuralEngine) };
+    unsafe { config.setComputeUnits(units) };
     if let Some(name) = function {
         unsafe { config.setFunctionName(Some(&NSString::from_str(name))) };
     }
@@ -1412,4 +1429,97 @@ fn a_checkpoint_converts_itself_on_first_use_and_is_cached() {
     );
 
     let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// Deterministic weights of whatever shape the emitter asks for, so a graph can be
+/// exercised without a checkpoint. Seeded by the tensor's name: every weight differs
+/// and none is zero, which a masking bug could otherwise hide behind.
+struct Synthetic;
+
+impl kohagi::coreml_export::encoder::Weights for Synthetic {
+    fn get(&self, name: &str, expected: &[usize]) -> anyhow::Result<Vec<f32>> {
+        let n: usize = expected.iter().product();
+        let mut state = name.bytes().fold(0x811c_9dc5u32, |h, b| {
+            (h ^ u32::from(b)).wrapping_mul(16_777_619)
+        }) | 1;
+        Ok((0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 16) as f32 / 32_768.0 - 1.0
+            })
+            .collect())
+    }
+}
+
+/// Rung 15: a padded input stays finite, on the compute unit that does not round the
+/// question away.
+///
+/// A query position further past the last real token than the local window's reach
+/// has nothing left to attend to: padding on both sides, the window beyond that. If
+/// the mask blocks with an infinity, softmax over that row is NaN — and it does not
+/// stay in the row it started in, because the next layer weights those positions'
+/// values by an exact zero and `0 * NaN` is NaN. One padded row takes the whole
+/// output with it.
+///
+/// It needs all three at once, which is why it went unseen: enough padding for such a
+/// row to exist, a local layer to be reached, and the CPU compute unit — the ANE's
+/// fp16 saturates and returns finite garbage instead. With Kohagi's bucket routing a
+/// text lands in the smallest bucket that fits it, so the padding only runs this deep
+/// from `seq-128` upward: the 256 bucket takes 129-token texts and pads them to 256.
+#[test]
+fn a_padded_input_stays_finite_on_the_cpu() {
+    use kohagi::coreml_export::encoder::{self, EncoderConfig};
+
+    let cfg = EncoderConfig {
+        hidden: 16,
+        heads: 2,
+        layers: 3,
+        intermediate: 8,
+        vocab: 32,
+        eps: 1e-5,
+        // Reach 2, so a query at 6 or beyond sees only padding once 4 tokens are real.
+        local_attention: 4,
+        global_every: 3,
+        local_rope_theta: 10_000.0,
+        global_rope_theta: 160_000.0,
+        max_positions: 64,
+        activation: kohagi::coreml_export::modernbert::Activation::Gelu,
+    };
+    let (seq, real) = (32usize, 4usize);
+    assert!(
+        real + cfg.local_attention / 2 < seq,
+        "the padding has to run past the window for this to test anything"
+    );
+
+    let (m, blob) = encoder::emit(&cfg, &Synthetic, seq).expect("emit the encoder");
+    let dir = scratch("padded-rows");
+    write_package(&dir, &m, &blob).expect("write the package");
+
+    let ids: Vec<i32> = (0..seq)
+        .map(|i| if i < real { i as i32 + 5 } else { 0 })
+        .collect();
+    let mask: Vec<i32> = (0..seq).map(|i| i32::from(i < real)).collect();
+    let hidden = predict(
+        &load_on_cpu(&dir),
+        &[
+            ("input_ids", Feed::I32(vec![1, seq], ids)),
+            ("attention_mask", Feed::I32(vec![1, seq], mask)),
+        ],
+        "hidden",
+    );
+
+    assert_eq!(hidden.len(), seq * cfg.hidden);
+    let bad = hidden.iter().filter(|v| !v.is_finite()).count();
+    assert_eq!(
+        bad,
+        0,
+        "{bad} of {} hidden values are not finite; the attention mask blocks with an \
+         infinity somewhere and a fully padded query row has turned into NaN",
+        hidden.len()
+    );
+    // The real positions are what pooling reads, so say separately that they survived.
+    assert!(
+        hidden[..real * cfg.hidden].iter().all(|v| v.is_finite()),
+        "the unpadded rows are not finite"
+    );
 }

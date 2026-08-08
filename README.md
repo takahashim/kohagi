@@ -274,9 +274,12 @@ from 0.48 s to 0.56 s, and paid for itself after about a hundred short texts by
 cutting the per-text cost from 4.3 ms to 3.5 ms. **Match the set to the lengths
 your texts actually are.** A bucket nothing lands in is pure overhead — adding
 192 to the default, on a corpus where every text is under 32 tokens, cost 0.25 s
-of load and bought nothing. [`scripts/convert_coreml.py`](scripts/convert_coreml.py)
-does the same conversion through PyTorch and `coremltools`, bit-identical for
-`cl-nagoya/ruri-v3-130m`; every model published for Kohagi so far was made with it.
+of load and bought nothing. This is the converter to use, and what the models
+published for Kohagi are made with.
+[`scripts/convert_coreml.py`](scripts/convert_coreml.py) does the same conversion
+through PyTorch and `coremltools` and was how this one was checked — its vectors
+for `cl-nagoya/ruri-v3-130m` were bit-identical — but it is kept for that
+comparison rather than for converting.
 
 Measured against PyTorch on the same machine — M2, `ruri-v3-130m`, the default
 buckets, median of three runs, from `tools/benchmark.py`:

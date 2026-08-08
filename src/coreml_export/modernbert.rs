@@ -563,16 +563,31 @@ pub fn window_condition(seq: usize, window: usize) -> Vec<bool> {
     out
 }
 
+/// What an additive attention mask holds where a position may not attend.
+///
+/// Finite, because `-inf` makes softmax return NaN for any query row with no unmasked
+/// key at all — which padding produces, and which then spreads (see the mask prologue
+/// in [`crate::coreml_export::encoder`]). The reference implementations are finite for
+/// the same reason: `transformers` fills both the padding and the sliding-window mask
+/// with `torch.finfo(dtype).min`, and candle's `prepare_4d_attention_mask` uses
+/// `f32::MIN`.
+///
+/// Not that rule's own answer here, though. This constant is emitted as fp16 and added
+/// to the scaled scores in fp16, where `finfo.min` is -65504 and the next value along
+/// is the overflow: -65504 plus a score below about -16 rounds to `-inf` and hands the
+/// NaN back, data-dependently. -10_000 keeps 55,000 of headroom, drives `exp` to
+/// exactly zero all the same, and stays well outside the range Kohagi's own Metal path
+/// has been running in — it clamps this same mask to -60 and matches the CPU path to
+/// 1e-5 (`crate::encoder`).
+pub const BLOCKED: f32 = -10_000.0;
+
 /// A sliding-window additive mask, `[1, 1, seq, seq]`: zero where a position may
-/// attend, a large negative elsewhere.
+/// attend, [`BLOCKED`] elsewhere.
 ///
 /// `window` is the total width, so a position sees `window / 2` either side, which
 /// is how ModernBERT's `local_attention` is defined. `None` gives the global mask,
 /// which is all zeros for an unpadded input.
 pub fn attention_mask(seq: usize, window: Option<usize>) -> Vec<f32> {
-    // -10_000 rather than -inf: fp16 saturates, and softmax of an all -inf row is
-    // NaN. The reference model uses a finite sentinel for the same reason.
-    const BLOCKED: f32 = -10_000.0;
     let mut mask = vec![0.0f32; seq * seq];
     if let Some(window) = window {
         let reach = window / 2;
@@ -596,6 +611,35 @@ pub fn to_fp16(values: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Why [`BLOCKED`] is neither `-inf` nor the dtype's smallest finite value.
+    ///
+    /// The graph adds this to the scaled scores in fp16 and takes a softmax. Both of
+    /// those steps have to survive it: the sum has to stay finite for scores either
+    /// side of zero, and `exp` of the result has to be exactly zero so a blocked key
+    /// contributes nothing. `f16::MIN` fails the first at a score real attention
+    /// reaches, which is the trap this constant exists to stay out of.
+    #[test]
+    fn the_blocked_sentinel_survives_the_addition_it_is_written_for() {
+        let blocked = f16::from_f32(BLOCKED);
+        for score in [-60.0f32, -30.0, -16.0, 0.0, 30.0, 60.0] {
+            let sum = blocked + f16::from_f32(score);
+            assert!(
+                sum.is_finite(),
+                "BLOCKED + {score} overflowed fp16, which softmax turns into NaN"
+            );
+            assert_eq!(
+                (sum.to_f32() - score).exp(),
+                0.0,
+                "BLOCKED + {score} does not drive exp to zero"
+            );
+        }
+        assert!(
+            (f16::MIN + f16::from_f32(-20.0)).is_infinite(),
+            "if finfo(fp16).min no longer overflows here, this constant can follow \
+             the reference implementations' rule literally"
+        );
+    }
 
     #[test]
     fn rope_tables_duplicate_the_angles_across_the_halves() {

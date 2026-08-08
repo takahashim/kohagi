@@ -572,16 +572,24 @@ fn prologue(
         Tensor::new("m_is_padding", DType::Bool, &square),
         &[("x", &inverted), ("dtype", &to_bool)],
     );
-    // -inf where padding, else the 0 that `inverted` already holds. The reference
-    // model uses fp16 -inf rather than a finite sentinel.
-    let neg_inf = b.const_fp16_bits(
-        Tensor::new("m_neg_inf", DType::Fp16, &[]),
-        half::f16::NEG_INFINITY,
+    // `BLOCKED` where padding, else the 0 that `inverted` already holds.
+    //
+    // Finite, not -inf. Both selects below draw on this one constant, so a query
+    // position further past the last real token than the window's reach has every
+    // key blocked — padding to its left and right, the window beyond that — and an
+    // infinite sentinel makes softmax return NaN for the whole row. Those rows are
+    // padding and pooling would drop them, but the NaN does not stay there: the next
+    // layer's `probs @ v` multiplies them by an exact zero, and `0 * NaN` is NaN, so
+    // every real position goes with them. The ANE does not show this and the CPU
+    // compute unit does.
+    let blocked = b.const_fp16(
+        Tensor::new("m_blocked", DType::Fp16, &[]),
+        &[modernbert::BLOCKED],
     );
     let global_mask = b.op(
         "select",
         Tensor::new("global_mask", DType::Fp16, &square),
-        &[("cond", &is_padding), ("a", &neg_inf), ("b", &inverted)],
+        &[("cond", &is_padding), ("a", &blocked), ("b", &inverted)],
     );
     // The window itself is a constant: only the padding part depends on input.
     let outside = modernbert::window_condition(seq, cfg.local_attention);
@@ -589,7 +597,7 @@ fn prologue(
     let local_mask = b.op(
         "select",
         Tensor::new("local_mask", DType::Fp16, &square),
-        &[("cond", &outside_c), ("a", &neg_inf), ("b", &global_mask)],
+        &[("cond", &outside_c), ("a", &blocked), ("b", &global_mask)],
     );
 
     // Negative ids wrap into the table, as the traced Python does.
@@ -1109,7 +1117,7 @@ mod tests {
         assert_eq!(encoded.len(), 55_944, "model.mlmodel size");
         assert_eq!(
             crate::fnv::hash(&encoded),
-            0x77c6_381d_d954_3ad5,
+            0x0f0a_b9d0_301c_aaf9,
             "model.mlmodel digest"
         );
         assert_eq!(blob.len(), 13_760, "weight.bin size");
