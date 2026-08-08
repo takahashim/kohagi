@@ -162,6 +162,12 @@ fn run(args: &Args) -> Result<()> {
     if lengths.is_empty() || lengths[0] == 0 {
         bail!("--sequence-lengths must be positive");
     }
+    // Before the download and the emit, not after: a build that cannot compile
+    // should cost a message rather than 260MB of bundle it then refuses to finish.
+    #[cfg(not(feature = "coreml"))]
+    if args.compiled {
+        bail!("--compiled needs a build with `--features coreml,coreml-export`");
+    }
 
     let checkpoint = gather(args)?;
     let opts = Options {
@@ -200,6 +206,7 @@ fn run(args: &Args) -> Result<()> {
                 out.strip_prefix(&args.out_dir).unwrap_or(&out).display()
             );
         }
+        // Unreachable: `run` refuses `--compiled` on such a build before it starts.
         #[cfg(not(feature = "coreml"))]
         bail!("--compiled needs a build with `--features coreml,coreml-export`");
     }

@@ -68,12 +68,16 @@ def synth(kind: str, n: int) -> list[str]:
     ]
 
 
-def time_kohagi(binary: str, texts: list[str], args, *, coreml: bool = False) -> dict:
+def time_kohagi(
+    binary: str, texts: list[str], args, *, coreml: bool = False, device: str | None = None
+) -> dict:
     stdin = "".join(
         json.dumps({"id": i, "text": t}, ensure_ascii=False) + "\n"
         for i, t in enumerate(texts)
     )
     cmd = [binary, "--model-id", args.model_id, "--max-seq-length", str(args.max_seq_length)]
+    if device:
+        cmd += ["--device", device]
     if coreml:
         cmd += ["--device", "coreml"]
         if args.coreml_dir:
@@ -152,6 +156,12 @@ def main() -> int:
     p.add_argument("--runs", type=int, default=3)
     p.add_argument("--texts", help="file with one text per line")
     p.add_argument("--device", default="cpu", help="PyTorch device: cpu, mps, cuda")
+    p.add_argument(
+        "--kohagi-device",
+        action="append",
+        default=[],
+        help="extra Kohagi device to time, e.g. metal. Repeatable; adds one row each.",
+    )
     coreml = p.add_mutually_exclusive_group()
     coreml.add_argument(
         "--coreml-dir",
@@ -190,6 +200,8 @@ def main() -> int:
     # Kohagi, Metal shader compilation for MPS. Discard it.
     print("warming up...", flush=True)
     time_kohagi(args.kohagi, texts[:8], args)
+    for d in args.kohagi_device:
+        time_kohagi(args.kohagi, texts[:8], args, device=d)
     if args.coreml_dir or args.coreml_model_id:
         time_kohagi(args.kohagi, texts[:8], args, coreml=True)
 
@@ -199,6 +211,11 @@ def main() -> int:
     runs = [time_kohagi(args.kohagi, texts, args) for _ in range(args.runs)]
     rows.append(("kohagi", med(runs, "load"), med(runs, "encode"), med(runs, "total")))
 
+    for d in args.kohagi_device:
+        runs = [time_kohagi(args.kohagi, texts, args, device=d) for _ in range(args.runs)]
+        rows.append(
+            (f"kohagi/{d}", med(runs, "load"), med(runs, "encode"), med(runs, "total"))
+        )
     if args.coreml_dir or args.coreml_model_id:
         runs = [time_kohagi(args.kohagi, texts, args, coreml=True) for _ in range(args.runs)]
         rows.append(

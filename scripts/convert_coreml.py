@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 """Convert a ModernBERT sentence encoder to the CoreML layout Kohagi expects.
 
+NOT the converter to use. `coreml-convert` (`--features coreml-export`) is, and it
+is what the published models are made with:
+
+    cargo run --release --bin coreml-convert --features coreml,coreml-export -- \\
+        --model-id cl-nagoya/ruri-v3-130m --out-dir <out-dir> \\
+        --sequence-lengths 64,128,256,512 --compiled
+
+This script is kept as the independent second opinion that checked that one — a
+conversion through PyTorch and coremltools, arriving at the same vectors by another
+route. Do not publish what it writes without looking at the mask first. It traces
+the model in fp32, where `transformers` blocks attention with
+`torch.finfo(torch.float32).min`, and coremltools casts that constant to fp16 on the
+way out; -3.4e38 has no fp16 spelling but `-inf` does. A bundle that blocks with
+`-inf` returns NaN for the whole embedding of a padded input on the CPU compute unit
+— see `BLOCKED` in `src/coreml_export/modernbert.rs`. Whether this path lands there
+has not been measured; `grep -c -- -inf <compiled>/model.mil` after a conversion
+answers it.
+
 Kohagi's `--device coreml` backend runs the encoder on the Apple Neural Engine.
 The ANE needs a *fixed-shape, batch=1* model, and one model per sequence length,
 so this script emits one `seq-<N>.mlpackage` per bucket length plus the

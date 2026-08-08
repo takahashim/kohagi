@@ -7,8 +7,11 @@
 //! costs no separate conversion step.
 //!
 //! Doing this at runtime is only safe because the emitter is checked rather than
-//! trusted: its output for `ruri-v3-130m` is bit-identical to the Python
-//! conversion, an unsupported config is refused before anything is written, and
+//! trusted: its vectors for `ruri-v3-130m` were bit-identical to the Python
+//! conversion's when both blocked attention with `-inf` — the two now differ in that
+//! constant alone (see [`crate::coreml_export::modernbert::BLOCKED`]), which changes
+//! only the padded rows pooling drops. An unsupported config is refused before
+//! anything is written, and
 //! [`super::CoreMlEncoder::load`] validates the bundle's inputs and output shape.
 //! What it cannot check is whether a checkpoint is
 //! *itself* sensitive to fp16, so [`self_check`] measures that once, after the
@@ -32,7 +35,7 @@ use crate::coreml_export::{bundle_name, encoder, Checkpoint};
 ///
 /// The golden-file test in `crate::coreml_export::encoder` pins the emitted bytes;
 /// a change that updates those hashes updates this too.
-pub const GRAPH_VERSION: u32 = 1;
+pub const GRAPH_VERSION: u32 = 2;
 
 /// The emitter options a quantization level asks for.
 fn options(quantize: Quantize) -> encoder::Options {
