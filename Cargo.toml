@@ -7,7 +7,7 @@ exclude = ["tools"]
 
 [package]
 name = "kohagi"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.89"
 # ...and out of the published crate: they are for developing Kohagi, not using it.
