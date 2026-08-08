@@ -4,7 +4,7 @@
 NOT the converter to use. `coreml-convert` (`--features coreml-export`) is, and it
 is what the published models are made with:
 
-    cargo run --release --bin coreml-convert --features coreml-export -- \\
+    cargo run --release --bin coreml-convert --features coreml,coreml-export -- \\
         --model-id cl-nagoya/ruri-v3-130m --out-dir <out-dir> \\
         --sequence-lengths 64,128,256,512 --compiled
 
