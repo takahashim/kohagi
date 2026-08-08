@@ -27,15 +27,11 @@ use anyhow::Result;
 use crate::config::CoreMlQuantize as Quantize;
 use crate::coreml_export::{bundle_name, encoder, Checkpoint};
 
-/// The emitted graph's version, part of the cache key.
+/// The emitted graph's version, which is half of this cache's key.
 ///
-/// Bumped whenever the emitter changes what it builds, so that a new Kohagi never
-/// reads a bundle an older one wrote. Deliberately not `CARGO_PKG_VERSION`: a
-/// release that leaves the graph alone should not throw away every user's cache.
-///
-/// The golden-file test in `crate::coreml_export::encoder` pins the emitted bytes;
-/// a change that updates those hashes updates this too.
-pub const GRAPH_VERSION: u32 = 2;
+/// Defined beside the emitter that moves it, because a bundle records it too — see
+/// [`crate::coreml_export::GRAPH_VERSION`].
+pub use crate::coreml_export::GRAPH_VERSION;
 
 /// The emitter options a quantization level asks for.
 fn options(quantize: Quantize) -> encoder::Options {

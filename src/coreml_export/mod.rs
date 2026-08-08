@@ -101,11 +101,31 @@ fn feature(tensor: &mil::Tensor) -> FeatureDescription {
     }
 }
 
+/// The emitted graph's version.
+///
+/// Bumped whenever the emitter changes what it builds. It is the cache key for
+/// [`crate::coreml::autoconvert`], so a new Kohagi never reads a bundle an older one
+/// wrote, and it is recorded in every bundle's provenance, so a *published* bundle
+/// can be told apart from its predecessor. The crate version cannot do either job:
+/// releases that leave the graph alone would throw away every cache, and two
+/// conversions from the same release can still differ if the graph was fixed between
+/// them — which is exactly what 2 records.
+///
+/// The golden-file test in [`encoder`] pins the emitted bytes; a change that updates
+/// those hashes updates this too.
+///
+/// | version | graph |
+/// | --- | --- |
+/// | 1 | first release (0.5.0) |
+/// | 2 | attention blocked with a finite value rather than `-inf` (0.5.1) |
+pub const GRAPH_VERSION: u32 = 2;
+
 /// What produced a model, recorded in its `userDefined` metadata.
 ///
 /// A model card is expected to state the toolchain and the source revision; a
-/// converted model that carries them can be asked instead of trusted.
-/// `coreml-inspect` reads these back.
+/// converted model that carries them can be asked instead of trusted. Only the
+/// quantization key is read back by Kohagi itself (`crate::coreml`, which warns
+/// on load); the rest answer a question about a bundle someone already has.
 #[derive(Debug, Clone, Default)]
 pub struct Provenance {
     /// The checkpoint this was converted from, as a Hub id or a path.
@@ -133,6 +153,12 @@ impl Provenance {
             (
                 "com.github.takahashim.kohagi.emitter".to_string(),
                 "coreml-export".to_string(),
+            ),
+            // Unconditional, and separate from the crate version: two bundles from
+            // one release can hold different graphs, and this is what says so.
+            (
+                "com.github.takahashim.kohagi.graph_version".to_string(),
+                GRAPH_VERSION.to_string(),
             ),
         ];
         if !self.source.is_empty() {
