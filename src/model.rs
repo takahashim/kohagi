@@ -592,12 +592,27 @@ fn open_device(backend: Backend) -> Result<Device> {
 /// What a checkpoint's `1_Pooling/config.json` says its pooling is, or `None`
 /// when it publishes neither a cls nor a mean flag (or has no such file).
 ///
-/// The sentence-transformers config sets one `pooling_mode_*` bool per mode.
+/// Two spellings are in circulation. sentence-transformers 5 writes a single
+/// `pooling_mode` string; every earlier version wrote one `pooling_mode_*` bool
+/// per mode, which is still what most checkpoints on the Hub carry. Both are
+/// read, because a 5.x checkpoint judged by the older rule alone looks like a
+/// checkpoint with no pooling config at all — and that reads as mean, which is
+/// silently wrong for a cls model.
+///
 /// Only the two Kohagi supports are read; a checkpoint pooling some other way
 /// (max, weighted mean) reads as `None`, the same as no file at all, which is
-/// the honest answer since Kohagi cannot reproduce it.
+/// the honest answer since Kohagi cannot reproduce it. A checkpoint combining
+/// several modes writes an array there, which is not a string and so takes the
+/// same path.
 fn pooling_from_st_config(json: &str) -> Option<Pooling> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    if let Some(mode) = v.get("pooling_mode").and_then(|m| m.as_str()) {
+        return match mode {
+            "cls" => Some(Pooling::Cls),
+            "mean" => Some(Pooling::Mean),
+            _ => None,
+        };
+    }
     if v.get("pooling_mode_cls_token")? == &serde_json::Value::Bool(true) {
         Some(Pooling::Cls)
     } else if v.get("pooling_mode_mean_tokens")? == &serde_json::Value::Bool(true) {
@@ -978,11 +993,32 @@ mod pooling_tests {
     }
 
     #[test]
+    fn reads_cls_and_mean_from_the_5x_st_config() {
+        // What sentence-transformers 5 saves, and so what a model fine-tuned
+        // today ships: one string in place of the per-mode bools.
+        let cls = r#"{"embedding_dimension": 512, "pooling_mode": "cls"}"#;
+        let mean = r#"{"embedding_dimension": 512, "pooling_mode": "mean",
+                       "include_prompt": true}"#;
+        assert_eq!(pooling_from_st_config(cls), Some(Pooling::Cls));
+        assert_eq!(pooling_from_st_config(mean), Some(Pooling::Mean));
+    }
+
+    #[test]
     fn unsupported_or_absent_pooling_reads_as_none() {
         // A mode Kohagi cannot reproduce, and junk, both decline rather than guess.
         let other = r#"{"pooling_mode_max_tokens": true}"#;
         assert_eq!(pooling_from_st_config(other), None);
         assert_eq!(pooling_from_st_config("not json"), None);
+    }
+
+    #[test]
+    fn unsupported_or_combined_pooling_reads_as_none_in_the_5x_config() {
+        let weighted = r#"{"pooling_mode": "weightedmean"}"#;
+        // Several modes at once are concatenated into one vector; the array is
+        // not a string, and Kohagi has no way to reproduce the result anyway.
+        let combined = r#"{"pooling_mode": ["mean", "cls"]}"#;
+        assert_eq!(pooling_from_st_config(weighted), None);
+        assert_eq!(pooling_from_st_config(combined), None);
     }
 
     #[test]
