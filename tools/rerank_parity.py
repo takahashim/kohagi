@@ -51,6 +51,106 @@ SAMPLE_PAIRS = [
 ]
 
 
+def pairs_from(args):
+    if not args.pairs:
+        return SAMPLE_PAIRS
+    with open(args.pairs, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    return [(r["query"], r["text"]) for r in rows]
+
+
+def score_with(args, pairs, device, raw_logits):
+    """kohagi-rerank's scores for `pairs` on one device, in input order."""
+    stdin = "".join(
+        json.dumps({"id": i, "query": q, "text": t}, ensure_ascii=False) + "\n"
+        for i, (q, t) in enumerate(pairs)
+    )
+    cmd = [
+        args.kohagi,
+        "--model-id", args.model_id,
+        "--max-seq-length", str(args.max_seq_length),
+        "--precision", args.precision,
+        "--device", device,
+    ]
+    if device == "coreml":
+        # One bucket, matching --max-seq-length: a pair fills a long bucket, and
+        # a comparison should not depend on which one it landed in.
+        cmd += ["--coreml-buckets", str(args.max_seq_length)]
+    if raw_logits:
+        cmd.append("--raw-logits")
+    proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
+    if proc.returncode == 1:
+        sys.stderr.write(proc.stderr)
+        raise SystemExit(1)
+    got = {json.loads(l)["id"]: json.loads(l)["score"] for l in proc.stdout.splitlines()}
+    return [got[i] for i in range(len(pairs))]
+
+
+def sigmoid(x):
+    import math
+
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def compare_devices(args, pairs) -> int:
+    """One backend against another, measured where the measurement transfers.
+
+    A score is a sigmoid, so the same underlying error shows up 12x larger at
+    s=0.5 than at s=0.02 — quoting a worst-case score difference says nothing
+    about a threshold elsewhere. The logit error does transfer: for a threshold
+    t, a pair can only cross it if its score sits within about d*t*(1-t), which
+    is derived, not sampled, and so does not have to be re-measured when a
+    threshold moves.
+    """
+    import statistics
+
+    ref = score_with(args, pairs, args.against, raw_logits=True)
+    mine = score_with(args, pairs, args.device, raw_logits=True)
+    delta = [abs(a - b) for a, b in zip(ref, mine)]
+    scores = [sigmoid(x) for x in ref]
+
+    ordered = sorted(delta)
+    p99 = ordered[min(len(ordered) - 1, int(0.99 * len(ordered)))]
+    worst = ordered[-1]
+
+    print(f"model      : {args.model_id} ({args.max_seq_length} tokens)")
+    print(f"comparison : --device {args.device} against --device {args.against}, in logit space")
+    print(f"pairs      : {len(pairs)}")
+    print()
+    print(f"logit error d: mean {statistics.fmean(delta):.4f}  p99 {p99:.4f}  max {worst:.4f}")
+
+    # The whole argument rests on d being a property of the encoder rather than
+    # of where the score landed, so show it split by score region rather than
+    # asserting it.
+    print("\n  by score region (is d scale-invariant?)")
+    regions = [(0.0, 0.05), (0.05, 0.3), (0.3, 0.7), (0.7, 1.0)]
+    for lo, hi in regions:
+        group = [d for d, s in zip(delta, scores) if lo <= s < hi]
+        if not group:
+            continue
+        print(f"    {lo:.2f}-{hi:.2f}  n={len(group):>5}  mean {statistics.fmean(group):.4f}"
+              f"  max {max(group):.4f}")
+
+    # Flip bands. Worst-case d, because a threshold's safety is not an average.
+    corpus = None
+    if args.scores:
+        import numpy as np
+
+        corpus = np.load(args.scores)
+        print(f"\n  corpus for band populations: {args.scores} ({len(corpus):,} scores)")
+    print("\n  threshold   flip band (score space)   population in band")
+    for t in [float(x) for x in args.thresholds.split(",")]:
+        half = worst * t * (1 - t)
+        if corpus is not None:
+            n = int(((corpus > t - half) & (corpus < t + half)).sum())
+            pop = f"{n:>9,} ({n / len(corpus):.2%})"
+        else:
+            pop = "        —"
+        print(f"    {t:<9} +/- {half:.5f}            {pop}")
+    print("\nA pair outside its threshold's band cannot cross it; one inside may or may not.")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--kohagi", default="kohagi-rerank", help="path to the kohagi-rerank binary")
@@ -67,38 +167,32 @@ def main() -> int:
         "--pairs",
         help="JSONL file of {\"query\", \"text\"} pairs (default: built-in samples)",
     )
+    p.add_argument(
+        "--against",
+        help="compare --device against this device instead of against PyTorch, in "
+        "logit space. Use it to measure what a lower-precision backend costs: "
+        "`--device coreml --against cpu` reports the logit error d, from which "
+        "the flip band of any score threshold follows as d*t*(1-t).",
+    )
+    p.add_argument(
+        "--thresholds",
+        default="0.02,0.1,0.5,0.6",
+        help="score thresholds to report flip bands for, with --against",
+    )
+    p.add_argument(
+        "--scores",
+        help="a .npy of scores from the same model, with --against: adds how "
+        "much of a real corpus sits inside each flip band",
+    )
     args = p.parse_args()
 
-    pairs = SAMPLE_PAIRS
-    if args.pairs:
-        with open(args.pairs, encoding="utf-8") as f:
-            rows = [json.loads(line) for line in f if line.strip()]
-        pairs = [(r["query"], r["text"]) for r in rows]
+    if args.against:
+        return compare_devices(args, pairs_from(args))
+
+    pairs = pairs_from(args)
 
     # --- kohagi-rerank, over its stdio protocol ------------------------------
-    stdin = "".join(
-        json.dumps({"id": i, "query": q, "text": t}, ensure_ascii=False) + "\n"
-        for i, (q, t) in enumerate(pairs)
-    )
-    cmd = [
-        args.kohagi,
-        "--model-id", args.model_id,
-        "--max-seq-length", str(args.max_seq_length),
-        "--precision", args.precision,
-        "--device", args.device,
-    ]
-    if args.device == "coreml":
-        # One bucket, matching --max-seq-length: a pair fills a long bucket, and
-        # a comparison should not depend on which one it landed in.
-        cmd += ["--coreml-buckets", str(args.max_seq_length)]
-    if args.raw_logits:
-        cmd.append("--raw-logits")
-    proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
-    if proc.returncode == 1:
-        sys.stderr.write(proc.stderr)
-        return 1
-    got = {json.loads(l)["id"]: json.loads(l)["score"] for l in proc.stdout.splitlines()}
-    mine = [got[i] for i in range(len(pairs))]
+    mine = score_with(args, pairs, args.device, args.raw_logits)
 
     # --- the reference -------------------------------------------------------
     import torch
