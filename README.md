@@ -188,9 +188,12 @@ warm process):
 On the CPU it is a little faster than PyTorch and on the GPU about the same; on
 the Neural Engine it is 3.4× the fastest PyTorch path. Scores match the
 reference to f32 rounding on every backend except `coreml`, whose encoder is
-fp16 — that shifts scores by 1e-4 on average, leaves ranking essentially
-unchanged, and is quantified in [PROTOCOL-rerank.md](PROTOCOL-rerank.md).
-Verify any of it with `tools/rerank_parity.py`.
+fp16. That error lives in the logit, where it is 0.058 at worst, and the
+sigmoid compresses it hardest exactly where thresholds matter most — so a
+cutoff at 0.02 moved nothing in 200 sampled boundary pairs while one at 0.5
+moved 12% of them. [PROTOCOL-rerank.md](PROTOCOL-rerank.md) derives the band
+for any threshold; `tools/rerank_parity.py --against` and
+`tools/rerank_fp16_bands.py` re-measure it.
 
 ```bash
 # Converts the checkpoint for the ANE on first use and caches it.
