@@ -62,15 +62,88 @@ fn rows_per_forward(seq: usize, backend: Backend) -> usize {
     (budget / (seq * seq).max(1)).max(1)
 }
 
-/// Pooled vectors from one forward, tagged with their caller-side row index.
-type PooledRows = Vec<(usize, Vec<f32>)>;
-
 /// One forward pass: rows `start .. start + rows` of `batch`. A bucketed
 /// batch is split into as many of these as the memory budget requires.
 struct Unit<'a> {
     batch: &'a BatchInput,
     start: usize,
     rows: usize,
+}
+
+/// Run bucketed batches through the encoder and reduce each row's hidden
+/// states to one result, in the caller's original order.
+///
+/// The shared middle of every candle-backed task: split each batch into
+/// forwards that fit the memory budget, run them the way this backend wants,
+/// and put the rows back where they came from. What varies is only the last
+/// step — mean-pool and normalize for an embedding, take the CLS token and
+/// push it through a classifier head for a reranker — so that is the closure.
+///
+/// `reduce` receives one row's `[seq, dim]` hidden states, that row's mask,
+/// and `dim`. It runs on a worker thread, so it must not assume an order.
+pub(crate) fn run_batches<T: Send>(
+    weights: &Weights,
+    device: &Device,
+    backend: Backend,
+    batches: &[BatchInput],
+    rows_total: usize,
+    reduce: impl Fn(&[f32], &[i64], usize) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    // Split each bucketed batch into forwards that fit the memory budget.
+    let limit = weights.max_rows_per_forward();
+    let mut units: Vec<Unit> = Vec::new();
+    for batch in batches {
+        let cap = rows_per_forward(batch.seq, backend).min(limit);
+        let mut start = 0;
+        while start < batch.batch {
+            let rows = cap.min(batch.batch - start);
+            units.push(Unit { batch, start, rows });
+            start += rows;
+        }
+    }
+
+    let run = |unit: &Unit| -> Result<Vec<(usize, T)>> {
+        let (batch, seq) = (unit.batch, unit.batch.seq);
+        // This unit's slice of the batch's `[batch, seq]` layout.
+        let range = unit.start * seq..(unit.start + unit.rows) * seq;
+        let ids = &batch.ids[range.clone()];
+        let mask = &batch.mask[range];
+        let (hidden, dim) = weights.forward(device, ids, mask, unit.rows, seq)?;
+
+        let mut done = Vec::with_capacity(unit.rows);
+        for row in 0..unit.rows {
+            let reduced = reduce(
+                &hidden[row * seq * dim..(row + 1) * seq * dim],
+                &mask[row * seq..(row + 1) * seq],
+                dim,
+            )?;
+            done.push((batch.orig[unit.start + row], reduced));
+        }
+        Ok(done)
+    };
+
+    // The two backends want opposite shapes. On the CPU, parallelism comes
+    // from running many narrow forwards at once. There is only one GPU, so
+    // fanning out just makes threads contend over command submission and
+    // multiplies scratch memory; a GPU runs wide forwards back to back
+    // instead, and gets its parallelism inside each one.
+    let per_unit: Vec<Result<Vec<(usize, T)>>> = match backend {
+        Backend::Cpu => worker_pool()?.install(|| units.par_iter().map(run).collect()),
+        Backend::Metal | Backend::Cuda => units.iter().map(run).collect(),
+        // The CoreML backend runs its own fixed-shape path and never arrives here.
+        Backend::CoreML => unreachable!("CoreML does not use the candle batch runner"),
+    };
+
+    let mut out: Vec<Option<T>> = (0..rows_total).map(|_| None).collect();
+    for unit in per_unit {
+        for (orig, value) in unit? {
+            out[orig] = Some(value);
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, v)| v.with_context(|| format!("row {i} came back from no batch")))
+        .collect()
 }
 
 /// Where the model weights come from.
@@ -151,6 +224,78 @@ pub enum Backend {
     CoreML,
 }
 
+impl Backend {
+    /// The name `--device` takes, so a report can be pasted back as a flag.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+            Self::CoreML => "coreml",
+        }
+    }
+}
+
+impl Precision {
+    /// The name `--precision` takes.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::Bf16 => "bf16",
+        }
+    }
+}
+
+/// What a loaded model is, in the terms a results file should record.
+///
+/// The point of it is [`Self::sha256`]: everything else here can be inferred
+/// from the command line, but which weights actually answered cannot. Written
+/// by `--print-model-info` as one JSON line, and abbreviated into the stderr
+/// summary of every run.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ModelInfo {
+    /// `--device`, as its flag value.
+    pub backend: &'static str,
+    /// `--precision`, as its flag value.
+    pub precision: &'static str,
+    /// sha256 of the `model.safetensors` these weights were loaded from.
+    /// Absent on the CoreML path, which loads a converted bundle instead and
+    /// reports [`Self::source_sha256`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// The checkpoint a CoreML bundle was converted from, as its converter
+    /// recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// sha256 of that checkpoint's weights. `None` for a bundle converted
+    /// before Kohagi recorded it — an unknown provenance says so rather than
+    /// borrowing the bundle's own identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
+    /// The fixed sequence lengths a CoreML bundle serves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buckets: Option<Vec<usize>>,
+    /// `embeddings-int8` / `all-int8` for a quantized CoreML bundle, `none`
+    /// for an fp16 one. A quantized bundle's vectors are not interchangeable
+    /// with an fp16 one's, so the number a run produced needs it recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    /// The emitted graph's version (`GRAPH_VERSION`), for a CoreML bundle that
+    /// records one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_version: Option<String>,
+    /// The pooling that was resolved at load — the checkpoint's own choice
+    /// unless `--pooling` overrode it.
+    pub pooling: &'static str,
+    /// Output dimension, the model's `hidden_size`.
+    pub dim: usize,
+    pub max_seq_length: usize,
+    /// `sigmoid` or `logit` for a reranker: which of the two a score is. Absent
+    /// for an embedding model, which has no score to shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<&'static str>,
+}
+
 /// Knobs for [`Embedder::load`]. `Default` matches Ruri v3.
 #[derive(Clone, Copy)]
 pub struct Options {
@@ -187,7 +332,7 @@ impl Default for Options {
 }
 
 /// The loaded weights, in whichever precision was requested.
-enum Weights {
+pub(crate) enum Weights {
     F32(Arc<ModernBert>),
     #[cfg(target_arch = "x86_64")]
     Bf16(Arc<crate::bf16::Bf16ModernBert>),
@@ -215,6 +360,10 @@ pub struct Embedder {
     /// time (see [`resolve_pooling`]), so `embed` never re-decides it.
     pooling: Pooling,
     dim: usize,
+    /// sha256 of the weights file this was loaded from, started at load and
+    /// collected when something asks. `None` on the CoreML path, whose
+    /// provenance is read from the bundle instead (see [`Embedder::info`]).
+    fingerprint: Option<crate::fingerprint::Fingerprint>,
 }
 
 impl Embedder {
@@ -260,6 +409,11 @@ impl Embedder {
         );
 
         let device = open_device(opts.backend)?;
+        // Started here and collected at the end of the run: the weights are
+        // about to be memory-mapped, so this reads the same file the forward
+        // pass will fault in, and doing it on another thread keeps half a
+        // gigabyte of hashing out of the caller's first result.
+        let fingerprint = crate::fingerprint::Fingerprint::spawn(model_path.clone());
         let weights = load_weights(&model_path, &config, &device, opts.precision)?;
         let tokenizer = load_tokenizer(&tokenizer_path, opts.max_seq_length)?;
         Ok(Self {
@@ -268,6 +422,7 @@ impl Embedder {
             opts,
             pooling,
             dim,
+            fingerprint: Some(fingerprint),
         })
     }
 
@@ -324,6 +479,9 @@ impl Embedder {
             opts,
             pooling,
             dim,
+            // A bundle has no safetensors to hash; what it can say about the
+            // checkpoint behind it is in its own metadata, read by `info`.
+            fingerprint: None,
         };
         #[cfg(feature = "coreml-export")]
         if converted {
@@ -422,6 +580,43 @@ impl Embedder {
         self.dim
     }
 
+    /// What this model is, for a summary line or a results file. Cheap: every
+    /// field was resolved at load, except a CoreML bundle's provenance, which
+    /// is a metadata lookup on an already-open model.
+    pub fn info(&self) -> ModelInfo {
+        // Mutated only under the `coreml` feature, which is the only path with
+        // bundle fields to fill in.
+        #[allow(unused_mut)]
+        let mut info = ModelInfo {
+            backend: self.opts.backend.name(),
+            precision: self.opts.precision.name(),
+            sha256: self.fingerprint.as_ref().and_then(|f| f.get()),
+            source: None,
+            source_sha256: None,
+            buckets: None,
+            quantization: None,
+            graph_version: None,
+            pooling: self.pooling.name(),
+            dim: self.dim,
+            max_seq_length: self.opts.max_seq_length,
+            score: None,
+        };
+        #[cfg(feature = "coreml")]
+        if let Engine::CoreMl(encoder) = &self.engine {
+            let p = encoder.provenance();
+            info.source = p.source;
+            info.source_sha256 = p.source_sha256;
+            info.graph_version = p.graph_version;
+            // Every bundle serves the lengths it was compiled for, whether or
+            // not its metadata says so, so this reads the loaded models.
+            info.buckets = Some(encoder.buckets());
+            // An fp16 bundle carries no quantization key; saying "none" is
+            // what makes the two cases distinguishable in a results file.
+            info.quantization = Some(p.quantization.unwrap_or_else(|| "none".to_string()));
+        }
+        info
+    }
+
     /// Embed a batch of texts, one vector per text, in input order. Prefixes
     /// (e.g. Ruri's `"検索文書: "`) are the caller's job — pass prefixed text.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -452,63 +647,21 @@ impl Embedder {
         device: &Device,
     ) -> Result<(Vec<Vec<f32>>, Vec<TokenInfo>)> {
         let (batches, info) = tokenize_bucket(&self.tokenizer, texts, self.opts.batch_size)?;
-
-        // Split each bucketed batch into forwards that fit the memory budget.
-        let limit = weights.max_rows_per_forward();
-        let mut units: Vec<Unit> = Vec::new();
-        for batch in &batches {
-            let cap = rows_per_forward(batch.seq, self.opts.backend).min(limit);
-            let mut start = 0;
-            while start < batch.batch {
-                let rows = cap.min(batch.batch - start);
-                units.push(Unit { batch, start, rows });
-                start += rows;
-            }
-        }
-
-        let pooling = self.pooling;
-        let run = |unit: &Unit| -> Result<PooledRows> {
-            let (batch, seq) = (unit.batch, unit.batch.seq);
-            // This unit's slice of the batch's `[batch, seq]` layout.
-            let range = unit.start * seq..(unit.start + unit.rows) * seq;
-            let ids = &batch.ids[range.clone()];
-            let mask = &batch.mask[range];
-            let (hidden, dim) = weights.forward(device, ids, mask, unit.rows, seq)?;
-
-            let mut pooled = Vec::with_capacity(unit.rows);
-            for row in 0..unit.rows {
-                let vector = pool_row(
-                    &hidden[row * seq * dim..(row + 1) * seq * dim],
-                    &mask[row * seq..(row + 1) * seq],
-                    dim,
-                    pooling,
-                );
-                pooled.push((batch.orig[unit.start + row], vector));
-            }
-            Ok(pooled)
-        };
-
-        // The two backends want opposite shapes. On the CPU, parallelism comes
-        // from running many narrow forwards at once. There is only one GPU, so
-        // fanning out just makes threads contend over command submission and
-        // multiplies scratch memory; a GPU runs wide forwards back to back
-        // instead, and gets its parallelism inside each one.
-        let per_unit: Vec<Result<PooledRows>> = match self.opts.backend {
-            Backend::Cpu => worker_pool()?.install(|| units.par_iter().map(run).collect()),
-            Backend::Metal | Backend::Cuda => units.iter().map(run).collect(),
-            // embed() dispatches CoreML to embed_coreml, so it never arrives here.
-            Backend::CoreML => unreachable!("CoreML uses embed_coreml, not embed_candle"),
-        };
-
-        let mut rows_out: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
-        for unit in per_unit {
-            for (orig, mut vec) in unit? {
-                if self.opts.normalize {
-                    l2_normalize(&mut vec);
+        let (pooling, normalize) = (self.pooling, self.opts.normalize);
+        let rows_out = run_batches(
+            weights,
+            device,
+            self.opts.backend,
+            &batches,
+            texts.len(),
+            |hidden, mask, dim| {
+                let mut vector = pool_row(hidden, mask, dim, pooling);
+                if normalize {
+                    l2_normalize(&mut vector);
                 }
-                rows_out[orig] = vec;
-            }
-        }
+                Ok(vector)
+            },
+        )?;
         Ok((rows_out, info))
     }
 
@@ -564,7 +717,7 @@ impl Embedder {
 /// Open the requested device, failing with a fixable message rather than a
 /// silent fallback — a run that quietly lands on the CPU looks like a Metal
 /// benchmark result.
-fn open_device(backend: Backend) -> Result<Device> {
+pub(crate) fn open_device(backend: Backend) -> Result<Device> {
     match backend {
         Backend::Cpu => Ok(Device::Cpu),
         #[cfg(feature = "metal")]
@@ -697,7 +850,7 @@ fn resolve_pooling_warned(requested: Option<Pooling>, detected: Option<Pooling>)
 }
 
 /// Read and parse a `config.json`.
-fn read_config(path: &Path) -> Result<Config> {
+pub(crate) fn read_config(path: &Path) -> Result<Config> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("cannot parse {}", path.display()))
@@ -710,7 +863,7 @@ fn read_config(path: &Path) -> Result<Config> {
 /// through the ordinary directory loader — which is what keeps `check_io` and the
 /// compile cache in the path.
 #[cfg(all(feature = "coreml", feature = "coreml-export"))]
-fn convert_for_coreml(
+pub(crate) fn convert_for_coreml(
     checkpoint: &ModelSource,
     buckets: &[usize],
     quantize: crate::CoreMlQuantize,
@@ -761,7 +914,7 @@ fn convert_for_coreml(
 }
 
 #[cfg(all(feature = "coreml", not(feature = "coreml-export")))]
-fn convert_for_coreml(
+pub(crate) fn convert_for_coreml(
     _checkpoint: &ModelSource,
     _buckets: &[usize],
     _quantize: crate::CoreMlQuantize,
@@ -797,9 +950,9 @@ fn beside(path: &Path, name: &str) -> Result<PathBuf> {
 }
 
 /// What a Hub checkpoint download produced.
-struct Fetched {
-    weights: PathBuf,
-    tokenizer: PathBuf,
+pub(crate) struct Fetched {
+    pub(crate) weights: PathBuf,
+    pub(crate) tokenizer: PathBuf,
     /// `1_Pooling/config.json` in the cache, when the checkpoint ships one. Kept as
     /// a path as well as parsed, because the CoreML converter copies the file into
     /// the bundle it writes.
@@ -813,7 +966,7 @@ struct Fetched {
 
 /// Download (or reuse from the HF cache) the files a model needs, plus its
 /// declared pooling if the checkpoint ships one.
-fn fetch_checkpoint(repo: &str) -> Result<Fetched> {
+pub(crate) fn fetch_checkpoint(repo: &str) -> Result<Fetched> {
     let api = hf_hub::api::sync::Api::new().context("initializing Hugging Face Hub client")?;
     let repo = api.model(repo.to_string());
     let get = |f: &str| {
@@ -853,7 +1006,7 @@ fn local_pooling(model_path: &Path) -> Option<Pooling> {
     pooling_in_dir(model_path.parent()?)
 }
 
-fn load_weights(
+pub(crate) fn load_weights(
     path: &Path,
     config: &Config,
     device: &Device,
@@ -906,7 +1059,7 @@ fn load_weights(
 impl Weights {
     /// Run one forward pass, returning flat `[batch * seq * dim]` hidden
     /// states and the dimension.
-    fn forward(
+    pub(crate) fn forward(
         &self,
         device: &Device,
         ids: &[i64],
@@ -943,7 +1096,7 @@ impl Weights {
     ///
     /// The f32 path needs no such limit: candle's gemm is internally
     /// efficient on wider batches.
-    fn max_rows_per_forward(&self) -> usize {
+    pub(crate) fn max_rows_per_forward(&self) -> usize {
         match self {
             Self::F32(_) => usize::MAX,
             #[cfg(target_arch = "x86_64")]

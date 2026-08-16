@@ -225,6 +225,12 @@ struct Args {
     /// output ids are the argument positions (0, 1, …).
     #[arg(long)]
     text: Vec<String>,
+    /// Load the model, print one line of JSON describing it on stdout, and
+    /// exit without reading stdin. The weights' sha256 is in there: record it
+    /// beside a result and the question "which checkpoint produced this" has
+    /// an answer that a renamed directory cannot change.
+    #[arg(long, conflicts_with = "text")]
+    print_model_info: bool,
 }
 
 impl Args {
@@ -301,11 +307,23 @@ impl Args {
 }
 
 /// A short display label for a model path: its file name, or the full path.
+///
+/// Except when that file name is `model.safetensors`, which every checkpoint's
+/// is. The directory is the part a caller chose — `alpha05`, `exec9` — so a
+/// checkpoint reports that instead; otherwise a summary line says
+/// `model=model.safetensors` for every fine-tune on the machine, which is one
+/// of the ways two runs get mistaken for each other in the first place.
 fn label_of(path: &Path) -> String {
-    path.file_name().map_or_else(
-        || path.display().to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    )
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    if name == "model.safetensors" {
+        if let Some(dir) = path.parent().and_then(Path::file_name) {
+            return dir.to_string_lossy().into_owned();
+        }
+    }
+    name
 }
 
 /// `--text` mode: embed the arguments and print what stdio mode would, with the
@@ -333,6 +351,30 @@ fn embed_arguments(args: &Args, source: &ModelSource, label: &str) -> anyhow::Re
     out.finish()
 }
 
+/// `--print-model-info`: one JSON line naming the model that a run would use.
+///
+/// One line so that a caller can `json.loads` the whole of stdout, and on
+/// stdout rather than stderr because it is this mode's output rather than a
+/// remark about it.
+fn print_model_info(args: &Args, source: &ModelSource, label: &str) -> anyhow::Result<()> {
+    /// The model's own facts, plus the name the caller used for it — which the
+    /// [`Embedder`] does not know, since one model has many names.
+    #[derive(serde::Serialize)]
+    struct Printed<'a> {
+        model: &'a str,
+        #[serde(flatten)]
+        info: kohagi::ModelInfo,
+    }
+
+    let embedder = Embedder::load(source, args.options())?;
+    let line = serde_json::to_string(&Printed {
+        model: label,
+        info: embedder.info(),
+    })?;
+    println!("{line}");
+    Ok(())
+}
+
 /// Returns the number of skipped input lines (0 in `--text` mode).
 fn run(args: Args) -> anyhow::Result<usize> {
     let (source, label) = args.source()?;
@@ -348,6 +390,11 @@ fn run(args: Args) -> anyhow::Result<usize> {
                 .to_string(),
         )
         .into());
+    }
+
+    if args.print_model_info {
+        print_model_info(&args, &source, &label)?;
+        return Ok(0);
     }
 
     if !args.text.is_empty() {
@@ -379,5 +426,37 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_checkpoint_is_labelled_by_its_directory() {
+        // The name every fine-tune's weights file has, so the directory is the
+        // only part that distinguishes them.
+        assert_eq!(
+            label_of(Path::new("/m/interp/alpha05/model.safetensors")),
+            "alpha05"
+        );
+        // Anything else names itself.
+        assert_eq!(
+            label_of(Path::new("/m/exec9-fp16.safetensors")),
+            "exec9-fp16.safetensors"
+        );
+        // A CoreML directory is already the name a caller chose.
+        assert_eq!(label_of(Path::new("/m/coreml/ruri-130m")), "ruri-130m");
+        assert_eq!(
+            label_of(Path::new("model.safetensors")),
+            "model.safetensors"
+        );
+    }
+
+    #[test]
+    fn the_help_and_flags_are_well_formed() {
+        use clap::CommandFactory;
+        Args::command().debug_assert();
     }
 }

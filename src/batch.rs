@@ -18,6 +18,17 @@ pub enum Pooling {
     Cls,
 }
 
+impl Pooling {
+    /// The name this pooling has in a `1_Pooling/config.json` and on the
+    /// command line, so that what a run reports is what a caller can pass back.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mean => "mean",
+            Self::Cls => "cls",
+        }
+    }
+}
+
 /// Per-text tokenization facts, surfaced so a caller can tell a truncated
 /// embedding — one built from only the first `--max-seq-length` tokens — from a
 /// whole one. Both fields come straight off the encoding, so producing them
@@ -84,6 +95,37 @@ pub fn tokenize_bucket(
 ) -> Result<(Vec<BatchInput>, Vec<TokenInfo>)> {
     let encodings = tokenizer
         .encode_batch(texts.to_vec(), true)
+        .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+    let info: Vec<TokenInfo> = encodings.iter().map(token_info).collect();
+    let rows: Vec<Tokenized> = encodings
+        .iter()
+        .map(|e| Tokenized {
+            ids: e.get_ids(),
+            mask: e.get_attention_mask(),
+        })
+        .collect();
+    Ok((bucket(&rows, batch_size), info))
+}
+
+/// The same, for `(query, text)` pairs — what a cross-encoder scores.
+///
+/// The pair is joined by the tokenizer's own template rather than by string
+/// concatenation here (`<s> query </s> <s> text </s>` for the Ruri and
+/// japanese-reranker families), so the two sequences arrive in the shape the
+/// model was trained on, with truncation trimming the longer of the two first
+/// (`longest_first`, the tokenizer's default and the one CrossEncoder asks
+/// for). A pair is one row from bucketing's point of view.
+pub fn tokenize_bucket_pairs(
+    tokenizer: &Tokenizer,
+    pairs: &[(&str, &str)],
+    batch_size: usize,
+) -> Result<(Vec<BatchInput>, Vec<TokenInfo>)> {
+    let inputs: Vec<tokenizers::EncodeInput> = pairs
+        .iter()
+        .map(|&(query, text)| (query, text).into())
+        .collect();
+    let encodings = tokenizer
+        .encode_batch(inputs, true)
         .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
     let info: Vec<TokenInfo> = encodings.iter().map(token_info).collect();
     let rows: Vec<Tokenized> = encodings

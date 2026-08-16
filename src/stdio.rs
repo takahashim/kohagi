@@ -348,14 +348,48 @@ pub fn run(
     truncated += f.truncated;
 
     // `in` counts record lines (blank lines are ignored entirely); with no
-    // valid input the model was never loaded and dim is unknown (0).
-    let dim = embedder.as_ref().map_or(0, Embedder::dim);
+    // valid input the model was never loaded, and there is nothing to say
+    // about it beyond the name that would have been used.
+    let facts = embedder
+        .as_ref()
+        .map_or_else(|| "dim=0".to_string(), |e| summary_facts(&e.info()));
     let n_in = n_out + skipped;
     eprintln!(
-        "kohagi: model={model_label} dim={dim} in={n_in} out={n_out} \
+        "kohagi: model={model_label} {facts} in={n_in} out={n_out} \
          skipped={skipped} truncated={truncated}"
     );
     Ok(skipped)
+}
+
+/// The model's part of the summary line: which weights, resolved how.
+///
+/// Enough to reconstruct what produced the vectors from a captured log alone —
+/// the fingerprint answers *which* checkpoint, and pooling and max_seq answer
+/// the two settings that silently change every vector when they differ.
+pub(crate) fn summary_facts(info: &crate::ModelInfo) -> String {
+    let mut out = String::new();
+    if let Some(sha) = &info.sha256 {
+        out.push_str(&format!("sha256={} ", crate::fingerprint::short(sha)));
+    }
+    // A CoreML bundle has no weights of its own to hash, so it reports the
+    // checkpoint it was converted from — under a different key, because it is
+    // a different claim.
+    if let Some(sha) = &info.source_sha256 {
+        out.push_str(&format!(
+            "source_sha256={} ",
+            crate::fingerprint::short(sha)
+        ));
+    }
+    out.push_str(&format!(
+        "pooling={} dim={} max_seq={}",
+        info.pooling, info.dim, info.max_seq_length
+    ));
+    // A reranker's numbers mean different things either side of the sigmoid,
+    // so a log of scores has to say which it holds.
+    if let Some(score) = info.score {
+        out.push_str(&format!(" score={score}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -518,6 +552,73 @@ mod tests {
                 1,
                 "{format:?}"
             );
+        }
+    }
+
+    fn info() -> crate::ModelInfo {
+        crate::ModelInfo {
+            backend: "cpu",
+            precision: "f32",
+            sha256: Some("0123456789abcdef0123456789abcdef".to_string()),
+            source: None,
+            source_sha256: None,
+            buckets: None,
+            quantization: None,
+            graph_version: None,
+            pooling: "mean",
+            dim: 512,
+            max_seq_length: 512,
+            score: None,
+        }
+    }
+
+    /// The summary is where a captured log says which weights answered, so the
+    /// two paths spell their fingerprints differently: a checkpoint's own hash
+    /// and a bundle's report of the checkpoint behind it are not the same
+    /// claim, and a log that conflated them would be worse than one with
+    /// neither.
+    #[test]
+    fn the_summary_says_which_weights_it_used() {
+        assert_eq!(
+            summary_facts(&info()),
+            "sha256=0123456789ab pooling=mean dim=512 max_seq=512"
+        );
+
+        let coreml = crate::ModelInfo {
+            backend: "coreml",
+            sha256: None,
+            source_sha256: Some("fedcba9876543210fedcba9876543210".to_string()),
+            ..info()
+        };
+        assert_eq!(
+            summary_facts(&coreml),
+            "source_sha256=fedcba987654 pooling=mean dim=512 max_seq=512"
+        );
+
+        // A bundle that records no provenance says nothing about one, rather
+        // than reporting its own identity as the checkpoint's.
+        let unknown = crate::ModelInfo {
+            source_sha256: None,
+            ..coreml
+        };
+        assert_eq!(summary_facts(&unknown), "pooling=mean dim=512 max_seq=512");
+    }
+
+    /// What `--print-model-info` writes, which evaluation scripts read into
+    /// their results files: every key present, and the ones that do not apply
+    /// to this path absent rather than null.
+    #[test]
+    fn the_model_info_json_omits_what_does_not_apply() {
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&info()).unwrap()).unwrap();
+        assert_eq!(json["backend"], "cpu");
+        assert_eq!(json["precision"], "f32");
+        assert_eq!(json["pooling"], "mean");
+        assert_eq!(json["dim"], 512);
+        assert_eq!(json["max_seq_length"], 512);
+        assert_eq!(json["sha256"], "0123456789abcdef0123456789abcdef");
+        for absent in ["source", "source_sha256", "buckets", "quantization"] {
+            assert!(json.get(absent).is_none(), "{absent} should be omitted");
         }
     }
 

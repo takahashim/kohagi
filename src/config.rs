@@ -1,5 +1,20 @@
 //! Shared configuration value types used across modules.
 
+/// A cross-encoder's classification head, written beside a converted CoreML
+/// bundle when the checkpoint has one.
+///
+/// The emitted graph is the encoder alone, so a reranker's head has nowhere to
+/// go inside it; this file is how a bundle stays self-contained. Named here
+/// because the two ends are in different feature-gated modules — the converter
+/// (`coreml_export`) writes it, `rerank` reads it — and the name has to be one
+/// string.
+/// Both ends are feature-gated; the name is not, so that it stays one string.
+#[cfg_attr(
+    not(any(feature = "coreml", feature = "coreml-export")),
+    allow(dead_code)
+)]
+pub const COREML_HEAD_FILE: &str = "head.safetensors";
+
 /// Which converted form to download when a CoreML Hub repo ships both a
 /// compiled `.mlmodelc` and a portable `.mlpackage` for a bucket. Only affects
 /// [`crate::ModelSource::CoreMlHub`] downloads — a local dir loads whatever is

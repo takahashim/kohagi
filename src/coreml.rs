@@ -60,6 +60,21 @@ fn warn_if_quantized(model: &MLModel) {
     );
 }
 
+/// What a bundle says about where it came from, read back from the metadata
+/// its converter wrote.
+///
+/// Every field is optional because a bundle converted by an older Kohagi (or
+/// by `scripts/convert_coreml.py` before it recorded the same keys) simply
+/// does not have them. An absent field is reported as absent; a bundle is
+/// never credited with a provenance it does not carry.
+#[derive(Debug, Default)]
+pub struct BundleProvenance {
+    pub source: Option<String>,
+    pub source_sha256: Option<String>,
+    pub graph_version: Option<String>,
+    pub quantization: Option<String>,
+}
+
 /// One value from the creator-defined metadata a converted bundle carries.
 fn creator_metadata(model: &MLModel, key: &str) -> Option<String> {
     unsafe {
@@ -134,6 +149,27 @@ impl CoreMlEncoder {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// What the loaded bundle records about its own conversion. Read from the
+    /// first bucket: one conversion writes the same metadata into all of them,
+    /// and a single-bundle multi-function model has only one to read.
+    pub fn provenance(&self) -> BundleProvenance {
+        let Some(first) = self.buckets.first() else {
+            return BundleProvenance::default();
+        };
+        let read = |key: &str| creator_metadata(&first.model, key);
+        BundleProvenance {
+            source: read("com.github.takahashim.kohagi.source"),
+            source_sha256: read("com.github.takahashim.kohagi.source_sha256"),
+            graph_version: read("com.github.takahashim.kohagi.graph_version"),
+            quantization: read("com.github.takahashim.kohagi.quantization"),
+        }
+    }
+
+    /// The bucket lengths this bundle serves, ascending.
+    pub fn buckets(&self) -> Vec<usize> {
+        self.buckets.iter().map(|b| b.seq).collect()
     }
 
     /// The longest sequence any loaded bucket can serve.

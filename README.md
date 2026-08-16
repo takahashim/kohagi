@@ -125,6 +125,78 @@ $ echo '{"id": 1, "text": "…a very long document…"}' | kohagi --report-token
 Raising `--max-seq-length` embeds more of each text at a quadratic cost in
 attention compute. See [PROTOCOL.md](PROTOCOL.md) for the field definitions.
 
+### Which model produced these vectors
+
+Every run's summary line names the weights by content, not just by path:
+
+```console
+$ kohagi --model-path models/alpha05/model.safetensors --tokenizer-path models/alpha05/tokenizer.json < texts.jsonl > out.jsonl
+kohagi: model=alpha05 sha256=1c342581efc2 pooling=mean dim=512 max_seq=512 in=2141 out=2141 skipped=0 truncated=3
+```
+
+`--print-model-info` gives the same facts as one line of JSON on stdout and
+exits without embedding anything, for a script to record beside its results:
+
+```console
+$ kohagi --print-model-info
+{"model":"cl-nagoya/ruri-v3-130m","backend":"cpu","precision":"f32","sha256":"1c342581efc2…","pooling":"mean","dim":512,"max_seq_length":512}
+```
+
+This matters as soon as there is more than one checkpoint: fine-tunes of one
+model, or interpolations between two, differ only in bytes, and a results file
+that records a directory name records what someone meant to load. The digest is
+of the whole `model.safetensors`, so identical weights always agree and one
+byte's difference always shows, and `sha256sum` on the same file gives the same
+value. Hashing runs on its own thread beside the embedding and is collected at
+the end, so a run doing real work pays nothing for it — 0.36s of CPU for
+ruri-v3-130m's 528MB, and however long the disk takes for a model on a network
+share.
+
+## Reranking with `kohagi-rerank`
+
+Embedding search finds candidates; a cross-encoder reorders them. `kohagi-rerank`
+is a second binary from the same crate that reads `{"id","query","text"}` and
+writes `{"id","score"}`:
+
+```console
+$ echo '{"id":1,"query":"Rubyで配列を並べ替えるには","text":"配列の並べ替えには sort と sort_by がある。"}' | kohagi-rerank
+{"id":1,"score":0.9283465}
+```
+
+It defaults to `cl-nagoya/ruri-v3-reranker-310m` and runs any ModernBERT
+sequence-classification checkpoint with one label, including the
+`hotchpotch/japanese-reranker-*-v2` family. The score is the sigmoid of the
+model's logit — the same number `sentence_transformers.CrossEncoder.predict`
+returns, so thresholds carry over; `--raw-logits` reports the logit instead.
+
+A separate binary rather than a flag on `kohagi`, because it is a different
+function: pairs in, numbers out. Everything around the records — opaque ids,
+skipped lines, blank-line batches, exit codes — is the same protocol. See
+[PROTOCOL-rerank.md](PROTOCOL-rerank.md).
+
+Measured on an M2, 100 pairs at the 512-token cap, scoring only (best of three,
+warm process):
+
+| | ruri-v3-reranker-310m | japanese-reranker-xsmall-v2 |
+| --- | --- | --- |
+| `kohagi-rerank --device cpu` | 3.3 pairs/s | 38.0 pairs/s |
+| `kohagi-rerank --device metal` | 3.7 pairs/s | 64.5 pairs/s |
+| **`kohagi-rerank --device coreml`** | **18.5 pairs/s** | **154.5 pairs/s** |
+| `CrossEncoder` (PyTorch MPS) | 5.5 pairs/s | 74.9 pairs/s |
+| `CrossEncoder` (PyTorch CPU) | 2.7 pairs/s | 34.3 pairs/s |
+
+On the CPU it is a little faster than PyTorch and on the GPU about the same; on
+the Neural Engine it is 3.4× the fastest PyTorch path. Scores match the
+reference to f32 rounding on every backend except `coreml`, whose encoder is
+fp16 — that shifts scores by 1e-4 on average, leaves ranking essentially
+unchanged, and is quantified in [PROTOCOL-rerank.md](PROTOCOL-rerank.md).
+Verify any of it with `tools/rerank_parity.py`.
+
+```bash
+# Converts the checkpoint for the ANE on first use and caches it.
+kohagi-rerank --device coreml < pairs.jsonl > scores.jsonl
+```
+
 ## Calling Kohagi from another language
 
 Launch Kohagi as a subprocess, write JSONL records to its standard input, and read JSONL results from its standard output.
