@@ -130,6 +130,11 @@ pub const GRAPH_VERSION: u32 = 2;
 pub struct Provenance {
     /// The checkpoint this was converted from, as a Hub id or a path.
     pub source: String,
+    /// sha256 of that checkpoint's `model.safetensors`. A path or a Hub id
+    /// names what was meant to be converted; this names what was. It is the
+    /// only fingerprint a bundle can offer, since the bundle holds fp16 (or
+    /// int8) copies of those weights rather than the weights themselves.
+    pub source_sha256: Option<String>,
     /// Which sequence lengths the bundle serves.
     pub lengths: Vec<usize>,
     /// Whether the embedding table is int8. Recorded because a quantized bundle's
@@ -165,6 +170,12 @@ impl Provenance {
             out.push((
                 "com.github.takahashim.kohagi.source".to_string(),
                 self.source.clone(),
+            ));
+        }
+        if let Some(sha) = &self.source_sha256 {
+            out.push((
+                "com.github.takahashim.kohagi.source_sha256".to_string(),
+                sha.clone(),
             ));
         }
         if self.quantized_embeddings {
@@ -417,9 +428,15 @@ pub fn convert(
     cfg.check_lengths(lengths)
         .with_context(|| format!("converting {}", checkpoint.source))?;
 
+    // Before the weights are opened: a conversion that then fails leaves no
+    // bundle, and this way the hash is of the file the emitter is about to
+    // read rather than of whatever replaced it afterwards.
+    let source_sha256 = crate::fingerprint::sha256_file(&checkpoint.weights)?;
+
     let weights = safetensors::Checkpoint::open(&checkpoint.weights)?;
     let provenance = Provenance {
         source: checkpoint.source.clone(),
+        source_sha256: Some(source_sha256),
         lengths: lengths.to_vec(),
         quantized_embeddings: opts.quantize_embeddings,
         quantized_projections: opts.quantize_projections,
@@ -429,6 +446,13 @@ pub fn convert(
 
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     write_package(&dir.join(bundle_name(lengths)), &model, &blob)?;
+
+    // A cross-encoder's head, when the checkpoint is one. The emitter reads
+    // only the encoder, so without this the bundle could not score a pair.
+    let head_file = crate::config::COREML_HEAD_FILE;
+    if weights.write_head(&dir.join(head_file))? {
+        eprintln!("wrote   : {head_file} (the classification head, for kohagi-rerank)");
+    }
 
     // A converted directory has to be self-contained: the checkpoint it came from
     // may be a Hugging Face cache entry that is cleared independently.

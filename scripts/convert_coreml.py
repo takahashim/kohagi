@@ -105,7 +105,52 @@ class Encoder(torch.nn.Module):
         return self.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
 
-def convert_bucket(enc, seq, out_path):
+def source_fingerprint(model_id):
+    """sha256 of the checkpoint's weights, for the bundle's metadata.
+
+    A converted bundle holds fp16 copies of the weights, so it cannot be hashed
+    into anything comparable with the checkpoint it came from; the checkpoint's
+    own digest is the only fingerprint it can carry. Kohagi's Rust converter
+    records the same key, and reports it back under `--print-model-info`.
+
+    `None` when the weights are not one cached file — sharded checkpoints, or a
+    local directory this cannot resolve. An absent key reads as "unknown",
+    which is true; a guessed one would not be.
+    """
+    import hashlib
+
+    from huggingface_hub import hf_hub_download
+
+    try:
+        path = hf_hub_download(model_id, "model.safetensors")
+    except Exception as e:
+        print(f"  no single model.safetensors ({type(e).__name__}); no source fingerprint recorded")
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def provenance(model_id):
+    """The metadata every bucket carries: what it was converted from, by what.
+
+    Deliberately not `graph_version`: that names the graph Kohagi's own emitter
+    builds, and this script converts through coremltools instead. Claiming it
+    would make two different graphs answer to one version.
+    """
+    entries = {
+        "com.github.takahashim.kohagi.emitter": "convert_coreml.py",
+        "com.github.takahashim.kohagi.source": model_id,
+    }
+    sha = source_fingerprint(model_id)
+    if sha:
+        entries["com.github.takahashim.kohagi.source_sha256"] = sha
+    return entries
+
+
+def convert_bucket(enc, seq, out_path, metadata=None):
     import coremltools as ct
 
     ids = torch.randint(5, 1000, (1, seq), dtype=torch.long)
@@ -124,6 +169,8 @@ def convert_bucket(enc, seq, out_path):
         minimum_deployment_target=ct.target.macOS15,
         convert_to="mlprogram",
     )
+    for key, value in (metadata or {}).items():
+        mlmodel.user_defined_metadata[key] = value
     mlmodel.save(str(out_path))
     print(f"  saved {out_path.name}")
 
@@ -209,12 +256,18 @@ def main():
 
     buckets = sorted(args.buckets)
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    # Stamped on each bucket as it is written. `--multi-function` merges the
+    # buckets afterwards, and whether the merge carries the metadata across is
+    # coremltools' business; Kohagi's own converter is the one that guarantees
+    # it, and a bundle without the key is reported as unknown rather than
+    # assumed.
+    stamp = provenance(args.model_id)
     for seq in buckets:
         out = args.out_dir / f"seq-{seq}.mlpackage"
         if out.exists():
             shutil.rmtree(out)
         print(f"converting seq={seq} ...")
-        convert_bucket(enc, seq, out)
+        convert_bucket(enc, seq, out, stamp)
 
     bundles = [args.out_dir / f"seq-{seq}.mlpackage" for seq in buckets]
     if args.multi_function:
