@@ -6,18 +6,15 @@
 //! what I have sent and answer now", and the answer to a batch ends with a
 //! blank line of its own. Only the record shape differs.
 
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufWriter, Write};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 
 use super::Reranker;
+use crate::stdio::{drive, summarize, Flushed, Records};
 use crate::TokenInfo;
-
-/// Pairs scored per chunk. As in the embedding path, this bounds resident
-/// memory to one chunk rather than the whole input.
-const CHUNK_ROWS: usize = 1024;
 
 #[derive(Serialize)]
 struct OutRecord<'a> {
@@ -56,15 +53,11 @@ struct InRecord {
     text: String,
 }
 
-enum Line {
-    Record(InRecord),
-    Flush,
-}
-
-/// Parse one physical line. `Err` = skip with a warning.
-fn parse_line(line: &str) -> Result<Line, String> {
+/// Parse one physical line. `Ok(None)` is a blank line — the batch boundary.
+/// `Err` = skip with a warning.
+fn parse_line(line: &str) -> Result<Option<InRecord>, String> {
     if line.trim().is_empty() {
-        return Ok(Line::Flush);
+        return Ok(None);
     }
     let v: Value = serde_json::from_str(line).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = v.as_object().ok_or("not a JSON object")?;
@@ -81,50 +74,66 @@ fn parse_line(line: &str) -> Result<Line, String> {
     };
     let query = field("query")?;
     let text = field("text")?;
-    Ok(Line::Record(InRecord { id, query, text }))
+    Ok(Some(InRecord { id, query, text }))
 }
 
-struct Flushed {
-    written: usize,
-    truncated: usize,
-}
-
-/// Score the buffered chunk, write its lines, and empty the buffer. The model
-/// is loaded here on first use, so input with no valid records never loads it.
-fn flush_chunk(
-    reranker: &mut Option<Reranker>,
-    load: &impl Fn() -> Result<Reranker>,
+/// The scoring end of the protocol.
+struct Score<W: Write, F> {
+    reranker: Option<Reranker>,
+    load: F,
     report_tokens: bool,
-    chunk: &mut Vec<InRecord>,
-    out: &mut impl Write,
-) -> Result<Flushed> {
-    if chunk.is_empty() {
-        return Ok(Flushed {
-            written: 0,
-            truncated: 0,
-        });
+    out: W,
+}
+
+impl<W: Write, F: Fn() -> Result<Reranker>> Records for Score<W, F> {
+    type Record = InRecord;
+
+    fn parse(line: &str) -> Result<Option<InRecord>, String> {
+        parse_line(line)
     }
-    let reranker = match reranker {
-        Some(r) => r,
-        None => reranker.insert(load()?),
-    };
 
-    let pairs: Vec<(&str, &str)> = chunk
-        .iter()
-        .map(|r| (r.query.as_str(), r.text.as_str()))
-        .collect();
-    let (scores, tokens) = reranker.score(&pairs)?;
+    fn flush(&mut self, chunk: &mut Vec<InRecord>) -> Result<Flushed> {
+        if chunk.is_empty() {
+            return Ok(Flushed {
+                written: 0,
+                truncated: 0,
+            });
+        }
+        let reranker = match &mut self.reranker {
+            Some(r) => r,
+            None => self.reranker.insert((self.load)()?),
+        };
 
-    let mut truncated = 0usize;
-    for ((record, &score), info) in chunk.iter().zip(&scores).zip(&tokens) {
-        truncated += info.truncated as usize;
-        write_record(out, &record.id, score, report_tokens.then_some(info))?;
+        let pairs: Vec<(&str, &str)> = chunk
+            .iter()
+            .map(|r| (r.query.as_str(), r.text.as_str()))
+            .collect();
+        let (scores, tokens) = reranker.score(&pairs)?;
+
+        let mut truncated = 0usize;
+        for ((record, &score), info) in chunk.iter().zip(&scores).zip(&tokens) {
+            truncated += info.truncated as usize;
+            write_record(
+                &mut self.out,
+                &record.id,
+                score,
+                self.report_tokens.then_some(info),
+            )?;
+        }
+        self.out.flush()?;
+
+        let written = chunk.len();
+        chunk.clear();
+        Ok(Flushed { written, truncated })
     }
-    out.flush()?;
 
-    let written = chunk.len();
-    chunk.clear();
-    Ok(Flushed { written, truncated })
+    /// A blank line, so a long-lived caller can read until it instead of
+    /// counting records a skip would spoil.
+    fn boundary(&mut self) -> Result<()> {
+        self.out.write_all(b"\n")?;
+        self.out.flush()?;
+        Ok(())
+    }
 }
 
 /// Run the protocol over stdin/stdout. Returns the number of skipped lines,
@@ -134,57 +143,23 @@ pub fn run(
     report_tokens: bool,
     model_label: &str,
 ) -> Result<usize> {
-    let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
+    let mut records = Score {
+        reranker: None,
+        load,
+        report_tokens,
+        out: BufWriter::new(stdout.lock()),
+    };
 
-    let mut reranker: Option<Reranker> = None;
-    let mut chunk: Vec<InRecord> = Vec::new();
-    let mut n_out = 0usize;
-    let mut skipped = 0usize;
-    let mut truncated = 0usize;
+    let counts = drive(&mut records, "kohagi-rerank")?;
+    records.out.flush()?;
 
-    for (lineno, line) in stdin.lock().lines().enumerate() {
-        let line = line.context("reading stdin")?;
-        match parse_line(&line) {
-            Ok(Line::Record(record)) => {
-                chunk.push(record);
-                if chunk.len() >= CHUNK_ROWS {
-                    let f = flush_chunk(&mut reranker, &load, report_tokens, &mut chunk, &mut out)?;
-                    n_out += f.written;
-                    truncated += f.truncated;
-                }
-            }
-            Ok(Line::Flush) => {
-                let f = flush_chunk(&mut reranker, &load, report_tokens, &mut chunk, &mut out)?;
-                n_out += f.written;
-                truncated += f.truncated;
-                // The reply marker, so a long-lived caller can read until the
-                // blank line instead of counting records a skip would spoil.
-                out.write_all(b"\n")?;
-                out.flush()?;
-            }
-            Err(why) => {
-                skipped += 1;
-                eprintln!("kohagi-rerank: skip line {}: {why}", lineno + 1);
-            }
-        }
-    }
-    let f = flush_chunk(&mut reranker, &load, report_tokens, &mut chunk, &mut out)?;
-    out.flush()?;
-    n_out += f.written;
-    truncated += f.truncated;
-
-    let facts = reranker.as_ref().map_or_else(
+    let facts = records.reranker.as_ref().map_or_else(
         || "dim=0".to_string(),
         |r| crate::stdio::summary_facts(&r.info()),
     );
-    let n_in = n_out + skipped;
-    eprintln!(
-        "kohagi-rerank: model={model_label} {facts} in={n_in} out={n_out} \
-         skipped={skipped} truncated={truncated}"
-    );
-    Ok(skipped)
+    summarize("kohagi-rerank", model_label, &facts, &counts);
+    Ok(counts.skipped)
 }
 
 #[cfg(test)]
@@ -192,10 +167,9 @@ mod tests {
     use super::*;
 
     fn record(line: &str) -> InRecord {
-        match parse_line(line).expect("a record") {
-            Line::Record(r) => r,
-            Line::Flush => panic!("expected a record, got a batch boundary"),
-        }
+        parse_line(line)
+            .expect("a record")
+            .expect("a record, not a batch boundary")
     }
 
     #[test]
@@ -210,7 +184,7 @@ mod tests {
     /// a number, which is worse than skipping the line.
     #[test]
     fn parse_skips_what_it_cannot_score() {
-        assert!(matches!(parse_line(""), Ok(Line::Flush)));
+        assert!(matches!(parse_line(""), Ok(None)));
         assert!(parse_line("not json").is_err());
         assert!(parse_line(r#"{"query": "q", "text": "t"}"#).is_err());
         assert!(parse_line(r#"{"id": 1, "text": "t"}"#).is_err());
