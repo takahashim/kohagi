@@ -70,10 +70,16 @@ def score(binary, model_id, device, max_seq, pairs):
     if device == "coreml":
         cmd += ["--coreml-buckets", str(max_seq)]
     proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
-    if proc.returncode == 1:
+    # Anything but 0 stops the run. A flip rate counted over the pairs that
+    # happened to survive a partial failure is a rate for a different sample
+    # than the one the band was drawn from, and it would not look wrong.
+    if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
-        raise SystemExit(1)
+        raise SystemExit(f"kohagi-rerank exited {proc.returncode}")
     got = {json.loads(l)["id"]: json.loads(l)["score"] for l in proc.stdout.splitlines()}
+    missing = [i for i in range(len(pairs)) if i not in got]
+    if missing:
+        raise SystemExit(f"kohagi-rerank returned no score for pair {missing[0]}")
     return [got[i] for i in range(len(pairs))]
 
 

@@ -37,7 +37,7 @@ SAMPLE_PAIRS = [
     (QUERY, "配列の並べ替えには sort と sort_by がある。sort はブロックで比較を指定でき、"
             "sort_by は各要素から取り出したキーで並べ替える。破壊的に並べ替えるなら sort! を使う。"),
     # Related but not an answer.
-    (QUERY, "ハッシュは키と値の組を保持するデータ構造で、each で走査すると挿入順に取り出せる。"),
+    (QUERY, "ハッシュはキーと値の組を保持するデータ構造で、each で走査すると挿入順に取り出せる。"),
     # Unrelated.
     (QUERY, "駅前の駐輪場が不足しているため、増設を要望します。"),
     # Code, which rerankers read badly and which the mining pipeline hits often.
@@ -59,6 +59,27 @@ def pairs_from(args):
     return [(r["query"], r["text"]) for r in rows]
 
 
+def collect(proc, n):
+    """The `n` scores a kohagi-rerank run produced, in id order.
+
+    Every exit code other than 0 stops the comparison. 2 means some pairs were
+    skipped, and a parity number computed from the rest would be a real number
+    about a different set of pairs than the one asked for; 3 means the backend
+    under test never ran at all, which is the answer least worth averaging.
+    """
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        sys.exit(
+            f"kohagi-rerank exited {proc.returncode}"
+            + (" (some lines were skipped; see above)" if proc.returncode == 2 else "")
+        )
+    got = {json.loads(l)["id"]: json.loads(l)["score"] for l in proc.stdout.splitlines()}
+    missing = [i for i in range(n) if i not in got]
+    if missing:
+        sys.exit(f"kohagi-rerank exited 0 but returned no score for pair {missing[0]}")
+    return [got[i] for i in range(n)]
+
+
 def score_with(args, pairs, device, raw_logits):
     """kohagi-rerank's scores for `pairs` on one device, in input order."""
     stdin = "".join(
@@ -78,12 +99,7 @@ def score_with(args, pairs, device, raw_logits):
         cmd += ["--coreml-buckets", str(args.max_seq_length)]
     if raw_logits:
         cmd.append("--raw-logits")
-    proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
-    if proc.returncode == 1:
-        sys.stderr.write(proc.stderr)
-        raise SystemExit(1)
-    got = {json.loads(l)["id"]: json.loads(l)["score"] for l in proc.stdout.splitlines()}
-    return [got[i] for i in range(len(pairs))]
+    return collect(subprocess.run(cmd, input=stdin, capture_output=True, text=True), len(pairs))
 
 
 def sigmoid(x):
