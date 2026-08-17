@@ -8,7 +8,7 @@
 //! protocol rule around it.
 //!
 //! Exit codes match `kohagi`: 0 = every pair scored, 2 = finished with skipped
-//! lines, 1 = fatal.
+//! lines, 1 = fatal, 3 = the requested CoreML backend cannot serve this request.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

@@ -86,7 +86,8 @@ kohagi-rerank: model=ruri-v3-reranker-310m sha256=1c342581efc2 pooling=cls dim=7
 a log of numbers cannot be read without it. `--print-model-info` prints the
 same facts as one JSON line, as in [PROTOCOL.md](PROTOCOL.md), with `score`
 added. Exit codes are the same: 0 every pair scored, 2 finished with skipped
-lines, 1 fatal.
+lines, 1 fatal, 3 the CoreML backend cannot serve this request — see
+[PROTOCOL.md](PROTOCOL.md) for what each one means and what to do about it.
 
 ## Devices
 
