@@ -8,81 +8,16 @@
 //! converted bucket) — caught before any input is read, so the caller can
 //! retry on `--device cpu`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
-use kohagi::{
-    stdio, Backend, CoreMlForm, CoreMlQuantize, Embedder, ModelSource, Options, Pooling, Precision,
-};
+use kohagi::cli::{self, BackendArg, CoreMlFormArg, CoreMlQuantizeArg, PoolingArg, PrecisionArg};
+use kohagi::{stdio, Embedder, ModelSource, Options};
 
-/// CLI spellings of the library enums, so `--help` lists the valid values and
-/// clap rejects anything else before we do any work.
-#[derive(Clone, Copy, ValueEnum)]
-enum PoolingArg {
-    /// Mask-aware mean over tokens (Ruri v3, modernbert-embed).
-    Mean,
-    /// First token only.
-    Cls,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum PrecisionArg {
-    /// Matches the PyTorch reference; works on every CPU.
-    F32,
-    /// ~2x faster on x86_64 CPUs with AVX512-BF16, at cosine ~0.99999.
-    Bf16,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum BackendArg {
-    /// Apple Accelerate on macOS, candle's own gemm elsewhere.
-    Cpu,
-    /// Apple GPU. Needs a binary built with `--features metal`.
-    Metal,
-    /// NVIDIA GPU via CUDA. Needs a binary built with `--features cuda`.
-    Cuda,
-    /// Apple Neural Engine. Needs a binary built with `--features coreml` and
-    /// `--coreml-dir` pointing at pre-converted fixed-shape models.
-    Coreml,
-}
-
-impl From<PoolingArg> for Pooling {
-    fn from(p: PoolingArg) -> Self {
-        match p {
-            PoolingArg::Mean => Pooling::Mean,
-            PoolingArg::Cls => Pooling::Cls,
-        }
-    }
-}
-
-impl From<PrecisionArg> for Precision {
-    fn from(p: PrecisionArg) -> Self {
-        match p {
-            PrecisionArg::F32 => Precision::F32,
-            PrecisionArg::Bf16 => Precision::Bf16,
-        }
-    }
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum CoreMlFormArg {
-    /// Compiled `.mlmodelc` — no per-run compile (default).
-    Compiled,
-    /// Portable `.mlpackage` — compiled on load, robust across OS versions.
-    Package,
-}
-
-impl From<CoreMlFormArg> for CoreMlForm {
-    fn from(f: CoreMlFormArg) -> Self {
-        match f {
-            CoreMlFormArg::Compiled => CoreMlForm::Compiled,
-            CoreMlFormArg::Package => CoreMlForm::Package,
-        }
-    }
-}
-
+/// This binary's own output shape; the rest of the CLI value enums are shared
+/// with `kohagi-rerank` in [`kohagi::cli`].
 #[derive(Copy, Clone, ValueEnum)]
 enum FormatArg {
     /// Kohagi's JSONL protocol: one record per line, ids echoed.
@@ -96,34 +31,6 @@ impl From<FormatArg> for stdio::Format {
         match f {
             FormatArg::Jsonl => stdio::Format::Jsonl,
             FormatArg::Openai => stdio::Format::OpenAi,
-        }
-    }
-}
-
-#[derive(Copy, Clone, ValueEnum)]
-enum CoreMlQuantizeArg {
-    /// The embedding table int8, one scale per row.
-    Embeddings,
-    /// The embedding table and every projection int8.
-    All,
-}
-
-impl From<CoreMlQuantizeArg> for CoreMlQuantize {
-    fn from(q: CoreMlQuantizeArg) -> Self {
-        match q {
-            CoreMlQuantizeArg::Embeddings => CoreMlQuantize::Embeddings,
-            CoreMlQuantizeArg::All => CoreMlQuantize::All,
-        }
-    }
-}
-
-impl From<BackendArg> for Backend {
-    fn from(b: BackendArg) -> Self {
-        match b {
-            BackendArg::Cpu => Backend::Cpu,
-            BackendArg::Metal => Backend::Metal,
-            BackendArg::Cuda => Backend::Cuda,
-            BackendArg::Coreml => Backend::CoreML,
         }
     }
 }
@@ -248,82 +155,23 @@ impl Args {
 
     /// Where to load the model from, plus the name to show in the summary.
     fn source(&self) -> anyhow::Result<(ModelSource, String)> {
-        // CoreML loads pre-converted fixed-shape models — a local directory or
-        // a Hub repo — not safetensors.
+        let checkpoint = cli::checkpoint_source(
+            self.model_path.as_ref(),
+            self.tokenizer_path.as_ref(),
+            &self.model_id,
+        );
+        // CoreML loads converted fixed-shape models rather than safetensors.
         if self.device == BackendArg::Coreml {
-            if let Some(dir) = self.coreml_dir.clone() {
-                let label = label_of(&dir);
-                return Ok((ModelSource::CoreMl { dir }, label));
-            }
-            if let Some(repo) = self.coreml_model_id.clone() {
-                let label = repo.clone();
-                return Ok((ModelSource::CoreMlHub { repo }, label));
-            }
-            // Neither: convert the checkpoint the CPU path would have used. One
-            // `--model-id` therefore serves every device.
-            let mut buckets = self.coreml_buckets.clone();
-            buckets.sort_unstable();
-            buckets.dedup();
-            if buckets.is_empty() {
-                return Err(kohagi::UnsupportedRequest(
-                    "`--coreml-buckets` is empty; give at least one sequence length".to_string(),
-                )
-                .into());
-            }
-            let (checkpoint, label) = self.checkpoint_source();
-            return Ok((
-                ModelSource::CoreMlConvert {
-                    checkpoint: Box::new(checkpoint),
-                    buckets,
-                    quantize: self.coreml_quantize.map(Into::into).unwrap_or_default(),
-                },
-                label,
-            ));
+            return cli::coreml_source(
+                self.coreml_dir.as_ref(),
+                self.coreml_model_id.as_deref(),
+                &self.coreml_buckets,
+                self.coreml_quantize.map(Into::into).unwrap_or_default(),
+                checkpoint,
+            );
         }
-        Ok(self.checkpoint_source())
+        Ok(checkpoint)
     }
-
-    /// The safetensors checkpoint the run names, with its display label. Shared by
-    /// the candle backends and by CoreML's own conversion.
-    fn checkpoint_source(&self) -> (ModelSource, String) {
-        match (&self.model_path, &self.tokenizer_path) {
-            // clap's `requires` guarantees these two arrive together.
-            (Some(model), Some(tokenizer)) => {
-                let label = label_of(model);
-                let source = ModelSource::Files {
-                    model: model.clone(),
-                    tokenizer: tokenizer.clone(),
-                };
-                (source, label)
-            }
-            _ => (
-                ModelSource::Hub {
-                    repo: self.model_id.clone(),
-                },
-                self.model_id.clone(),
-            ),
-        }
-    }
-}
-
-/// A short display label for a model path: its file name, or the full path.
-///
-/// Except when that file name is `model.safetensors`, which every checkpoint's
-/// is. The directory is the part a caller chose — `alpha05`, `exec9` — so a
-/// checkpoint reports that instead; otherwise a summary line says
-/// `model=model.safetensors` for every fine-tune on the machine, which is one
-/// of the ways two runs get mistaken for each other in the first place.
-fn label_of(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    if name == "model.safetensors" {
-        if let Some(dir) = path.parent().and_then(Path::file_name) {
-            return dir.to_string_lossy().into_owned();
-        }
-    }
-    name
 }
 
 /// `--text` mode: embed the arguments and print what stdio mode would, with the
@@ -351,30 +199,6 @@ fn embed_arguments(args: &Args, source: &ModelSource, label: &str) -> anyhow::Re
     out.finish()
 }
 
-/// `--print-model-info`: one JSON line naming the model that a run would use.
-///
-/// One line so that a caller can `json.loads` the whole of stdout, and on
-/// stdout rather than stderr because it is this mode's output rather than a
-/// remark about it.
-fn print_model_info(args: &Args, source: &ModelSource, label: &str) -> anyhow::Result<()> {
-    /// The model's own facts, plus the name the caller used for it — which the
-    /// [`Embedder`] does not know, since one model has many names.
-    #[derive(serde::Serialize)]
-    struct Printed<'a> {
-        model: &'a str,
-        #[serde(flatten)]
-        info: kohagi::ModelInfo,
-    }
-
-    let embedder = Embedder::load(source, args.options())?;
-    let line = serde_json::to_string(&Printed {
-        model: label,
-        info: embedder.info(),
-    })?;
-    println!("{line}");
-    Ok(())
-}
-
 /// Returns the number of skipped input lines (0 in `--text` mode).
 fn run(args: Args) -> anyhow::Result<usize> {
     let (source, label) = args.source()?;
@@ -393,7 +217,8 @@ fn run(args: Args) -> anyhow::Result<usize> {
     }
 
     if args.print_model_info {
-        print_model_info(&args, &source, &label)?;
+        let embedder = Embedder::load(&source, args.options())?;
+        cli::print_model_info(&label, &embedder.info())?;
         return Ok(0);
     }
 
@@ -413,46 +238,12 @@ fn run(args: Args) -> anyhow::Result<usize> {
 }
 
 fn main() -> ExitCode {
-    match run(Args::parse()) {
-        Ok(0) => ExitCode::SUCCESS,
-        Ok(_) => ExitCode::from(2),
-        Err(e) => {
-            eprintln!("kohagi: error: {e:#}");
-            // A CoreML-unsupported request gets its own code so callers can
-            // tell "retry on --device cpu" apart from a genuine failure.
-            if e.chain().any(|c| c.is::<kohagi::UnsupportedRequest>()) {
-                ExitCode::from(3)
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-    }
+    cli::exit_code("kohagi", run(Args::parse()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_checkpoint_is_labelled_by_its_directory() {
-        // The name every fine-tune's weights file has, so the directory is the
-        // only part that distinguishes them.
-        assert_eq!(
-            label_of(Path::new("/m/interp/alpha05/model.safetensors")),
-            "alpha05"
-        );
-        // Anything else names itself.
-        assert_eq!(
-            label_of(Path::new("/m/exec9-fp16.safetensors")),
-            "exec9-fp16.safetensors"
-        );
-        // A CoreML directory is already the name a caller chose.
-        assert_eq!(label_of(Path::new("/m/coreml/ruri-130m")), "ruri-130m");
-        assert_eq!(
-            label_of(Path::new("model.safetensors")),
-            "model.safetensors"
-        );
-    }
 
     #[test]
     fn the_help_and_flags_are_well_formed() {

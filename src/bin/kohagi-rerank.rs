@@ -10,71 +10,14 @@
 //! Exit codes match `kohagi`: 0 = every pair scored, 2 = finished with skipped
 //! lines, 1 = fatal.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
+use kohagi::cli::{self, BackendArg, CoreMlFormArg, PrecisionArg};
 use kohagi::rerank::{self, Reranker};
-use kohagi::{Backend, CoreMlForm, ModelSource, Precision};
-
-#[derive(Clone, Copy, ValueEnum)]
-enum PrecisionArg {
-    /// Matches the PyTorch reference; works on every CPU.
-    F32,
-    /// ~2x faster on x86_64 CPUs with AVX512-BF16.
-    Bf16,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum BackendArg {
-    /// Apple Accelerate on macOS, candle's own gemm elsewhere.
-    Cpu,
-    /// Apple GPU. Needs a binary built with `--features metal`.
-    Metal,
-    /// NVIDIA GPU via CUDA. Needs a binary built with `--features cuda`.
-    Cuda,
-    /// Apple Neural Engine. Needs `--features coreml`; converts --model-id
-    /// itself unless given a converted bundle.
-    Coreml,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum CoreMlFormArg {
-    /// Compiled `.mlmodelc` — no per-run compile (default).
-    Compiled,
-    /// Portable `.mlpackage` — compiled on load, robust across OS versions.
-    Package,
-}
-
-impl From<CoreMlFormArg> for CoreMlForm {
-    fn from(f: CoreMlFormArg) -> Self {
-        match f {
-            CoreMlFormArg::Compiled => CoreMlForm::Compiled,
-            CoreMlFormArg::Package => CoreMlForm::Package,
-        }
-    }
-}
-
-impl From<PrecisionArg> for Precision {
-    fn from(p: PrecisionArg) -> Self {
-        match p {
-            PrecisionArg::F32 => Precision::F32,
-            PrecisionArg::Bf16 => Precision::Bf16,
-        }
-    }
-}
-
-impl From<BackendArg> for Backend {
-    fn from(b: BackendArg) -> Self {
-        match b {
-            BackendArg::Cpu => Backend::Cpu,
-            BackendArg::Metal => Backend::Metal,
-            BackendArg::Cuda => Backend::Cuda,
-            BackendArg::Coreml => Backend::CoreML,
-        }
-    }
-}
+use kohagi::ModelSource;
 
 /// Score query/document pairs with a Japanese ModernBERT cross-encoder.
 ///
@@ -160,91 +103,25 @@ impl Args {
 
     /// Where the model comes from, plus the name to show in the summary.
     fn source(&self) -> anyhow::Result<(ModelSource, String)> {
-        // CoreML loads converted fixed-shape models — a directory, a Hub repo,
-        // or a checkpoint converted on first use — rather than safetensors.
+        let checkpoint = cli::checkpoint_source(
+            self.model_path.as_ref(),
+            self.tokenizer_path.as_ref(),
+            &self.model_id,
+        );
+        // CoreML loads converted fixed-shape models rather than safetensors.
+        // Never quantized: a reranker's output is one number being compared
+        // against a threshold, and int8 moves it further than fp16 already does.
         if self.device == BackendArg::Coreml {
-            if let Some(dir) = self.coreml_dir.clone() {
-                let label = label_of(&dir);
-                return Ok((ModelSource::CoreMl { dir }, label));
-            }
-            if let Some(repo) = self.coreml_model_id.clone() {
-                let label = repo.clone();
-                return Ok((ModelSource::CoreMlHub { repo }, label));
-            }
-            let mut buckets = self.coreml_buckets.clone();
-            buckets.sort_unstable();
-            buckets.dedup();
-            anyhow::ensure!(
-                !buckets.is_empty(),
-                "`--coreml-buckets` is empty; give at least one sequence length"
+            return cli::coreml_source(
+                self.coreml_dir.as_ref(),
+                self.coreml_model_id.as_deref(),
+                &self.coreml_buckets,
+                kohagi::CoreMlQuantize::None,
+                checkpoint,
             );
-            let (checkpoint, label) = self.checkpoint_source();
-            return Ok((
-                ModelSource::CoreMlConvert {
-                    checkpoint: Box::new(checkpoint),
-                    buckets,
-                    quantize: kohagi::CoreMlQuantize::None,
-                },
-                label,
-            ));
         }
-        Ok(self.checkpoint_source())
+        Ok(checkpoint)
     }
-
-    fn checkpoint_source(&self) -> (ModelSource, String) {
-        match (&self.model_path, &self.tokenizer_path) {
-            // clap's `requires` guarantees these two arrive together.
-            (Some(model), Some(tokenizer)) => {
-                let label = label_of(model);
-                (
-                    ModelSource::Files {
-                        model: model.clone(),
-                        tokenizer: tokenizer.clone(),
-                    },
-                    label,
-                )
-            }
-            _ => (
-                ModelSource::Hub {
-                    repo: self.model_id.clone(),
-                },
-                self.model_id.clone(),
-            ),
-        }
-    }
-}
-
-/// A checkpoint's file is nearly always `model.safetensors`; the directory is
-/// the part a caller chose. Same rule as `kohagi`'s.
-fn label_of(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    if name == "model.safetensors" {
-        if let Some(dir) = path.parent().and_then(Path::file_name) {
-            return dir.to_string_lossy().into_owned();
-        }
-    }
-    name
-}
-
-fn print_model_info(reranker: &Reranker, label: &str) -> anyhow::Result<()> {
-    #[derive(serde::Serialize)]
-    struct Printed<'a> {
-        model: &'a str,
-        #[serde(flatten)]
-        info: kohagi::ModelInfo,
-    }
-
-    println!(
-        "{}",
-        serde_json::to_string(&Printed {
-            model: label,
-            info: reranker.info(),
-        })?
-    );
-    Ok(())
 }
 
 /// `--pair` mode: score the arguments and print what stdio mode would, with
@@ -269,7 +146,7 @@ fn run(args: Args) -> anyhow::Result<usize> {
     if args.print_model_info || !args.pair.is_empty() {
         let reranker = Reranker::load(&source, opts)?;
         if args.print_model_info {
-            print_model_info(&reranker, &label)?;
+            cli::print_model_info(&label, &reranker.info())?;
         } else {
             score_arguments(&args, &reranker)?;
         }
@@ -280,18 +157,7 @@ fn run(args: Args) -> anyhow::Result<usize> {
 }
 
 fn main() -> ExitCode {
-    match run(Args::parse()) {
-        Ok(0) => ExitCode::SUCCESS,
-        Ok(_) => ExitCode::from(2),
-        Err(e) => {
-            eprintln!("kohagi-rerank: error: {e:#}");
-            if e.chain().any(|c| c.is::<kohagi::UnsupportedRequest>()) {
-                ExitCode::from(3)
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-    }
+    cli::exit_code("kohagi-rerank", run(Args::parse()))
 }
 
 #[cfg(test)]
@@ -302,17 +168,5 @@ mod tests {
     fn the_help_and_flags_are_well_formed() {
         use clap::CommandFactory;
         Args::command().debug_assert();
-    }
-
-    #[test]
-    fn a_checkpoint_is_labelled_by_its_directory() {
-        assert_eq!(
-            label_of(Path::new("/m/rerankers/xsmall-v2/model.safetensors")),
-            "xsmall-v2"
-        );
-        assert_eq!(
-            label_of(Path::new("/m/reranker.safetensors")),
-            "reranker.safetensors"
-        );
     }
 }
