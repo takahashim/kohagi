@@ -24,13 +24,13 @@ use candle_core::{Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 use tokenizers::Tokenizer;
 
-use crate::batch::{load_tokenizer, pool_row, tokenize_bucket_pairs, Pooling, TokenInfo};
+use crate::batch::{bucket_encodings, encode_pairs, load_tokenizer, pool_row, Pooling, TokenInfo};
 use crate::encoder::{Activation, Config};
 use crate::errors::UnsupportedRequest;
 use crate::fingerprint::Fingerprint;
 use crate::model::{
-    fetch_checkpoint, load_weights, open_device, read_config, run_batches, Backend, ModelInfo,
-    ModelSource, Precision, Weights,
+    check_precision, fetch_checkpoint, load_weights, open_device, read_config, run_batches,
+    Backend, ModelInfo, ModelSource, Precision, Weights,
 };
 
 /// Knobs for [`Reranker::load`]. `Default` matches the Ruri v3 reranker.
@@ -270,11 +270,7 @@ impl Reranker {
             .context("model path has no parent dir for config.json")?;
         let (config, head_config, pooling) = read_head_config(&config_path)?;
 
-        anyhow::ensure!(
-            !matches!(opts.backend, Backend::Metal | Backend::Cuda)
-                || opts.precision != Precision::Bf16,
-            "bf16 is a CPU-only fast path and cannot run on a GPU; pick f32"
-        );
+        check_precision(opts.backend, opts.precision)?;
 
         let device = open_device(opts.backend)?;
         let fingerprint = Fingerprint::spawn(model_path.clone());
@@ -397,12 +393,7 @@ impl Reranker {
         };
         #[cfg(feature = "coreml")]
         if let Engine::CoreMl(encoder) = &self.engine {
-            let p = encoder.provenance();
-            info.source = p.source;
-            info.source_sha256 = p.source_sha256;
-            info.graph_version = p.graph_version;
-            info.buckets = Some(encoder.buckets());
-            info.quantization = Some(p.quantization.unwrap_or_else(|| "none".to_string()));
+            info.add_bundle(encoder);
         }
         info
     }
@@ -429,7 +420,8 @@ impl Reranker {
         weights: &Weights,
         device: &Device,
     ) -> Result<(Vec<f32>, Vec<TokenInfo>)> {
-        let (batches, info) = tokenize_bucket_pairs(&self.tokenizer, pairs, self.opts.batch_size)?;
+        let encodings = encode_pairs(&self.tokenizer, pairs)?;
+        let (batches, info) = bucket_encodings(&encodings, self.opts.batch_size);
         let (head, pooling, sigmoid) = (&self.head, self.pooling, self.opts.sigmoid);
         let scores = run_batches(
             weights,
@@ -443,44 +435,19 @@ impl Reranker {
     }
 
     /// The ANE path: one fixed-shape, batch=1 forward per pair, routed to the
-    /// smallest converted bucket it fits. Serial by design, as in the embedding
-    /// path — the ANE is one shared engine.
+    /// smallest converted bucket it fits.
     #[cfg(feature = "coreml")]
     fn score_coreml(
         &self,
         pairs: &[(&str, &str)],
         encoder: &crate::coreml::CoreMlEncoder,
     ) -> Result<(Vec<f32>, Vec<TokenInfo>)> {
-        let inputs: Vec<tokenizers::EncodeInput> = pairs
-            .iter()
-            .map(|&(query, text)| (query, text).into())
-            .collect();
-        let encodings = self
-            .tokenizer
-            .encode_batch(inputs, true)
-            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let encodings = encode_pairs(&self.tokenizer, pairs)?;
         let info: Vec<TokenInfo> = encodings.iter().map(crate::batch::token_info).collect();
-
-        let mut scores = Vec::with_capacity(pairs.len());
-        for enc in &encodings {
-            let ids = enc.get_ids();
-            let seq = encoder.bucket_for(ids.len()).ok_or_else(|| {
-                UnsupportedRequest::new(format!(
-                    "{} tokens exceed the largest CoreML bucket ({})",
-                    ids.len(),
-                    encoder.max_bucket()
-                ))
-            })?;
-            let mut ids_pad = vec![0i64; seq];
-            let mut mask_pad = vec![0i64; seq];
-            for (t, (&id, &m)) in ids.iter().zip(enc.get_attention_mask()).enumerate() {
-                ids_pad[t] = id as i64;
-                mask_pad[t] = m as i64;
-            }
-            let hidden = encoder.forward(&ids_pad, &mask_pad, seq)?;
-            let pooled = pool_row(&hidden, &mask_pad, self.dim, self.pooling);
-            scores.push(self.head.score(&pooled, self.opts.sigmoid)?);
-        }
+        let (head, pooling, sigmoid) = (&self.head, self.pooling, self.opts.sigmoid);
+        let scores = encoder.run_rows(&encodings, |hidden, mask, dim| {
+            head.score(&pool_row(hidden, mask, dim, pooling), sigmoid)
+        })?;
         Ok((scores, info))
     }
 }

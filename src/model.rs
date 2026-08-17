@@ -26,9 +26,7 @@ use candle_nn::VarBuilder;
 use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
-use crate::batch::{
-    l2_normalize, load_tokenizer, pool_row, tokenize_bucket, BatchInput, Pooling, TokenInfo,
-};
+use crate::batch::{l2_normalize, load_tokenizer, pool_row, BatchInput, Pooling, TokenInfo};
 use crate::config::CoreMlForm;
 use crate::errors::UnsupportedRequest;
 
@@ -296,6 +294,41 @@ pub struct ModelInfo {
     pub score: Option<&'static str>,
 }
 
+impl ModelInfo {
+    /// Fill in what only a converted bundle can say about itself.
+    ///
+    /// Shared by the embedder and the reranker because it is one claim either
+    /// way: a bundle's provenance is a property of the bundle, not of what is
+    /// being asked of it.
+    #[cfg(feature = "coreml")]
+    pub(crate) fn add_bundle(&mut self, encoder: &crate::coreml::CoreMlEncoder) {
+        let p = encoder.provenance();
+        self.source = p.source;
+        self.source_sha256 = p.source_sha256;
+        self.graph_version = p.graph_version;
+        // Every bundle serves the lengths it was compiled for, whether or not
+        // its metadata says so, so this reads the loaded models.
+        self.buckets = Some(encoder.buckets());
+        // An fp16 bundle carries no quantization key; saying "none" is what
+        // makes the two cases distinguishable in a results file.
+        self.quantization = Some(p.quantization.unwrap_or_else(|| "none".to_string()));
+    }
+}
+
+/// Reject a precision the requested device cannot run.
+///
+/// The bf16 path is a hand-written CPU GEMM (see `crate::bf16`), so it has
+/// nothing to run on a GPU. Checked before the device is opened, and in one
+/// place so that the embedder and the reranker cannot drift on which
+/// combinations they accept.
+pub(crate) fn check_precision(backend: Backend, precision: Precision) -> Result<()> {
+    anyhow::ensure!(
+        !matches!(backend, Backend::Metal | Backend::Cuda) || precision != Precision::Bf16,
+        "bf16 is a CPU-only fast path and cannot run on a GPU; pick f32"
+    );
+    Ok(())
+}
+
 /// Knobs for [`Embedder::load`]. `Default` matches Ruri v3.
 #[derive(Clone, Copy)]
 pub struct Options {
@@ -400,13 +433,7 @@ impl Embedder {
         let config: Config = read_config(&config_path)?;
         let dim = config.hidden_size;
 
-        // The bf16 path is a hand-written CPU GEMM (see `crate::bf16`), so it
-        // has nothing to run on a GPU.
-        anyhow::ensure!(
-            !matches!(opts.backend, Backend::Metal | Backend::Cuda)
-                || opts.precision != Precision::Bf16,
-            "bf16 is a CPU-only fast path and cannot run on a GPU; pick f32"
-        );
+        check_precision(opts.backend, opts.precision)?;
 
         let device = open_device(opts.backend)?;
         // Started here and collected at the end of the run: the weights are
@@ -603,16 +630,7 @@ impl Embedder {
         };
         #[cfg(feature = "coreml")]
         if let Engine::CoreMl(encoder) = &self.engine {
-            let p = encoder.provenance();
-            info.source = p.source;
-            info.source_sha256 = p.source_sha256;
-            info.graph_version = p.graph_version;
-            // Every bundle serves the lengths it was compiled for, whether or
-            // not its metadata says so, so this reads the loaded models.
-            info.buckets = Some(encoder.buckets());
-            // An fp16 bundle carries no quantization key; saying "none" is
-            // what makes the two cases distinguishable in a results file.
-            info.quantization = Some(p.quantization.unwrap_or_else(|| "none".to_string()));
+            info.add_bundle(encoder);
         }
         info
     }
@@ -646,7 +664,8 @@ impl Embedder {
         weights: &Weights,
         device: &Device,
     ) -> Result<(Vec<Vec<f32>>, Vec<TokenInfo>)> {
-        let (batches, info) = tokenize_bucket(&self.tokenizer, texts, self.opts.batch_size)?;
+        let encodings = crate::batch::encode(&self.tokenizer, texts)?;
+        let (batches, info) = crate::batch::bucket_encodings(&encodings, self.opts.batch_size);
         let (pooling, normalize) = (self.pooling, self.opts.normalize);
         let rows_out = run_batches(
             weights,
@@ -654,64 +673,48 @@ impl Embedder {
             self.opts.backend,
             &batches,
             texts.len(),
-            |hidden, mask, dim| {
-                let mut vector = pool_row(hidden, mask, dim, pooling);
-                if normalize {
-                    l2_normalize(&mut vector);
-                }
-                Ok(vector)
-            },
+            |hidden, mask, dim| Ok(embed_row(hidden, mask, dim, pooling, normalize)),
         )?;
         Ok((rows_out, info))
     }
 
     /// The CoreML/ANE path: one fixed-shape, batch=1 forward per text, routed
-    /// to the smallest bucket that fits. Serial by design — the ANE is a single
-    /// shared engine, so a thread pool would only add contention.
+    /// to the smallest bucket that fits.
     #[cfg(feature = "coreml")]
     fn embed_coreml(
         &self,
         texts: &[&str],
         encoder: &crate::coreml::CoreMlEncoder,
     ) -> Result<(Vec<Vec<f32>>, Vec<TokenInfo>)> {
-        let encodings = self
-            .tokenizer
-            .encode_batch(texts.to_vec(), true)
-            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let encodings = crate::batch::encode(&self.tokenizer, texts)?;
         let info: Vec<TokenInfo> = encodings.iter().map(crate::batch::token_info).collect();
-        let dim = encoder.dim();
-        let pooling = self.pooling;
-
-        let mut rows_out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-        for enc in &encodings {
-            let ids = enc.get_ids();
-            let seq = encoder.bucket_for(ids.len()).ok_or_else(|| {
-                // Unreachable given the load-time max_seq_length check, but
-                // never silently truncate past what the model can do.
-                UnsupportedRequest::new(format!(
-                    "{} tokens exceed the largest CoreML bucket ({})",
-                    ids.len(),
-                    encoder.max_bucket()
-                ))
-            })?;
-
-            // Pad this row to the exact bucket length; zeros stay masked out.
-            let mut ids_pad = vec![0i64; seq];
-            let mut mask_pad = vec![0i64; seq];
-            for (t, (&id, &m)) in ids.iter().zip(enc.get_attention_mask()).enumerate() {
-                ids_pad[t] = id as i64;
-                mask_pad[t] = m as i64;
-            }
-
-            let hidden = encoder.forward(&ids_pad, &mask_pad, seq)?;
-            let mut vector = pool_row(&hidden, &mask_pad, dim, pooling);
-            if self.opts.normalize {
-                l2_normalize(&mut vector);
-            }
-            rows_out.push(vector);
-        }
+        let (pooling, normalize) = (self.pooling, self.opts.normalize);
+        let rows_out = encoder.run_rows(&encodings, |hidden, mask, dim| {
+            Ok(embed_row(hidden, mask, dim, pooling, normalize))
+        })?;
         Ok((rows_out, info))
     }
+}
+
+/// One row's hidden states to its embedding — the step that differs between an
+/// embedder and a reranker, and the only one either batch runner does not do.
+///
+/// A free function rather than a method so the closures handing it to
+/// [`run_batches`] capture two `Copy` scalars instead of `&self`: the CPU
+/// fan-out needs a `Sync` closure, and an [`Embedder`] may hold a CoreML model
+/// that is not shareable between threads.
+fn embed_row(
+    hidden: &[f32],
+    mask: &[i64],
+    dim: usize,
+    pooling: Pooling,
+    normalize: bool,
+) -> Vec<f32> {
+    let mut vector = pool_row(hidden, mask, dim, pooling);
+    if normalize {
+        l2_normalize(&mut vector);
+    }
+    vector
 }
 
 /// Open the requested device, failing with a fixable message rather than a

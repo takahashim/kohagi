@@ -37,6 +37,7 @@ use objc2_core_ml::{
     MLModelCreatorDefinedKey, MLMultiArray, MLMultiArrayDataType,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
+use tokenizers::Encoding;
 
 use crate::UnsupportedRequest;
 
@@ -147,10 +148,6 @@ impl CoreMlEncoder {
         Ok(Self { buckets, dim })
     }
 
-    pub fn dim(&self) -> usize {
-        self.dim
-    }
-
     /// What the loaded bundle records about its own conversion. Read from the
     /// first bucket: one conversion writes the same metadata into all of them,
     /// and a single-bundle multi-function model has only one to read.
@@ -182,6 +179,49 @@ impl CoreMlEncoder {
     /// validating `max_seq_length <= max_bucket()` at load.
     pub fn bucket_for(&self, len: usize) -> Option<usize> {
         self.buckets.iter().map(|b| b.seq).find(|&s| s >= len)
+    }
+
+    /// Run each encoding through the smallest bucket it fits and reduce its
+    /// hidden states to one result, in input order.
+    ///
+    /// The ANE's half of [`crate::model::run_batches`], with the same division
+    /// of labour and the same `reduce` — one row's `[seq, dim]` hidden states,
+    /// its mask, and `dim` — so a caller states what it wants from a row once
+    /// and gets it on either engine.
+    ///
+    /// Serial, and not because it was easier: the ANE is one shared engine, and
+    /// fixed-shape batch=1 is the only shape it runs at full speed (see the
+    /// module docs). There is nothing here to fan out to.
+    pub fn run_rows<T>(
+        &self,
+        encodings: &[Encoding],
+        reduce: impl Fn(&[f32], &[i64], usize) -> Result<T>,
+    ) -> Result<Vec<T>> {
+        let mut out = Vec::with_capacity(encodings.len());
+        for enc in encodings {
+            let ids = enc.get_ids();
+            let seq = self.bucket_for(ids.len()).ok_or_else(|| {
+                // Unreachable given the load-time max_seq_length check, but
+                // never silently truncate past what the model can do.
+                UnsupportedRequest::new(format!(
+                    "{} tokens exceed the largest CoreML bucket ({})",
+                    ids.len(),
+                    self.max_bucket()
+                ))
+            })?;
+
+            // Pad this row to the exact bucket length; zeros stay masked out.
+            let mut ids_pad = vec![0i64; seq];
+            let mut mask_pad = vec![0i64; seq];
+            for (t, (&id, &m)) in ids.iter().zip(enc.get_attention_mask()).enumerate() {
+                ids_pad[t] = id as i64;
+                mask_pad[t] = m as i64;
+            }
+
+            let hidden = self.forward(&ids_pad, &mask_pad, seq)?;
+            out.push(reduce(&hidden, &mask_pad, self.dim)?);
+        }
+        Ok(out)
     }
 
     /// One forward pass for a single row already padded to bucket length `seq`.
