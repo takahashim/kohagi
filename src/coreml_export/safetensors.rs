@@ -25,6 +25,12 @@ impl Checkpoint {
         Ok(Self { tensors })
     }
 
+    /// One tensor by its exact name, or `None`. Unlike [`Weights::get`] this
+    /// does not fall back to a `model.` prefix: the head sits at the root.
+    pub fn tensor(&self, name: &str) -> Option<&Tensor> {
+        self.tensors.get(name)
+    }
+
     /// The tensor names, sorted — for reporting what a checkpoint actually holds
     /// when a lookup fails.
     pub fn names(&self) -> Vec<&str> {

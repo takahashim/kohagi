@@ -29,6 +29,17 @@ tokenizers = "0.21"
 half = "2"
 hf-hub = "0.4"
 
+# The model fingerprint (src/fingerprint.rs). fnv.rs cannot do this job, being
+# a 64-bit non-cryptographic hash whose only users are cache keys.
+#
+# 0.11 rather than the 0.10 that hf-hub already pulls in: 0.10 reaches its
+# hardware backends only through its `asm` feature, which drags in sha2-asm and
+# with it a C toolchain at build time. 0.11 selects the same backends by
+# runtime CPU detection with no features and no build script — 1.5 GB/s instead
+# of 350 MB/s on an M2, and the ARM and x86 paths both come for free. Two
+# versions of sha2 in the tree is the price, and it is only build time.
+sha2 = "0.11"
+
 # candle runs pure-CPU by default; the macOS target below adds Apple Accelerate
 # (AMX) for its sgemm. Apple GPU support is behind the `metal` feature — see
 # `Backend` in src/model.rs for why it is opt-in rather than the default.

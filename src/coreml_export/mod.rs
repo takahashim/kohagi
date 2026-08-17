@@ -24,6 +24,7 @@ pub mod mil;
 pub mod modernbert;
 pub mod safetensors;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -130,6 +131,11 @@ pub const GRAPH_VERSION: u32 = 2;
 pub struct Provenance {
     /// The checkpoint this was converted from, as a Hub id or a path.
     pub source: String,
+    /// sha256 of that checkpoint's `model.safetensors`. A path or a Hub id
+    /// names what was meant to be converted; this names what was. It is the
+    /// only fingerprint a bundle can offer, since the bundle holds fp16 (or
+    /// int8) copies of those weights rather than the weights themselves.
+    pub source_sha256: Option<String>,
     /// Which sequence lengths the bundle serves.
     pub lengths: Vec<usize>,
     /// Whether the embedding table is int8. Recorded because a quantized bundle's
@@ -165,6 +171,12 @@ impl Provenance {
             out.push((
                 "com.github.takahashim.kohagi.source".to_string(),
                 self.source.clone(),
+            ));
+        }
+        if let Some(sha) = &self.source_sha256 {
+            out.push((
+                "com.github.takahashim.kohagi.source_sha256".to_string(),
+                sha.clone(),
             ));
         }
         if self.quantized_embeddings {
@@ -417,9 +429,15 @@ pub fn convert(
     cfg.check_lengths(lengths)
         .with_context(|| format!("converting {}", checkpoint.source))?;
 
+    // Before the weights are opened: a conversion that then fails leaves no
+    // bundle, and this way the hash is of the file the emitter is about to
+    // read rather than of whatever replaced it afterwards.
+    let source_sha256 = crate::fingerprint::sha256_file(&checkpoint.weights)?;
+
     let weights = safetensors::Checkpoint::open(&checkpoint.weights)?;
     let provenance = Provenance {
         source: checkpoint.source.clone(),
+        source_sha256: Some(source_sha256),
         lengths: lengths.to_vec(),
         quantized_embeddings: opts.quantize_embeddings,
         quantized_projections: opts.quantize_projections,
@@ -429,6 +447,13 @@ pub fn convert(
 
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     write_package(&dir.join(bundle_name(lengths)), &model, &blob)?;
+
+    // A cross-encoder's head, when the checkpoint is one. The emitter reads
+    // only the encoder, so without this the bundle could not score a pair.
+    let head_file = crate::config::COREML_HEAD_FILE;
+    if write_head(&weights, &dir.join(head_file))? {
+        eprintln!("wrote   : {head_file} (the classification head, for kohagi-rerank)");
+    }
 
     // A converted directory has to be self-contained: the checkpoint it came from
     // may be a Hugging Face cache entry that is cleared independently.
@@ -443,6 +468,47 @@ pub fn convert(
             .with_context(|| format!("copying {}", pooling.display()))?;
     }
     Ok(cfg)
+}
+
+/// Copy the classification head out beside the bundle, if this checkpoint has
+/// one, and say whether it did.
+///
+/// A converted bundle holds the encoder alone: the emitter has no place for the
+/// head's tensors, and reranking needs them. Writing them beside the bundle
+/// keeps it self-contained — `kohagi-rerank --coreml-dir` needs nothing but the
+/// directory — and leaves them at the checkpoint's own precision while the
+/// encoder is rounded to fp16, which is the more accurate half of the trade
+/// rather than the less.
+///
+/// Four small tensors: 2.4 MB for a 768-wide head, against a bundle of hundreds.
+fn write_head(weights: &safetensors::Checkpoint, path: &Path) -> Result<bool> {
+    use crate::config::head;
+
+    // The projection is what says a head is here at all; the norm and the
+    // classifier come with it. Biases are optional (ModernBERT's defaults are
+    // off), so an absent one is not an error.
+    if weights.tensor(head::REQUIRED[0]).is_none() {
+        return Ok(false);
+    }
+    let mut out = HashMap::new();
+    for name in head::REQUIRED {
+        let tensor = weights.tensor(name).with_context(|| {
+            format!(
+                "this checkpoint has `{}` but no `{name}`; it is a classification model \
+                 this converter does not recognize",
+                head::REQUIRED[0]
+            )
+        })?;
+        out.insert(name.to_string(), tensor.clone());
+    }
+    for name in head::OPTIONAL {
+        if let Some(tensor) = weights.tensor(name) {
+            out.insert(name.to_string(), tensor.clone());
+        }
+    }
+    candle_core::safetensors::save(&out, path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
 }
 
 #[cfg(test)]

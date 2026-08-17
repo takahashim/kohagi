@@ -10,3 +10,6 @@ __pycache__/
 *.mlpackage
 *.mlmodelc
 notes/coreml-poc/.venv/
+
+# The Python side of the embedding work: torch, sentence-transformers, models
+/.venv

@@ -29,6 +29,7 @@
 mod batch;
 #[cfg(target_arch = "x86_64")]
 pub mod bf16;
+pub mod cli;
 mod config;
 #[cfg(feature = "coreml")]
 mod coreml;
@@ -38,14 +39,16 @@ pub mod coreml_export;
 mod coreml_proto;
 mod encoder;
 mod errors;
+mod fingerprint;
 // Only the CoreML caches and the emitter's golden test need a stable hash.
 #[cfg(any(feature = "coreml", test))]
 mod fnv;
 mod fused;
 mod model;
+pub mod rerank;
 pub mod stdio;
 
 pub use batch::{Pooling, TokenInfo};
 pub use config::{CoreMlForm, CoreMlQuantize};
 pub use errors::UnsupportedRequest;
-pub use model::{Backend, Embedder, ModelSource, Options, Precision};
+pub use model::{Backend, Embedder, ModelInfo, ModelSource, Options, Precision};

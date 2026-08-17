@@ -88,13 +88,54 @@ costs a marker rather than a deadlock.
 On completion, one summary line on stderr:
 
 ```
-kohagi: model=cl-nagoya/ruri-v3-130m dim=512 in=2141 out=2141 skipped=0 truncated=3
+kohagi: model=cl-nagoya/ruri-v3-130m sha256=1c342581efc2 pooling=mean dim=512 max_seq=512 in=2141 out=2141 skipped=0 truncated=3
 ```
 
 `in` = lines parsed as records = `out + skipped`; blank lines are not counted.
 `truncated` counts how many of the `out` records ran past `--max-seq-length`
 (always reported, with or without `--report-tokens`); a nonzero value is a hint
 to raise `--max-seq-length` or chunk those documents, not an error.
+
+The fields before `in` describe the model rather than the run: `sha256` is the
+first 12 hex digits of the weights file's digest, and `pooling` / `dim` /
+`max_seq` are the three settings that silently change every vector when they
+differ. Together they make a captured log say *which* model produced the
+vectors, not just which one was asked for — two fine-tunes of one checkpoint,
+or two blends of one pair, are otherwise indistinguishable in a log.
+
+Input with no valid records never loads the model, and the line then carries
+`dim=0` and none of the other model fields: nothing was loaded, so there is
+nothing to report about it.
+
+Read the line as `key=value` pairs rather than by position: it is meant for
+people and for grep, and later versions may add fields.
+
+## `--print-model-info`
+
+The same facts, machine-readable, without embedding anything. Kohagi loads the
+model, writes one JSON object on stdout, and exits 0 without reading stdin:
+
+```console
+$ kohagi --print-model-info
+{"model":"cl-nagoya/ruri-v3-130m","backend":"cpu","precision":"f32","sha256":"1c342581efc23d0b50b92fb11ac1eeb02719691bcc59bdc0dc0b09a36b4fc6d1","pooling":"mean","dim":512,"max_seq_length":512}
+```
+
+Call it once at the start of an evaluation and record the object beside the
+results: renaming a directory, or copying the wrong one into it, then cannot
+change what the numbers say they came from.
+
+| field | notes |
+|---|---|
+| `model` | The name this run used: the `--model-id` repo, or the directory of a `--model-path` checkpoint. |
+| `backend` / `precision` | `--device` and `--precision`, as their flag values. |
+| `sha256` | Of every byte of `model.safetensors`. Identical weights always give an identical digest, and one byte's difference gives a different one. Absent on `--device coreml`, which has no safetensors to hash. |
+| `pooling` | What was resolved at load — the checkpoint's own `1_Pooling/config.json` unless `--pooling` overrode it. |
+| `dim` | Output dimension. |
+| `max_seq_length` | Token-level truncation length for this run. |
+| `source`, `source_sha256` | `--device coreml` only: the checkpoint the bundle was converted from, and the digest of *its* weights. Absent for a bundle whose converter recorded none — an unknown provenance is reported as unknown rather than guessed. |
+| `buckets`, `quantization` | `--device coreml` only: the sequence lengths the bundle serves, and `none` / `embeddings-int8` / `all-int8`. A quantized bundle's vectors are not interchangeable with an fp16 one's, so a result that came from one should say so. |
+
+Fields that do not apply to a run are omitted rather than set to null.
 
 | exit | meaning |
 |---|---|

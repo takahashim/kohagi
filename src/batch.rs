@@ -6,7 +6,7 @@
 //! freedom is what lets `model.rs` re-split batches to fit its memory budget.
 
 use anyhow::Result;
-use tokenizers::{Tokenizer, TruncationParams};
+use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
 /// How to reduce the encoder's `[seq, dim]` output to one vector per text.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -16,6 +16,17 @@ pub enum Pooling {
     Mean,
     /// First token only. Some encoders are trained for this; Ruri is not.
     Cls,
+}
+
+impl Pooling {
+    /// The name this pooling has in a `1_Pooling/config.json` and on the
+    /// command line, so that what a run reports is what a caller can pass back.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mean => "mean",
+            Self::Cls => "cls",
+        }
+    }
 }
 
 /// Per-text tokenization facts, surfaced so a caller can tell a truncated
@@ -73,18 +84,42 @@ struct Tokenized<'a> {
     mask: &'a [u32],
 }
 
-/// Tokenize all texts (no padding), sort by token length, and split into
-/// padded batches of at most `batch_size` rows, each padded only to its own
-/// longest row. Also returns per-text [`TokenInfo`] in the original input
-/// order, so truncation can be reported alongside the vectors.
-pub fn tokenize_bucket(
-    tokenizer: &Tokenizer,
-    texts: &[&str],
-    batch_size: usize,
-) -> Result<(Vec<BatchInput>, Vec<TokenInfo>)> {
-    let encodings = tokenizer
+/// Tokenize texts, no padding.
+pub fn encode(tokenizer: &Tokenizer, texts: &[&str]) -> Result<Vec<Encoding>> {
+    tokenizer
         .encode_batch(texts.to_vec(), true)
-        .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))
+}
+
+/// The same, for `(query, text)` pairs — what a cross-encoder scores.
+///
+/// The pair is joined by the tokenizer's own template rather than by string
+/// concatenation here (`<s> query </s> <s> text </s>` for the Ruri and
+/// japanese-reranker families), so the two sequences arrive in the shape the
+/// model was trained on, with truncation trimming the longer of the two first
+/// (`longest_first`, the tokenizer's default and the one CrossEncoder asks
+/// for).
+pub fn encode_pairs(tokenizer: &Tokenizer, pairs: &[(&str, &str)]) -> Result<Vec<Encoding>> {
+    let inputs: Vec<tokenizers::EncodeInput> = pairs
+        .iter()
+        .map(|&(query, text)| (query, text).into())
+        .collect();
+    tokenizer
+        .encode_batch(inputs, true)
+        .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))
+}
+
+/// Sort encodings by token length and split into padded batches of at most
+/// `batch_size` rows, each padded only to its own longest row. Also returns
+/// per-row [`TokenInfo`] in the original input order, so truncation can be
+/// reported alongside the results.
+///
+/// A pair is one row here, as a text is: what a cross-encoder truncated is the
+/// longer half of one input, not one of two inputs.
+pub fn bucket_encodings(
+    encodings: &[Encoding],
+    batch_size: usize,
+) -> (Vec<BatchInput>, Vec<TokenInfo>) {
     let info: Vec<TokenInfo> = encodings.iter().map(token_info).collect();
     let rows: Vec<Tokenized> = encodings
         .iter()
@@ -93,7 +128,7 @@ pub fn tokenize_bucket(
             mask: e.get_attention_mask(),
         })
         .collect();
-    Ok((bucket(&rows, batch_size), info))
+    (bucket(&rows, batch_size), info)
 }
 
 /// Group tokenized rows into padded batches. Split out from tokenization so

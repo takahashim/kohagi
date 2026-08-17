@@ -210,19 +210,12 @@ struct InRecord {
     text: String,
 }
 
-/// What one physical line of input asks for.
-enum Line {
-    Record(InRecord),
-    /// A blank line: embed whatever is buffered now, do not wait for a full
-    /// chunk, and mark the boundary on the way out.
-    Flush,
-}
-
-/// Parse one physical line. `Err` = skip with a warning (malformed JSON,
-/// missing id, empty/missing text).
-fn parse_line(line: &str) -> Result<Line, String> {
+/// Parse one physical line. `Ok(None)` is a blank line — embed whatever is
+/// buffered now rather than waiting for a full chunk. `Err` = skip with a
+/// warning (malformed JSON, missing id, empty/missing text).
+fn parse_line(line: &str) -> Result<Option<InRecord>, String> {
     if line.trim().is_empty() {
-        return Ok(Line::Flush);
+        return Ok(None);
     }
     let v: Value = serde_json::from_str(line).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = v.as_object().ok_or("not a JSON object")?;
@@ -234,61 +227,145 @@ fn parse_line(line: &str) -> Result<Line, String> {
     if text.is_empty() {
         return Err("empty \"text\"".to_string());
     }
-    Ok(Line::Record(InRecord {
+    Ok(Some(InRecord {
         id,
         text: text.to_string(),
     }))
 }
 
 /// How many records a chunk produced, and how many of them were truncated.
-struct Flushed {
-    written: usize,
-    truncated: usize,
+pub(crate) struct Flushed {
+    pub written: usize,
+    pub truncated: usize,
 }
 
-/// Embed the buffered chunk, write its output lines, and empty the buffer.
+/// What a whole run produced, for the summary line.
+pub(crate) struct Counts {
+    pub written: usize,
+    pub skipped: usize,
+    pub truncated: usize,
+}
+
+/// One end of the protocol: what a line means here, and what to do with a batch
+/// of them. [`drive`] supplies everything the two ends share.
 ///
-/// The model is loaded here on first use, so input with no valid records
-/// never loads it at all. Each record is written as one complete line, so an
-/// abort can never leave a half-written line for the caller to misread.
-/// `report_tokens` adds the `n_tokens` / `truncated` fields to each record; the
-/// truncated count is tallied for the summary regardless.
-fn flush_chunk(
-    embedder: &mut Option<Embedder>,
-    load: &impl Fn() -> Result<Embedder>,
-    prefix: &str,
-    chunk: &mut Vec<InRecord>,
-    out: &mut Writer<impl Write>,
-) -> Result<Flushed> {
-    if chunk.is_empty() {
-        return Ok(Flushed {
-            written: 0,
-            truncated: 0,
-        });
-    }
-    let embedder = match embedder {
-        Some(e) => e,
-        None => embedder.insert(load()?),
+/// `kohagi` reads `{"id","text"}` and answers with embeddings; `kohagi-rerank`
+/// reads `{"id","query","text"}` and answers with scores. Every other rule is
+/// the same rule — an opaque echoed `id`, a malformed line skipped rather than
+/// fatal, a blank line meaning "answer what I have sent", a blank line back to
+/// mark the reply, output flushed per chunk, and the model loaded on first use
+/// so input with no valid records never loads it. Stated once here, because two
+/// statements of it are two things to keep in step with PROTOCOL.md.
+pub(crate) trait Records {
+    type Record;
+
+    /// `Ok(Some)` a record, `Ok(None)` a batch boundary, `Err` a skip reason.
+    fn parse(line: &str) -> Result<Option<Self::Record>, String>;
+
+    /// Answer the buffered records, write them out, and empty the buffer.
+    fn flush(&mut self, chunk: &mut Vec<Self::Record>) -> Result<Flushed>;
+
+    /// Say that a batch is complete, so a reader knows not to wait for more.
+    fn boundary(&mut self) -> Result<()>;
+}
+
+/// Read the protocol off stdin and hand it to `records`, chunk by chunk.
+///
+/// Does not write the summary or close the output: both need what the caller
+/// knows and this does not — which model answered, and whether the output shape
+/// has a document to close.
+pub(crate) fn drive<R: Records>(records: &mut R, program: &str) -> Result<Counts> {
+    let stdin = std::io::stdin();
+    let mut chunk: Vec<R::Record> = Vec::new();
+    let mut counts = Counts {
+        written: 0,
+        skipped: 0,
+        truncated: 0,
+    };
+    let take = |f: Flushed, counts: &mut Counts| {
+        counts.written += f.written;
+        counts.truncated += f.truncated;
     };
 
-    let prefixed: Vec<String> = chunk
-        .iter()
-        .map(|r| format!("{prefix}{}", r.text))
-        .collect();
-    let texts: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-    let (vectors, tokens) = embedder.embed_with_tokens(&texts)?;
-
-    let mut truncated = 0usize;
-    for ((record, vector), info) in chunk.iter().zip(&vectors).zip(&tokens) {
-        truncated += info.truncated as usize;
-        out.record(&record.id, vector, info)?;
+    for (lineno, line) in stdin.lock().lines().enumerate() {
+        let line = line.context("reading stdin")?;
+        match R::parse(&line) {
+            Ok(Some(record)) => {
+                chunk.push(record);
+                if chunk.len() >= CHUNK_ROWS {
+                    take(records.flush(&mut chunk)?, &mut counts);
+                }
+            }
+            // A blank line is the caller saying "that is one batch": answer what
+            // is buffered even though the chunk is short, and mark the boundary
+            // so a reader knows not to wait for more.
+            Ok(None) => {
+                take(records.flush(&mut chunk)?, &mut counts);
+                records.boundary()?;
+            }
+            Err(why) => {
+                counts.skipped += 1;
+                eprintln!("{program}: skip line {}: {why}", lineno + 1);
+            }
+        }
     }
-    // Flush per chunk so the caller can consume output as it is produced.
-    out.flush()?;
+    take(records.flush(&mut chunk)?, &mut counts);
+    Ok(counts)
+}
 
-    let written = chunk.len();
-    chunk.clear();
-    Ok(Flushed { written, truncated })
+/// The embedding end of the protocol: prefix each text, embed the chunk, write
+/// the vectors.
+struct Embed<'a, W: Write, F> {
+    embedder: Option<Embedder>,
+    load: F,
+    prefix: &'a str,
+    out: Writer<W>,
+}
+
+impl<W: Write, F: Fn() -> Result<Embedder>> Records for Embed<'_, W, F> {
+    type Record = InRecord;
+
+    fn parse(line: &str) -> Result<Option<InRecord>, String> {
+        parse_line(line)
+    }
+
+    fn flush(&mut self, chunk: &mut Vec<InRecord>) -> Result<Flushed> {
+        if chunk.is_empty() {
+            return Ok(Flushed {
+                written: 0,
+                truncated: 0,
+            });
+        }
+        let embedder = match &mut self.embedder {
+            Some(e) => e,
+            None => self.embedder.insert((self.load)()?),
+        };
+
+        let prefixed: Vec<String> = chunk
+            .iter()
+            .map(|r| format!("{}{}", self.prefix, r.text))
+            .collect();
+        let texts: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+        let (vectors, tokens) = embedder.embed_with_tokens(&texts)?;
+
+        let mut truncated = 0usize;
+        // Each record is written as one complete line, so an abort can never
+        // leave a half-written line for the caller to misread.
+        for ((record, vector), info) in chunk.iter().zip(&vectors).zip(&tokens) {
+            truncated += info.truncated as usize;
+            self.out.record(&record.id, vector, info)?;
+        }
+        // Flush per chunk so the caller can consume output as it is produced.
+        self.out.flush()?;
+
+        let written = chunk.len();
+        chunk.clear();
+        Ok(Flushed { written, truncated })
+    }
+
+    fn boundary(&mut self) -> Result<()> {
+        self.out.boundary()
+    }
 }
 
 /// Run the protocol over stdin/stdout. Returns the number of skipped lines —
@@ -301,61 +378,72 @@ pub fn run(
     model_label: &str,
     format: Format,
 ) -> Result<usize> {
-    let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut out = Writer::new(
-        BufWriter::new(stdout.lock()),
-        format,
-        model_label,
-        report_tokens,
-    );
+    let mut records = Embed {
+        embedder: None,
+        load,
+        prefix,
+        out: Writer::new(
+            BufWriter::new(stdout.lock()),
+            format,
+            model_label,
+            report_tokens,
+        ),
+    };
 
-    let mut embedder: Option<Embedder> = None;
-    let mut chunk: Vec<InRecord> = Vec::new();
-    let mut n_out = 0usize;
-    let mut skipped = 0usize;
-    let mut truncated = 0usize;
-
-    for (lineno, line) in stdin.lock().lines().enumerate() {
-        let line = line.context("reading stdin")?;
-        match parse_line(&line) {
-            Ok(Line::Record(record)) => {
-                chunk.push(record);
-                if chunk.len() >= CHUNK_ROWS {
-                    let f = flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
-                    n_out += f.written;
-                    truncated += f.truncated;
-                }
-            }
-            // A blank line is the caller saying "that is one batch": embed what
-            // is buffered even though the chunk is short, and mark the boundary
-            // so a reader knows not to wait for more.
-            Ok(Line::Flush) => {
-                let f = flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
-                n_out += f.written;
-                truncated += f.truncated;
-                out.boundary()?;
-            }
-            Err(why) => {
-                skipped += 1;
-                eprintln!("kohagi: skip line {}: {why}", lineno + 1);
-            }
-        }
-    }
-    let f = flush_chunk(&mut embedder, &load, prefix, &mut chunk, &mut out)?;
-    out.finish()?;
-    n_out += f.written;
-    truncated += f.truncated;
+    let counts = drive(&mut records, "kohagi")?;
+    records.out.finish()?;
 
     // `in` counts record lines (blank lines are ignored entirely); with no
-    // valid input the model was never loaded and dim is unknown (0).
-    let dim = embedder.as_ref().map_or(0, Embedder::dim);
-    let n_in = n_out + skipped;
+    // valid input the model was never loaded, and there is nothing to say
+    // about it beyond the name that would have been used.
+    let facts = records
+        .embedder
+        .as_ref()
+        .map_or_else(|| "dim=0".to_string(), |e| summary_facts(&e.info()));
+    summarize("kohagi", model_label, &facts, &counts);
+    Ok(counts.skipped)
+}
+
+/// The stderr line every run ends with, in the one shape a log parser has to
+/// know.
+pub(crate) fn summarize(program: &str, model_label: &str, facts: &str, counts: &Counts) {
+    let n_in = counts.written + counts.skipped;
     eprintln!(
-        "kohagi: model={model_label} dim={dim} in={n_in} out={n_out} \
-         skipped={skipped} truncated={truncated}"
+        "{program}: model={model_label} {facts} in={n_in} out={} skipped={} truncated={}",
+        counts.written, counts.skipped, counts.truncated
     );
-    Ok(skipped)
+}
+
+/// The model's part of the summary line: which weights, resolved how.
+///
+/// Enough to reconstruct what produced the vectors from a captured log alone —
+/// the fingerprint answers *which* checkpoint, and pooling and max_seq answer
+/// the two settings that silently change every vector when they differ.
+pub(crate) fn summary_facts(info: &crate::ModelInfo) -> String {
+    let mut out = String::new();
+    if let Some(sha) = &info.sha256 {
+        out.push_str(&format!("sha256={} ", crate::fingerprint::short(sha)));
+    }
+    // A CoreML bundle has no weights of its own to hash, so it reports the
+    // checkpoint it was converted from — under a different key, because it is
+    // a different claim.
+    if let Some(sha) = &info.source_sha256 {
+        out.push_str(&format!(
+            "source_sha256={} ",
+            crate::fingerprint::short(sha)
+        ));
+    }
+    out.push_str(&format!(
+        "pooling={} dim={} max_seq={}",
+        info.pooling, info.dim, info.max_seq_length
+    ));
+    // A reranker's numbers mean different things either side of the sigmoid,
+    // so a log of scores has to say which it holds.
+    if let Some(score) = info.score {
+        out.push_str(&format!(" score={score}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -363,10 +451,9 @@ mod tests {
     use super::*;
 
     fn record(line: &str) -> InRecord {
-        match parse_line(line).expect("a record") {
-            Line::Record(r) => r,
-            Line::Flush => panic!("expected a record, got a batch boundary"),
-        }
+        parse_line(line)
+            .expect("a record")
+            .expect("a record, not a batch boundary")
     }
 
     #[test]
@@ -521,10 +608,77 @@ mod tests {
         }
     }
 
+    fn info() -> crate::ModelInfo {
+        crate::ModelInfo {
+            backend: "cpu",
+            precision: "f32",
+            sha256: Some("0123456789abcdef0123456789abcdef".to_string()),
+            source: None,
+            source_sha256: None,
+            buckets: None,
+            quantization: None,
+            graph_version: None,
+            pooling: "mean",
+            dim: 512,
+            max_seq_length: 512,
+            score: None,
+        }
+    }
+
+    /// The summary is where a captured log says which weights answered, so the
+    /// two paths spell their fingerprints differently: a checkpoint's own hash
+    /// and a bundle's report of the checkpoint behind it are not the same
+    /// claim, and a log that conflated them would be worse than one with
+    /// neither.
+    #[test]
+    fn the_summary_says_which_weights_it_used() {
+        assert_eq!(
+            summary_facts(&info()),
+            "sha256=0123456789ab pooling=mean dim=512 max_seq=512"
+        );
+
+        let coreml = crate::ModelInfo {
+            backend: "coreml",
+            sha256: None,
+            source_sha256: Some("fedcba9876543210fedcba9876543210".to_string()),
+            ..info()
+        };
+        assert_eq!(
+            summary_facts(&coreml),
+            "source_sha256=fedcba987654 pooling=mean dim=512 max_seq=512"
+        );
+
+        // A bundle that records no provenance says nothing about one, rather
+        // than reporting its own identity as the checkpoint's.
+        let unknown = crate::ModelInfo {
+            source_sha256: None,
+            ..coreml
+        };
+        assert_eq!(summary_facts(&unknown), "pooling=mean dim=512 max_seq=512");
+    }
+
+    /// What `--print-model-info` writes, which evaluation scripts read into
+    /// their results files: every key present, and the ones that do not apply
+    /// to this path absent rather than null.
+    #[test]
+    fn the_model_info_json_omits_what_does_not_apply() {
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&info()).unwrap()).unwrap();
+        assert_eq!(json["backend"], "cpu");
+        assert_eq!(json["precision"], "f32");
+        assert_eq!(json["pooling"], "mean");
+        assert_eq!(json["dim"], 512);
+        assert_eq!(json["max_seq_length"], 512);
+        assert_eq!(json["sha256"], "0123456789abcdef0123456789abcdef");
+        for absent in ["source", "source_sha256", "buckets", "quantization"] {
+            assert!(json.get(absent).is_none(), "{absent} should be omitted");
+        }
+    }
+
     #[test]
     fn parse_skips_bad_lines_and_ignores_blank() {
-        assert!(matches!(parse_line(""), Ok(Line::Flush)));
-        assert!(matches!(parse_line("   "), Ok(Line::Flush)));
+        assert!(matches!(parse_line(""), Ok(None)));
+        assert!(matches!(parse_line("   "), Ok(None)));
         assert!(parse_line("not json").is_err());
         assert!(parse_line(r#"[1,2]"#).is_err());
         assert!(parse_line(r#"{"text": "no id"}"#).is_err());

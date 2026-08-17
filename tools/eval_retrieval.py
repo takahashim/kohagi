@@ -204,7 +204,17 @@ def main():
         help="where the parquet shards are kept (not committed)",
     )
     ap.add_argument("kohagi_args", nargs="*", help="passed to kohagi after --")
-    args = ap.parse_args()
+    # Split the passthrough off before argparse sees it. Whether a lone `--`
+    # survives for a `nargs="*"` positional depends on the Python version, and
+    # the same command has to work on both machines.
+    argv = sys.argv[1:]
+    passthrough = []
+    if "--" in argv:
+        cut = argv.index("--")
+        argv, passthrough = argv[:cut], argv[cut + 1 :]
+    args = ap.parse_args(argv)
+    if passthrough:
+        args.kohagi_args = passthrough
 
     if not os.path.exists(args.kohagi):
         sys.exit(f"no kohagi at {args.kohagi}; build it first (cargo build --release ...)")
