@@ -326,14 +326,19 @@ impl Reranker {
         // a bundle that cannot score a pair should say so in a second, not
         // after twenty.
         let head_path = dir.join(crate::config::COREML_HEAD_FILE);
-        anyhow::ensure!(
-            head_path.is_file(),
-            "{} has no {}, so it holds an encoder with no way to score a pair. Bundles \
-             converted before Kohagi 0.6 do not carry one: reconvert the checkpoint, or \
-             score on --device cpu",
-            dir.display(),
-            crate::config::COREML_HEAD_FILE
-        );
+        // An `UnsupportedRequest`, so this exits 3 like every other "the CoreML
+        // backend cannot serve this" — the message tells the caller to retry on
+        // the CPU, and exit 3 is how a caller learns that without reading it.
+        if !head_path.is_file() {
+            return Err(UnsupportedRequest::new(format!(
+                "{} has no {}, so it holds an encoder with no way to score a pair. Bundles \
+                 converted before Kohagi 0.6 do not carry one: reconvert the checkpoint, or \
+                 score on --device cpu",
+                dir.display(),
+                crate::config::COREML_HEAD_FILE
+            ))
+            .into());
+        }
         let head = Head::load(&cpu_weights(&head_path)?, &config, &head_config)?;
 
         let encoder = crate::coreml::CoreMlEncoder::load(&dir, config.hidden_size)?;
