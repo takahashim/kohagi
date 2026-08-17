@@ -77,54 +77,6 @@ Kohagi prepends the value of `--prefix` to every input text, allowing callers to
 | Search query                      | `"検索クエリ: "`                   |
 | Topic or keyword                  | `"トピック: "`                    |
 
-### Other models
-
-Kohagi can also run other ModernBERT-based sentence encoders available on the Hugging Face Hub.
-For example, you can use [nomic-ai/modernbert-embed-base](https://huggingface.co/nomic-ai/modernbert-embed-base) for English-language retrieval:
-
-```bash
-kohagi --model-id nomic-ai/modernbert-embed-base \
-       --prefix "search_document: " < texts.jsonl
-```
-
-`cl-nagoya/ruri-v3-310m`, which produces 768-dimensional vectors, works in the
-same way. To check whether a given model produces usable embeddings under
-Kohagi, run [`tools/model_check.py`](tools/model_check.py) against it.
-
-Pooling is taken from the model. Kohagi reads the checkpoint's
-`1_Pooling/config.json` and uses the mode it declares, so a CLS-pooled model
-such as `Alibaba-NLP/gte-modernbert-base` needs no flag. Pass `--pooling` only
-to override, and Kohagi warns if your choice disagrees with the checkpoint —
-or if the model ships no pooling config at all, which usually means it is a
-reranker or a base LM rather than a sentence encoder.
-
-For offline environments, specify local model files instead. In this mode, Kohagi does not make any network requests:
-
-```bash
-kohagi --model-path models/ruri-v3-130m/model.safetensors \
-       --tokenizer-path models/ruri-v3-130m/tokenizer.json
-```
-
-Kohagi expects `config.json` to be located in the same directory as the model
-weights. A `1_Pooling/config.json` beside them is read too if present; without
-it, pass `--pooling` for a CLS model, since there is nothing to detect from.
-
-### Long inputs and truncation
-
-Text longer than `--max-seq-length` (512 tokens by default) is truncated before
-embedding, so its vector reflects only the beginning. This is silent by design —
-the summary line on stderr always ends with `truncated=N`, and `--report-tokens`
-adds `n_tokens` and `truncated` to each output record so a caller can route the
-truncated ones to a chunking pass:
-
-```console
-$ echo '{"id": 1, "text": "…a very long document…"}' | kohagi --report-tokens
-{"id":1,"embedding":[…],"n_tokens":512,"truncated":true}
-```
-
-Raising `--max-seq-length` embeds more of each text at a quadratic cost in
-attention compute. See [PROTOCOL.md](PROTOCOL.md) for the field definitions.
-
 ### Which model produced these vectors
 
 Every run's summary line names the weights by content, not just by path:
@@ -173,27 +125,6 @@ A separate binary rather than a flag on `kohagi`, because it is a different
 function: pairs in, numbers out. Everything around the records — opaque ids,
 skipped lines, blank-line batches, exit codes — is the same protocol. See
 [PROTOCOL-rerank.md](PROTOCOL-rerank.md).
-
-Measured on an M2, 100 pairs at the 512-token cap, scoring only (best of three,
-warm process):
-
-| | ruri-v3-reranker-310m | japanese-reranker-xsmall-v2 |
-| --- | --- | --- |
-| `kohagi-rerank --device cpu` | 3.3 pairs/s | 38.0 pairs/s |
-| `kohagi-rerank --device metal` | 3.7 pairs/s | 64.5 pairs/s |
-| **`kohagi-rerank --device coreml`** | **18.5 pairs/s** | **154.5 pairs/s** |
-| `CrossEncoder` (PyTorch MPS) | 5.5 pairs/s | 74.9 pairs/s |
-| `CrossEncoder` (PyTorch CPU) | 2.7 pairs/s | 34.3 pairs/s |
-
-On the CPU it is a little faster than PyTorch and on the GPU about the same; on
-the Neural Engine it is 3.4× the fastest PyTorch path. Scores match the
-reference to f32 rounding on every backend except `coreml`, whose encoder is
-fp16. That error lives in the logit, where it is 0.058 at worst, and the
-sigmoid compresses it hardest exactly where thresholds matter most — so a
-cutoff at 0.02 moved nothing in 200 sampled boundary pairs while one at 0.5
-moved 12% of them. [PROTOCOL-rerank.md](PROTOCOL-rerank.md) derives the band
-for any threshold; `tools/rerank_parity.py --against` and
-`tools/rerank_fp16_bands.py` re-measure it.
 
 ```bash
 # Converts the checkpoint for the ANE on first use and caches it.
@@ -280,144 +211,6 @@ let embeddings = embedder.embed(&["検索クエリ: 瑠璃とは何ですか"])?
 A single `Embedder` instance can be reused for any number of `embed` calls.
 The CLI is built on the same API, and its `main.rs` is ~100 lines.
 
-## Performance notes
-
-* CPU by default, via Apple Accelerate on macOS, which performs within about 20% of PyTorch with equivalent output. Linux links no BLAS at all — candle's pure-Rust `gemm` does the matrix multiplies — so `--precision bf16` is where the Linux throughput is.
-* Batches run in parallel across physical CPU cores. Set `RAYON_NUM_THREADS` to override the default; additional threads may improve throughput at the cost of memory.
-* `--max-seq-length` has the largest effect on throughput because attention cost grows quadratically with sequence length.
-
-Throughput is worth measuring on your own machine and texts rather than taking
-numbers on faith. [`tools/benchmark.py`](tools/benchmark.py) times Kohagi against
-Sentence Transformers on the same corpus and settings; see
-[`examples/README.md`](examples/README.md) for measured results on Apple Silicon.
-
-### `--device metal` on Apple Silicon
-
-Building with `--features metal` adds an Apple GPU backend. On an M2 it runs
-about 1.8× faster than the Accelerate CPU path — measured on 512-token
-batches — with f32 output unchanged (worst `1 - cosine` 9e-13 against CPU).
-
-The changes live in Kohagi's own copy of the ModernBERT encoder
-([`src/encoder.rs`](src/encoder.rs)), so any build carries them, including
-`cargo install`. They are what makes the Metal path win rather than a CPU
-speedup: on CPU the difference measured smaller than the run-to-run noise,
-though peak RSS does drop.
-
-### `--device coreml` on the Apple Neural Engine
-
-Build with `--features coreml`. On an M2 it is about 4× faster than Metal at 512
-tokens, with cosine similarity of approximately 0.99999 against the CPU output.
-For short inputs the multicore CPU backend may still be faster.
-
-The ANE needs fixed input shapes, so it runs a converted model rather than the
-safetensors the other devices read. A release build converts one for itself:
-
-```bash
-kohagi --device coreml < texts.jsonl
-kohagi --device coreml --model-id answerdotai/ModernBERT-large < texts.jsonl
-```
-
-The first run downloads the checkpoint, converts it (~20 s) and compiles it;
-later runs load in about 0.3 s from `~/Library/Caches/kohagi/coreml`
-(`$KOHAGI_COREML_CACHE` to relocate), which is safe to delete. A checkpoint the
-converter cannot honour is refused before anything is written, naming every
-reason at once.
-
-`--coreml-buckets` sets the sequence lengths (default `64,128,256,512`; the
-largest caps `--max-seq-length`, and 4096 is the longest the converter will
-produce).
-`--coreml-quantize embeddings` roughly halves a large-vocabulary bundle at no
-measured retrieval cost, but a quantized bundle's vectors are not interchangeable
-with an fp16 one's, so the two must not share an index — which is why it is not
-the default.
-
-To convert ahead of time instead, into a directory to publish or share:
-
-```bash
-cargo run --release --bin coreml-convert --features coreml-export -- \
-    --model-id cl-nagoya/ruri-v3-130m --out-dir models/ruri-v3-130m-coreml \
-    --sequence-lengths 64,128,256,512
-
-kohagi --device coreml --coreml-dir models/ruri-v3-130m-coreml < texts.jsonl
-kohagi --device coreml --coreml-model-id takahashim/ruri-v3-130m-coreml < texts.jsonl
-```
-
-The lengths share one copy of the weights, so the set costs no disk — four
-buckets are the same 260 MB as three. What it costs is one model to open per
-length: going from `128,256,512` to the default's `64,128,256,512` took load
-from 0.48 s to 0.56 s, and paid for itself after about a hundred short texts by
-cutting the per-text cost from 4.3 ms to 3.5 ms. **Match the set to the lengths
-your texts actually are.** A bucket nothing lands in is pure overhead — adding
-192 to the default, on a corpus where every text is under 32 tokens, cost 0.25 s
-of load and bought nothing. This is the converter to use, and what the models
-published for Kohagi are made with.
-[`scripts/convert_coreml.py`](scripts/convert_coreml.py) does the same conversion
-through PyTorch and `coremltools` and was how this one was checked — its vectors
-for `cl-nagoya/ruri-v3-130m` were bit-identical — but it is kept for that
-comparison rather than for converting.
-
-Measured against PyTorch on the same machine — M2, `ruri-v3-130m`, the default
-buckets, median of three runs, from `tools/benchmark.py`:
-
-| Input                   |    kohagi (CPU) | kohagi (`--device coreml`) |    torch (MPS) |
-| ----------------------- | --------------: | -------------------------: | -------------: |
-| 1200 short (~30 tokens) |  7.1 s / 7.4 s  |       **4.0 s / 4.7 s**    | 4.3 s / 13.7 s |
-| 240 long (512 tokens)   | 30.8 s / 31.5 s |       **5.9 s / 6.6 s**    | 15.2 s / 24.9 s|
-
-Encode / total, where total adds startup and model load. At 512 tokens the ANE
-encodes 2.6× faster than torch/MPS and 5.2× faster than Kohagi's own CPU path.
-On short inputs the two are within noise of each other on encode, because what
-the ANE gains per token it gives back padding each row to its bucket. The totals
-go the other way throughout: torch spends 9–10 s importing and loading per
-process against Kohagi's under a second, so a rake task or a per-batch
-subprocess sees 2.9× (short) and 3.8× (long).
-
-These moved by a factor of two between runs on the same machine while other work
-was going on, so treat them as an order of magnitude rather than a ranking, and
-compare against a run of your own.
-
-### `--precision bf16` on AVX512-BF16 CPUs
-
-On Zen 4 (Sapphire Rapids) and newer CPUs, `--precision bf16` uses `bf16` for projection layers while keeping normalization, softmax, and attention scores in `f32`.
-
-Measured on a Ryzen 7 8745H (Zen 4, 8 cores) running Linux, `ruri-v3-130m`,
-median of five runs alternating between the two precisions
-(`tools/benchmark.py --precision bf16 --skip-torch` produces the times;
-peak RSS is from `/usr/bin/time -v`). Times are totals, including startup and
-model load. The f32 column drifts a few percent between sessions, so read the
-ratios rather than the seconds.
-
-| Input                    |    f32 |              bf16 |          Peak RSS |
-| ------------------------ | -----: | ----------------: | ----------------: |
-| 1200 short (~30 tokens)  | 11.2 s |  **4.9 s** (2.3×) | 1.19 GB → 0.87 GB |
-| 240 long (512 tokens)    | 44.2 s | **22.2 s** (2.0×) | 1.31 GB → 1.06 GB |
-
-Less than half of that is the bf16 arithmetic. The rest comes from two things
-a bf16 build also gets, both still f32: AVX-512 kernels for the softmax and
-the GELU, which candle evaluates one element at a time
-([`src/bf16/softmax.rs`](src/bf16/softmax.rs),
-[`src/bf16/geglu.rs`](src/bf16/geglu.rs)), and skipping the three quarters of
-the score matrix that ruri-v3's sliding-window layers mask off anyway. What
-stays f32 and unfused is the `q·kᵀ` and `att·v` matmuls, which is why the
-long row gains less than the short one.
-
-bf16 also pays about a second more at load, converting the weights, which
-matters if you spawn a process per small batch.
-
-The resulting embeddings remain very close to f32 output, with cosine similarity around 0.99999, but they are not bit-identical.
-
-bf16 therefore remains opt-in. The default f32 mode produces consistent vectors across machines, which is useful when embeddings generated on different hosts share the same index.
-
-Unsupported CPUs, including Apple Silicon, reject `--precision bf16` at startup rather than silently falling back to f32.
-
-## Accuracy and reproducibility
-
-Kohagi's f32 output matches the Sentence Transformers and PyTorch reference implementation to within f32 rounding error.
-On 512-token inputs, `1 - cosine ≈ 3e-12`.
-
-You can verify this on your own texts using [`tools/parity_check.py`](tools/parity_check.py).
-See [`examples/README.md`](examples/README.md) for the measured results and the three settings that must match for the comparison to be meaningful.
-
 ## The name
 
 In Saeko Himuro’s Heian-era novel series *Nante Suteki ni Japonésque* (『なんて素敵にジャパネスク』), the heroine, Ruri-hime (瑠璃姫), has a lady-in-waiting named Kohagi (小萩).
@@ -444,7 +237,7 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 - 同様に `--features coreml` でビルドすると `--device coreml` が使え、Apple Neural Engine (ANE) 上で動かせます。長い入力ほど高速で、CPU 出力に対し cosine ≈ 0.99999 です(短い入力では ANE が固定長にパディングする分、PyTorch (MPS) やマルチコア CPU の方が速いこともあります)。ローカルの変換済みモデルは `--coreml-dir`、Hugging Face Hub 上のものは `--coreml-model-id` で指定します
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
 - 入出力の契約・exit code(0/1/2/3)は [PROTOCOL.md](PROTOCOL.md) を参照してください。
-  Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) に、OpenAI Embeddings API互換サーバのサンプルは[`examples/openapi_proxy/proxy.py`](examples/openapi_proxy/proxy.py)(Python)、[`examples/openapi_proxy/proxy.rb`](examples/openapi_proxy/proxy.rb)(Ruby)、[`examples/openapi_proxy/proxy.ts`](examples/openapi_proxy/proxy.ts)(TypeScript)にあります。
+  Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) に、OpenAI Embeddings API互換サーバのサンプルは[`examples/openai_proxy/proxy.py`](examples/openai_proxy/proxy.py)(Python)、[`examples/openai_proxy/proxy.rb`](examples/openai_proxy/proxy.rb)(Ruby)、[`examples/openai_proxy/proxy.ts`](examples/openai_proxy/proxy.ts)(TypeScript)にあります。
 
 また、Ruby では Kohagi 専用の gem である [kohagi-ruby](https://github.com/takahashim/kohagi-ruby)が使えます。
 
