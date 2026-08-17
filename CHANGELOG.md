@@ -1,5 +1,84 @@
 # Changelog
 
+## [0.6.0] - 2026-08-17
+
+### Added
+
+- **`kohagi-rerank`: a cross-encoder for reordering search results.** Reads
+  `{"id","query","text"}` JSONL and writes `{"id","score"}`, under the same
+  protocol rules as `kohagi` — see [PROTOCOL-rerank.md](PROTOCOL-rerank.md).
+  Retrieval finds candidates; this reorders them, at a forward pass per pair.
+
+  It runs any one-label ModernBERT sequence-classification checkpoint, which
+  `cl-nagoya/ruri-v3-reranker-310m` and the `hotchpotch/japanese-reranker-*-v2`
+  family all are. The score is the sigmoid `sentence_transformers.CrossEncoder`
+  returns for such a model, matched to f32 rounding (worst |diff| 5.1e-07), so
+  **thresholds tuned against that library carry over unchanged**; `--raw-logits`
+  gives the logit instead.
+
+  `--device coreml` runs it on the Neural Engine at 18.5 pairs/s against 3.3 on
+  the CPU (`ruri-v3-reranker-310m`, M2).
+
+- **Every run says which weights answered.** The stderr summary now carries the
+  sha256 of the loaded `model.safetensors`, plus the resolved pooling, dimension
+  and `max_seq_length`. Fine-tuned checkpoints differ only in their bytes, so a
+  results file that records a path records what someone meant to run rather than
+  what ran. The digest matches `sha256sum` on the same file, and costs nothing:
+  it is computed alongside the encoding.
+
+- **`--print-model-info`** writes those same facts as one JSON line on stdout and
+  exits without reading stdin, for an evaluation script to record beside its
+  numbers. On both binaries.
+
+- **A converted CoreML bundle records the checkpoint it came from**, as a Hub id
+  or path and as that checkpoint's sha256 — reported as `source` and
+  `source_sha256`. `scripts/convert_coreml.py` records the same.
+
+- **New library API:** `kohagi::rerank`, `ModelInfo` with `Embedder::info` and
+  `Reranker::info`, and `kohagi::cli`.
+
+### Changed
+
+- **The stderr summary line has more fields, and `dim=` moved.** From
+  `model=… dim=512 in=…` to
+  `model=… sha256=1c342581efc2 pooling=mean dim=512 max_seq=512 in=…`.
+  **Anything parsing that line by position needs updating**; by key it does not.
+  A CoreML bundle reports `source_sha256=` in place of `sha256=`.
+
+- **A checkpoint is labelled by its directory** when its weights file is
+  `model.safetensors`, which every fine-tune's is: `model=alpha05` rather than
+  `model=model.safetensors` for every model on the machine.
+
+- **Release archives contain both binaries**, `kohagi` and `kohagi-rerank`. The
+  archive name is unchanged.
+
+### Fixed
+
+- **A head bias the config does not declare is reported rather than dropped in
+  silence.** `classifier_bias` and `norm_bias` decide whether the head's biases
+  load, as they do in Hugging Face; a checkpoint carrying one its config does not
+  declare used to lose it without a word, and a head missing a term does not
+  fail, it scores slightly wrong.
+
+- **`tools/rerank_parity.py` and `tools/rerank_fp16_bands.py` stop at any nonzero
+  exit.** They checked only for exit 1, so a run that finished with skipped lines
+  reported a number computed over a different sample than the one asked for.
+
+- **`tools/eval_retrieval.py` takes its passthrough arguments from an explicit
+  `--` split**, whose survival through argparse differs by Python version.
+
+### Compatibility
+
+- **A CoreML bundle converted before 0.6 cannot be used for reranking.** It has
+  no `head.safetensors`, so `kohagi-rerank --device coreml` says so at load and
+  exits 3. Reconvert the checkpoint, or score on `--device cpu`. **Embedding with
+  an old bundle is unaffected**; it simply reports no `source_sha256`.
+
+- **A reranker on `--device coreml` is not interchangeable with one on the CPU at
+  a fixed threshold**, because the encoder is fp16 there. How much of a corpus
+  can cross a given threshold, and how to work it out for a threshold of your
+  own, is in PROTOCOL-rerank.md.
+
 ## [0.5.1] - 2026-08-08
 
 ### Fixed
