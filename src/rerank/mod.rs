@@ -114,34 +114,72 @@ struct Head {
     classifier: Linear,
 }
 
+/// One of the head's two optional biases, or `None`.
+///
+/// `config.json` decides, not the checkpoint: HF builds
+/// `ModernBertPredictionHead`'s `Linear` and `LayerNorm` from `classifier_bias`
+/// and `norm_bias`, both of which default to false, so a bias tensor a config
+/// does not declare is one `from_pretrained` leaves unloaded as well. Following
+/// the flag is what keeps the score equal to CrossEncoder's.
+///
+/// Hence the warning rather than silence: a dropped bias does not fail, it
+/// scores slightly wrong. `from_pretrained` reports the same disagreement as
+/// an unexpected key.
+fn bias(
+    vb: &VarBuilder,
+    size: usize,
+    declared: Option<bool>,
+    tensor: &str,
+    flag: &str,
+) -> Result<Option<Tensor>> {
+    if declared == Some(true) {
+        return Ok(Some(vb.get(size, "bias").with_context(|| {
+            format!("config.json sets `{flag}`, but this checkpoint has no `{tensor}`")
+        })?));
+    }
+    if vb.contains_tensor("bias") {
+        eprintln!(
+            "kohagi-rerank: warning: this checkpoint carries `{tensor}` but its config.json \
+             does not set `{flag}`; scoring without it, as sentence-transformers would"
+        );
+    }
+    Ok(None)
+}
+
 impl Head {
     fn load(vb: &VarBuilder, config: &Config, head: &HeadConfig) -> Result<Self> {
         let size = config.hidden_size;
         let act = Activation::from_name(head.classifier_activation.as_deref())
             .map_err(|e| anyhow::anyhow!("classifier_activation: {e}"))?;
 
-        let dense = vb.pp("head.dense");
-        let weight = dense.get((size, size), "weight").context(
+        let dense_vb = vb.pp("head.dense");
+        let weight = dense_vb.get((size, size), "weight").context(
             "this checkpoint has no `head.dense.weight`; it is an encoder without a \
                       classification head, so there is nothing to score a pair with",
         )?;
         let dense = Linear::new(
             weight,
-            match head.classifier_bias {
-                Some(true) => Some(dense.get(size, "bias")?),
-                _ => None,
-            },
+            bias(
+                &dense_vb,
+                size,
+                head.classifier_bias,
+                "head.dense.bias",
+                "classifier_bias",
+            )?,
         );
 
         let norm_vb = vb.pp("head.norm");
-        let norm = candle_nn::LayerNorm::new(
-            norm_vb.get(size, "weight")?,
-            match head.norm_bias {
-                Some(true) => norm_vb.get(size, "bias")?,
-                _ => Tensor::zeros(size, candle_core::DType::F32, &Device::Cpu)?,
-            },
-            config.layer_norm_eps,
-        );
+        let norm_weight = norm_vb.get(size, "weight")?;
+        let norm = match bias(
+            &norm_vb,
+            size,
+            head.norm_bias,
+            "head.norm.bias",
+            "norm_bias",
+        )? {
+            Some(b) => candle_nn::LayerNorm::new(norm_weight, b, config.layer_norm_eps),
+            None => candle_nn::LayerNorm::new_no_bias(norm_weight, config.layer_norm_eps),
+        };
 
         let cls = vb.pp("classifier");
         let classifier = Linear::new(cls.get((1, size), "weight")?, Some(cls.get(1, "bias")?));
@@ -531,5 +569,50 @@ mod tests {
         assert!(config(r#", "classifier_pooling": "last""#)
             .pooling()
             .is_err());
+    }
+
+    fn head_weights(with_bias: bool) -> VarBuilder<'static> {
+        let mut tensors = std::collections::HashMap::new();
+        let one = |n: usize| Tensor::zeros(n, candle_core::DType::F32, &Device::Cpu).unwrap();
+        tensors.insert("head.dense.weight".to_string(), one(4));
+        if with_bias {
+            tensors.insert("head.dense.bias".to_string(), one(4));
+        }
+        VarBuilder::from_tensors(tensors, candle_core::DType::F32, &Device::Cpu)
+    }
+
+    #[test]
+    fn a_head_bias_follows_the_config_and_says_when_the_weights_disagree() {
+        let declared = |vb: &VarBuilder, d: Option<bool>| {
+            bias(
+                &vb.pp("head.dense"),
+                4,
+                d,
+                "head.dense.bias",
+                "classifier_bias",
+            )
+        };
+
+        // Both halves say yes, and both say no.
+        assert!(declared(&head_weights(true), Some(true)).unwrap().is_some());
+        assert!(declared(&head_weights(false), None).unwrap().is_none());
+        assert!(declared(&head_weights(false), Some(false))
+            .unwrap()
+            .is_none());
+
+        // The tensor is there and the config never asked for it: not loaded,
+        // and warned about on stderr.
+        assert!(declared(&head_weights(true), None).unwrap().is_none());
+        assert!(declared(&head_weights(true), Some(false))
+            .unwrap()
+            .is_none());
+
+        // The config asked for one that is not there: nothing to load, so this
+        // stops.
+        let e = declared(&head_weights(false), Some(true)).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("classifier_bias"),
+            "the error should name the flag: {e:#}"
+        );
     }
 }
