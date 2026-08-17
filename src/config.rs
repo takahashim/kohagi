@@ -8,12 +8,55 @@
 /// because the two ends are in different feature-gated modules — the converter
 /// (`coreml_export`) writes it, `rerank` reads it — and the name has to be one
 /// string.
-/// Both ends are feature-gated; the name is not, so that it stays one string.
 #[cfg_attr(
     not(any(feature = "coreml", feature = "coreml-export")),
     allow(dead_code)
 )]
 pub const COREML_HEAD_FILE: &str = "head.safetensors";
+
+/// The tensors a cross-encoder's classification head is made of, as
+/// `ModernBertForSequenceClassification` names them.
+///
+/// One description because three modules act on the same list: `rerank` loads
+/// these tensors, the CoreML converter copies them into [`COREML_HEAD_FILE`],
+/// and the emitter uses [`head::is_head`] to know which of a checkpoint's unread
+/// tensors it was right to leave out. Spelled out separately they drift, and the
+/// failure is a bundle that loads and scores wrongly rather than one that fails.
+pub mod head {
+    /// The projection. Its `weight` is what says a checkpoint has a head at all.
+    #[cfg_attr(not(feature = "coreml"), allow(dead_code))]
+    pub const DENSE: &str = "head.dense";
+    /// The LayerNorm between the projection and the classifier.
+    #[cfg_attr(not(feature = "coreml"), allow(dead_code))]
+    pub const NORM: &str = "head.norm";
+    /// The linear down to one logit.
+    #[cfg_attr(not(feature = "coreml"), allow(dead_code))]
+    pub const CLASSIFIER: &str = "classifier";
+
+    /// What a head cannot be assembled without.
+    #[cfg_attr(not(feature = "coreml-export"), allow(dead_code))]
+    pub const REQUIRED: [&str; 4] = [
+        "head.dense.weight",
+        "head.norm.weight",
+        "classifier.weight",
+        "classifier.bias",
+    ];
+
+    /// The two biases `config.json` decides on, absent from a checkpoint that
+    /// does not use them — which is ModernBERT's default.
+    #[cfg_attr(not(feature = "coreml-export"), allow(dead_code))]
+    pub const OPTIONAL: [&str; 2] = ["head.dense.bias", "head.norm.bias"];
+
+    /// Whether a checkpoint tensor belongs to the head rather than the encoder.
+    ///
+    /// By prefix family rather than by the names above: an unrecognized `head.*`
+    /// is still the head's, and reporting it as an encoder tensor the converter
+    /// dropped would be wrong.
+    #[cfg_attr(not(feature = "coreml-export"), allow(dead_code))]
+    pub fn is_head(name: &str) -> bool {
+        name.starts_with("head.") || name.starts_with("classifier.")
+    }
+}
 
 /// Which converted form to download when a CoreML Hub repo ships both a
 /// compiled `.mlmodelc` and a portable `.mlpackage` for a bucket. Only affects

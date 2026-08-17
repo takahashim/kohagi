@@ -754,11 +754,11 @@ pub fn emit_with(
     .context("collecting the weights for a CoreML bundle")?;
     for name in unused(weights, &read) {
         // A cross-encoder's head is expected to be left out: the graph is the
-        // encoder, and `Checkpoint::write_head` puts those four tensors in
-        // their own file beside the bundle. Saying they were dropped would be
-        // wrong, and saying it four times per conversion would train the
-        // reader to ignore the line that matters.
-        if name.starts_with("head.") || name.starts_with("classifier.") {
+        // encoder, and `super::write_head` puts those tensors in their own file
+        // beside the bundle. Saying they were dropped would be wrong, and saying
+        // it four times per conversion would train the reader to ignore the line
+        // that matters.
+        if crate::config::head::is_head(&name) {
             continue;
         }
         eprintln!("kohagi: the checkpoint's `{name}` was not read; the emitted encoder has no place for it");

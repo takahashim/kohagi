@@ -25,51 +25,10 @@ impl Checkpoint {
         Ok(Self { tensors })
     }
 
-    /// Copy the classification head out to its own file, if this checkpoint has
-    /// one, and say whether it did.
-    ///
-    /// A converted bundle holds the encoder alone: the emitter has no place for
-    /// `head.*` or `classifier.*`, and reranking needs them. Writing them beside
-    /// the bundle keeps it self-contained — `kohagi-rerank --coreml-dir` needs
-    /// nothing but the directory — and keeps the head in f32 while the encoder
-    /// is fp16, which is the more accurate half of the trade rather than the
-    /// less.
-    ///
-    /// Four small tensors: 2.4 MB for a 768-wide head, against a bundle of
-    /// hundreds.
-    pub fn write_head(&self, path: &Path) -> Result<bool> {
-        // The projection is what says a head is here at all; the norm and the
-        // classifier come with it. Biases are optional (ModernBERT's defaults
-        // are off), so an absent one is not an error.
-        const REQUIRED: [&str; 4] = [
-            "head.dense.weight",
-            "head.norm.weight",
-            "classifier.weight",
-            "classifier.bias",
-        ];
-        const OPTIONAL: [&str; 2] = ["head.dense.bias", "head.norm.bias"];
-
-        if !self.tensors.contains_key(REQUIRED[0]) {
-            return Ok(false);
-        }
-        let mut out = HashMap::new();
-        for name in REQUIRED {
-            let tensor = self.tensors.get(name).with_context(|| {
-                format!(
-                    "this checkpoint has `head.dense.weight` but no `{name}`; it is a \
-                     classification model this converter does not recognize"
-                )
-            })?;
-            out.insert(name.to_string(), tensor.clone());
-        }
-        for name in OPTIONAL {
-            if let Some(tensor) = self.tensors.get(name) {
-                out.insert(name.to_string(), tensor.clone());
-            }
-        }
-        candle_core::safetensors::save(&out, path)
-            .with_context(|| format!("writing {}", path.display()))?;
-        Ok(true)
+    /// One tensor by its exact name, or `None`. Unlike [`Weights::get`] this
+    /// does not fall back to a `model.` prefix: the head sits at the root.
+    pub fn tensor(&self, name: &str) -> Option<&Tensor> {
+        self.tensors.get(name)
     }
 
     /// The tensor names, sorted — for reporting what a checkpoint actually holds

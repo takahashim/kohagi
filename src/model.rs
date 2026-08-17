@@ -852,11 +852,29 @@ fn resolve_pooling_warned(requested: Option<Pooling>, detected: Option<Pooling>)
     pooling
 }
 
-/// Read and parse a `config.json`.
-pub(crate) fn read_config(path: &Path) -> Result<Config> {
+/// Read a `config.json` once, for callers that want more than one view of it.
+///
+/// A reranker's `config.json` describes both the encoder and the head, and two
+/// reads could land either side of a file being replaced — a checkpoint swapped
+/// mid-load would then be half one model and half another.
+pub(crate) fn read_config_json(path: &Path) -> Result<serde_json::Value> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("cannot parse {}", path.display()))
+}
+
+/// Read and parse a `config.json`.
+pub(crate) fn read_config(path: &Path) -> Result<Config> {
+    parse_config(read_config_json(path)?, path)
+}
+
+/// One view of an already-read `config.json`. `path` only names the file in an
+/// error.
+pub(crate) fn parse_config<T: serde::de::DeserializeOwned>(
+    json: serde_json::Value,
+    path: &Path,
+) -> Result<T> {
+    serde_json::from_value(json).with_context(|| format!("cannot parse {}", path.display()))
 }
 
 /// Convert a checkpoint for the ANE, or reuse the cached bundle, and return the

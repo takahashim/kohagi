@@ -25,12 +25,13 @@ use candle_nn::{Linear, Module, VarBuilder};
 use tokenizers::Tokenizer;
 
 use crate::batch::{bucket_encodings, encode_pairs, load_tokenizer, pool_row, Pooling, TokenInfo};
+use crate::config::head as names;
 use crate::encoder::{Activation, Config};
 use crate::errors::UnsupportedRequest;
 use crate::fingerprint::Fingerprint;
 use crate::model::{
-    check_precision, fetch_checkpoint, load_weights, open_device, read_config, run_batches,
-    Backend, ModelInfo, ModelSource, Precision, Weights,
+    check_precision, fetch_checkpoint, load_weights, open_device, parse_config, read_config_json,
+    run_batches, Backend, ModelInfo, ModelSource, Precision, Weights,
 };
 
 /// Knobs for [`Reranker::load`]. `Default` matches the Ruri v3 reranker.
@@ -152,7 +153,7 @@ impl Head {
         let act = Activation::from_name(head.classifier_activation.as_deref())
             .map_err(|e| anyhow::anyhow!("classifier_activation: {e}"))?;
 
-        let dense_vb = vb.pp("head.dense");
+        let dense_vb = vb.pp(names::DENSE);
         let weight = dense_vb.get((size, size), "weight").context(
             "this checkpoint has no `head.dense.weight`; it is an encoder without a \
                       classification head, so there is nothing to score a pair with",
@@ -168,7 +169,7 @@ impl Head {
             )?,
         );
 
-        let norm_vb = vb.pp("head.norm");
+        let norm_vb = vb.pp(names::NORM);
         let norm_weight = norm_vb.get(size, "weight")?;
         let norm = match bias(
             &norm_vb,
@@ -181,7 +182,7 @@ impl Head {
             None => candle_nn::LayerNorm::new_no_bias(norm_weight, config.layer_norm_eps),
         };
 
-        let cls = vb.pp("classifier");
+        let cls = vb.pp(names::CLASSIFIER);
         let classifier = Linear::new(cls.get((1, size), "weight")?, Some(cls.get(1, "bias")?));
         Ok(Self {
             dense,
@@ -455,11 +456,10 @@ impl Reranker {
 /// The encoder config, the head config, and the pooling they imply — from one
 /// `config.json`, which both a checkpoint and a converted bundle carry.
 fn read_head_config(path: &std::path::Path) -> Result<(Config, HeadConfig, Pooling)> {
-    let config: Config = read_config(path)?;
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let head_config: HeadConfig =
-        serde_json::from_str(&text).with_context(|| format!("cannot parse {}", path.display()))?;
+    // One read, two views: the encoder's and the head's.
+    let json = read_config_json(path)?;
+    let config: Config = parse_config(json.clone(), path)?;
+    let head_config: HeadConfig = parse_config(json, path)?;
 
     // Both of these are "this model is not what this binary scores with", and
     // both are worth stopping for: getting them wrong produces a

@@ -24,6 +24,7 @@ pub mod mil;
 pub mod modernbert;
 pub mod safetensors;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -450,7 +451,7 @@ pub fn convert(
     // A cross-encoder's head, when the checkpoint is one. The emitter reads
     // only the encoder, so without this the bundle could not score a pair.
     let head_file = crate::config::COREML_HEAD_FILE;
-    if weights.write_head(&dir.join(head_file))? {
+    if write_head(&weights, &dir.join(head_file))? {
         eprintln!("wrote   : {head_file} (the classification head, for kohagi-rerank)");
     }
 
@@ -467,6 +468,47 @@ pub fn convert(
             .with_context(|| format!("copying {}", pooling.display()))?;
     }
     Ok(cfg)
+}
+
+/// Copy the classification head out beside the bundle, if this checkpoint has
+/// one, and say whether it did.
+///
+/// A converted bundle holds the encoder alone: the emitter has no place for the
+/// head's tensors, and reranking needs them. Writing them beside the bundle
+/// keeps it self-contained — `kohagi-rerank --coreml-dir` needs nothing but the
+/// directory — and leaves them at the checkpoint's own precision while the
+/// encoder is rounded to fp16, which is the more accurate half of the trade
+/// rather than the less.
+///
+/// Four small tensors: 2.4 MB for a 768-wide head, against a bundle of hundreds.
+fn write_head(weights: &safetensors::Checkpoint, path: &Path) -> Result<bool> {
+    use crate::config::head;
+
+    // The projection is what says a head is here at all; the norm and the
+    // classifier come with it. Biases are optional (ModernBERT's defaults are
+    // off), so an absent one is not an error.
+    if weights.tensor(head::REQUIRED[0]).is_none() {
+        return Ok(false);
+    }
+    let mut out = HashMap::new();
+    for name in head::REQUIRED {
+        let tensor = weights.tensor(name).with_context(|| {
+            format!(
+                "this checkpoint has `{}` but no `{name}`; it is a classification model \
+                 this converter does not recognize",
+                head::REQUIRED[0]
+            )
+        })?;
+        out.insert(name.to_string(), tensor.clone());
+    }
+    for name in head::OPTIONAL {
+        if let Some(tensor) = weights.tensor(name) {
+            out.insert(name.to_string(), tensor.clone());
+        }
+    }
+    candle_core::safetensors::save(&out, path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
 }
 
 #[cfg(test)]
