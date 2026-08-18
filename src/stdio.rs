@@ -434,9 +434,14 @@ pub(crate) fn summary_facts(info: &crate::ModelInfo) -> String {
             crate::fingerprint::short(sha)
         ));
     }
+    // The dimension the vectors actually have: `--dims` when it truncated
+    // them, the model's own otherwise. A log line saying 512 about a 256-dim
+    // run would defeat the line's purpose.
     out.push_str(&format!(
         "pooling={} dim={} max_seq={}",
-        info.pooling, info.dim, info.max_seq_length
+        info.pooling,
+        info.output_dim.unwrap_or(info.dim),
+        info.max_seq_length
     ));
     // A reranker's numbers mean different things either side of the sigmoid,
     // so a log of scores has to say which it holds.
@@ -620,6 +625,7 @@ mod tests {
             graph_version: None,
             pooling: "mean",
             dim: 512,
+            output_dim: None,
             max_seq_length: 512,
             score: None,
         }
@@ -657,6 +663,20 @@ mod tests {
         assert_eq!(summary_facts(&unknown), "pooling=mean dim=512 max_seq=512");
     }
 
+    /// `--dims` changes what every vector is, so the summary's `dim=` reports
+    /// what came out, not what the model would have produced.
+    #[test]
+    fn the_summary_reports_the_truncated_dimension() {
+        let truncated = crate::ModelInfo {
+            output_dim: Some(256),
+            ..info()
+        };
+        assert_eq!(
+            summary_facts(&truncated),
+            "sha256=0123456789ab pooling=mean dim=256 max_seq=512"
+        );
+    }
+
     /// What `--print-model-info` writes, which evaluation scripts read into
     /// their results files: every key present, and the ones that do not apply
     /// to this path absent rather than null.
@@ -670,9 +690,26 @@ mod tests {
         assert_eq!(json["dim"], 512);
         assert_eq!(json["max_seq_length"], 512);
         assert_eq!(json["sha256"], "0123456789abcdef0123456789abcdef");
-        for absent in ["source", "source_sha256", "buckets", "quantization"] {
+        for absent in [
+            "source",
+            "source_sha256",
+            "buckets",
+            "quantization",
+            "output_dim",
+        ] {
             assert!(json.get(absent).is_none(), "{absent} should be omitted");
         }
+
+        // With `--dims`, the JSON says both what the model is and what was
+        // produced: `dim` stays the model's own, `output_dim` is the flag's.
+        let truncated = crate::ModelInfo {
+            output_dim: Some(256),
+            ..info()
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&truncated).unwrap()).unwrap();
+        assert_eq!(json["dim"], 512);
+        assert_eq!(json["output_dim"], 256);
     }
 
     #[test]

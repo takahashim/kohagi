@@ -89,6 +89,13 @@ added. Exit codes are the same: 0 every pair scored, 2 finished with skipped
 lines, 1 fatal, 3 the CoreML backend cannot serve this request — see
 [PROTOCOL.md](PROTOCOL.md) for what each one means and what to do about it.
 
+`--expect-sha256 <hex>` works as in PROTOCOL.md: a prefix of the expected
+digest, checked at load, exit 1 with no output on a mismatch. It matters more
+here than for embeddings, because a threshold belongs to the weights it was
+tuned on — two fine-tunes differ only in their bytes, and a config file
+carrying a threshold can carry the digest beside it and have Kohagi enforce
+the pairing.
+
 ## Devices
 
 `--device cpu`, `--device metal` (`--features metal`), `--device cuda`

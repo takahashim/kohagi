@@ -390,6 +390,9 @@ impl Reranker {
             graph_version: None,
             pooling: self.pooling.name(),
             dim: self.dim,
+            // A reranker's output is a score, not a vector; there is no
+            // dimension to truncate.
+            output_dim: None,
             max_seq_length: self.opts.max_seq_length,
             score: Some(if self.opts.sigmoid {
                 "sigmoid"

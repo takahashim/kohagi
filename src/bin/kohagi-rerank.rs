@@ -87,6 +87,14 @@ struct Args {
     /// exit without reading stdin.
     #[arg(long, conflicts_with = "pair")]
     print_model_info: bool,
+    /// Refuse to score anything unless the loaded weights' sha256 starts with
+    /// this hex prefix — paste the 12 digits from a summary line or the full
+    /// digest from --print-model-info. A threshold belongs to the weights it
+    /// was tuned on, and this stops the wrong ones with exit 1 before any pair
+    /// is answered. With --device coreml the bundle's recorded source_sha256
+    /// is checked instead, and a bundle that recorded none is refused.
+    #[arg(long, value_name = "HEX")]
+    expect_sha256: Option<String>,
 }
 
 impl Args {
@@ -124,6 +132,14 @@ impl Args {
     }
 }
 
+/// Load the model and, when `--expect-sha256` pinned a digest, refuse weights
+/// that do not carry it — before anything is scored, whichever mode loads.
+fn load_checked(args: &Args, source: &ModelSource) -> anyhow::Result<Reranker> {
+    let reranker = Reranker::load(source, args.options())?;
+    cli::verify_fingerprint(args.expect_sha256.as_deref(), &reranker.info())?;
+    Ok(reranker)
+}
+
 /// `--pair` mode: score the arguments and print what stdio mode would, with
 /// the pair positions as ids.
 fn score_arguments(args: &Args, reranker: &Reranker) -> anyhow::Result<()> {
@@ -141,10 +157,9 @@ fn score_arguments(args: &Args, reranker: &Reranker) -> anyhow::Result<()> {
 
 fn run(args: Args) -> anyhow::Result<usize> {
     let (source, label) = args.source()?;
-    let opts = args.options();
 
     if args.print_model_info || !args.pair.is_empty() {
-        let reranker = Reranker::load(&source, opts)?;
+        let reranker = load_checked(&args, &source)?;
         if args.print_model_info {
             cli::print_model_info(&label, &reranker.info())?;
         } else {
@@ -153,7 +168,7 @@ fn run(args: Args) -> anyhow::Result<usize> {
         return Ok(0);
     }
 
-    rerank::stdio::run(|| Reranker::load(&source, opts), args.report_tokens, &label)
+    rerank::stdio::run(|| load_checked(&args, &source), args.report_tokens, &label)
 }
 
 fn main() -> ExitCode {

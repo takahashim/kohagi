@@ -1,12 +1,27 @@
 # Changelog
 
-## [0.6.0] - 2026-08-17
+## [0.6.0] - 2026-08-18
 
 ### Added
 
+- **`--dims N`: Matryoshka truncation.** Keeps the first N dimensions of each
+  embedding and re-normalizes, matching `SentenceTransformer(model,
+  truncate_dim=N)` (worst `1 - cos` 1.8e-11), on every device. The summary's
+  `dim=` reports the output dimension; `--print-model-info` keeps `dim` as the
+  model's own and adds `output_dim`. N outside `1..=dim` and combining with
+  `--no-normalize` are refused at load. Truncated and full vectors must not
+  share an index.
+
+- **`--expect-sha256 <hex>`.** Pass a prefix of the expected digest (the
+  summary's 12 digits or the full 64) and either binary refuses weights whose
+  digest does not start with it. The run exits 1 at load, before any output. On
+  `--device coreml` the bundle's recorded `source_sha256` is checked; a bundle
+  that recorded none (converted before 0.6) is refused. Combine with
+  `--print-model-info` for a standalone check.
+
 - **`kohagi-rerank`: a cross-encoder for reordering search results.** Reads
   `{"id","query","text"}` JSONL and writes `{"id","score"}`, under the same
-  protocol rules as `kohagi` — see [PROTOCOL-rerank.md](PROTOCOL-rerank.md).
+  protocol rules as `kohagi`; see [PROTOCOL-rerank.md](PROTOCOL-rerank.md).
   Retrieval finds candidates; this reorders them, at a forward pass per pair.
 
   It runs any one-label ModernBERT sequence-classification checkpoint, which
@@ -31,7 +46,7 @@
   numbers. On both binaries.
 
 - **A converted CoreML bundle records the checkpoint it came from**, as a Hub id
-  or path and as that checkpoint's sha256 — reported as `source` and
+  or path and as that checkpoint's sha256, reported as `source` and
   `source_sha256`. `scripts/convert_coreml.py` records the same.
 
 - **New library API:** `kohagi::rerank`, `ModelInfo` with `Embedder::info` and
@@ -48,6 +63,11 @@
 - **A checkpoint is labelled by its directory** when its weights file is
   `model.safetensors`, which every fine-tune's is: `model=alpha05` rather than
   `model=model.safetensors` for every model on the machine.
+
+- **`Options` has a new `dims` field**, and `Embedder::dim` returns the output
+  dimension (`dims` when set, `hidden_size` otherwise). A breaking change for
+  library code building `Options` by struct literal; `..Options::default()`
+  spellings are unaffected.
 
 - **Release archives contain both binaries**, `kohagi` and `kohagi-rerank`. The
   archive name is unchanged.

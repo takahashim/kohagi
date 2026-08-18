@@ -41,6 +41,22 @@ kohagi --model-id cl-nagoya/ruri-v3-310m --prefix "検索文書: " < texts.jsonl
   `--print-model-info`. Two runs of the same weights under different pooling
   produce embeddings that must not share an index.
 
+## Truncated dimensions (`--dims`)
+
+- `--dims N` keeps the first N dimensions of each embedding and re-normalizes,
+  matching `SentenceTransformer(model, truncate_dim=N)` — Matryoshka
+  truncation, for models trained so a prefix of the vector is itself a usable
+  embedding.
+- Whether the shorter vectors retrieve well is the model's property, not
+  Kohagi's: a checkpoint trained with Matryoshka loss keeps most of its
+  quality at half dimension, one that was not may lose a great deal. Measure
+  on your own data before committing an index to it.
+- Truncated and full vectors must not share an index. The summary's `dim=` and
+  `--print-model-info`'s `output_dim` record which one a run produced.
+- N outside `1..=dim` is refused at load, as is combining with
+  `--no-normalize` (re-normalization is what keeps dot product = cosine on the
+  shorter vectors).
+
 ## Offline files
 
 - Point Kohagi at local files and it makes no network requests:

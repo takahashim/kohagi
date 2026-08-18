@@ -285,8 +285,15 @@ pub struct ModelInfo {
     /// The pooling that was resolved at load — the checkpoint's own choice
     /// unless `--pooling` overrode it.
     pub pooling: &'static str,
-    /// Output dimension, the model's `hidden_size`.
+    /// The model's own dimension, its `hidden_size`.
     pub dim: usize,
+    /// `--dims`, when it truncates the output below [`Self::dim`]. Absent when
+    /// the flag was not given or equalled `dim` (which changes no vector), so
+    /// a results file only carries the claim when there is one. A truncated
+    /// vector must not share an index with a full one, which is exactly what
+    /// two files disagreeing on this field says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_dim: Option<usize>,
     pub max_seq_length: usize,
     /// `sigmoid` or `logit` for a reranker: which of the two a score is. Absent
     /// for an embedding model, which has no score to shape.
@@ -339,6 +346,14 @@ pub struct Options {
     pub pooling: Option<Pooling>,
     /// L2-normalize each embedding (unit length, so dot = cosine).
     pub normalize: bool,
+    /// Keep only the first N dimensions of each pooled vector and re-normalize
+    /// (Matryoshka truncation). `None` outputs the model's full dimension.
+    ///
+    /// The re-normalization is not optional — it is what keeps the protocol's
+    /// "dot = cosine" promise on the truncated vectors — so this refuses to
+    /// combine with `normalize: false` at load. A caller wanting raw truncated
+    /// vectors can slice the full output itself.
+    pub dims: Option<usize>,
     /// Token-level truncation length. Ruri v3 accepts up to 8192 but was
     /// trained for retrieval at ~512; longer costs seq^2 attention compute.
     pub max_seq_length: usize,
@@ -355,6 +370,7 @@ impl Default for Options {
         Self {
             pooling: None,
             normalize: true,
+            dims: None,
             max_seq_length: 512,
             batch_size: 64,
             precision: Precision::F32,
@@ -401,6 +417,14 @@ pub struct Embedder {
 
 impl Embedder {
     pub fn load(source: &ModelSource, opts: Options) -> Result<Self> {
+        // Before any file is touched: this combination is wrong whatever the
+        // model turns out to be.
+        anyhow::ensure!(
+            opts.dims.is_none() || opts.normalize,
+            "--dims re-normalizes after truncating, which is what keeps dot = cosine on \
+             the shorter vectors; it cannot be combined with --no-normalize. For raw \
+             truncation, slice the full --no-normalize output yourself"
+        );
         if opts.backend == Backend::CoreML {
             return Self::load_coreml(source, opts);
         }
@@ -432,6 +456,7 @@ impl Embedder {
             .context("model path has no parent dir for config.json")?;
         let config: Config = read_config(&config_path)?;
         let dim = config.hidden_size;
+        check_dims(opts.dims, dim)?;
 
         check_precision(opts.backend, opts.precision)?;
 
@@ -481,6 +506,7 @@ impl Embedder {
 
         let config: Config = read_config(&dir.join("config.json"))?;
         let dim = config.hidden_size;
+        check_dims(opts.dims, dim)?;
         let encoder = crate::coreml::CoreMlEncoder::load(&dir, dim)?;
 
         // The ANE only has the bucket lengths that were converted. Every input
@@ -602,9 +628,19 @@ impl Embedder {
         .into())
     }
 
-    /// The embedding dimension (`hidden_size` — 512 for ruri-v3-130m).
+    /// The dimension of the vectors this embedder produces: `Options::dims`
+    /// when set, otherwise the model's `hidden_size` (512 for ruri-v3-130m).
     pub fn dim(&self) -> usize {
-        self.dim
+        self.opts.dims.unwrap_or(self.dim)
+    }
+
+    /// The reduction both engine paths apply to every row, stated once.
+    fn reduce(&self) -> Reduce {
+        Reduce {
+            pooling: self.pooling,
+            normalize: self.opts.normalize,
+            dims: self.opts.dims,
+        }
     }
 
     /// What this model is, for a summary line or a results file. Cheap: every
@@ -625,6 +661,7 @@ impl Embedder {
             graph_version: None,
             pooling: self.pooling.name(),
             dim: self.dim,
+            output_dim: output_dim(self.opts.dims, self.dim),
             max_seq_length: self.opts.max_seq_length,
             score: None,
         };
@@ -666,14 +703,14 @@ impl Embedder {
     ) -> Result<(Vec<Vec<f32>>, Vec<TokenInfo>)> {
         let encodings = crate::batch::encode(&self.tokenizer, texts)?;
         let (batches, info) = crate::batch::bucket_encodings(&encodings, self.opts.batch_size);
-        let (pooling, normalize) = (self.pooling, self.opts.normalize);
+        let reduce = self.reduce();
         let rows_out = run_batches(
             weights,
             device,
             self.opts.backend,
             &batches,
             texts.len(),
-            |hidden, mask, dim| Ok(embed_row(hidden, mask, dim, pooling, normalize)),
+            |hidden, mask, dim| Ok(embed_row(hidden, mask, dim, reduce)),
         )?;
         Ok((rows_out, info))
     }
@@ -688,33 +725,73 @@ impl Embedder {
     ) -> Result<(Vec<Vec<f32>>, Vec<TokenInfo>)> {
         let encodings = crate::batch::encode(&self.tokenizer, texts)?;
         let info: Vec<TokenInfo> = encodings.iter().map(crate::batch::token_info).collect();
-        let (pooling, normalize) = (self.pooling, self.opts.normalize);
+        let reduce = self.reduce();
         let rows_out = encoder.run_rows(&encodings, |hidden, mask, dim| {
-            Ok(embed_row(hidden, mask, dim, pooling, normalize))
+            Ok(embed_row(hidden, mask, dim, reduce))
         })?;
         Ok((rows_out, info))
     }
+}
+
+/// How one row's hidden states become the caller's vector: the pooling, the
+/// optional Matryoshka truncation, and whether to normalize.
+///
+/// One `Copy` value so the closures handing rows to the batch runners capture
+/// it instead of `&self` (see [`embed_row`]), and so the two engine paths
+/// cannot drift on which settings the reduction takes.
+#[derive(Clone, Copy)]
+struct Reduce {
+    pooling: Pooling,
+    normalize: bool,
+    dims: Option<usize>,
 }
 
 /// One row's hidden states to its embedding — the step that differs between an
 /// embedder and a reranker, and the only one either batch runner does not do.
 ///
 /// A free function rather than a method so the closures handing it to
-/// [`run_batches`] capture two `Copy` scalars instead of `&self`: the CPU
+/// [`run_batches`] capture one `Copy` value instead of `&self`: the CPU
 /// fan-out needs a `Sync` closure, and an [`Embedder`] may hold a CoreML model
 /// that is not shareable between threads.
-fn embed_row(
-    hidden: &[f32],
-    mask: &[i64],
-    dim: usize,
-    pooling: Pooling,
-    normalize: bool,
-) -> Vec<f32> {
-    let mut vector = pool_row(hidden, mask, dim, pooling);
-    if normalize {
+fn embed_row(hidden: &[f32], mask: &[i64], dim: usize, reduce: Reduce) -> Vec<f32> {
+    let mut vector = pool_row(hidden, mask, dim, reduce.pooling);
+    // Truncate before normalizing, so the kept prefix comes out unit-length —
+    // the order that makes dot = cosine hold on the shorter vectors, and the
+    // one `SentenceTransformer(..., truncate_dim=N)` uses. `load` refused
+    // `dims` without `normalize`, so the truncated arm always re-normalizes.
+    if let Some(n) = reduce.dims {
+        vector.truncate(n);
+    }
+    if reduce.normalize {
         l2_normalize(&mut vector);
     }
     vector
+}
+
+/// What [`ModelInfo::output_dim`] should claim: a `--dims` that actually
+/// shortened the vectors, and nothing else.
+///
+/// `--dims` equal to the model's own dimension changes no vector, so it
+/// claims nothing. The field marks output that is not interchangeable with a
+/// full run's, and vectors identical to a full run's are.
+fn output_dim(dims: Option<usize>, dim: usize) -> Option<usize> {
+    dims.filter(|&n| n < dim)
+}
+
+/// Refuse a `--dims` outside what the loaded model can be truncated to.
+///
+/// At load rather than at the first embed, so a bad value stops the run before
+/// any input is read — and it names the model's dimension, which is the number
+/// the caller was guessing at.
+fn check_dims(dims: Option<usize>, dim: usize) -> Result<()> {
+    if let Some(n) = dims {
+        anyhow::ensure!(
+            (1..=dim).contains(&n),
+            "--dims {n} is outside this model's dimensions; it produces {dim}, so \
+             --dims takes 1..={dim}"
+        );
+    }
+    Ok(())
 }
 
 /// Open the requested device, failing with a fixable message rather than a
@@ -1137,6 +1214,80 @@ fn worker_pool() -> Result<rayon::ThreadPool> {
         .num_threads(n)
         .build()
         .context("building rayon pool")
+}
+
+#[cfg(test)]
+mod dims_tests {
+    use super::*;
+
+    /// `--dims` keeps the leading dimensions and re-normalizes them, so the
+    /// truncated vector is unit-length in its own space rather than a slice of
+    /// a unit vector — which is the difference between dot = cosine holding
+    /// and silently not.
+    #[test]
+    fn truncation_renormalizes_the_kept_prefix() {
+        let reduce = |dims| Reduce {
+            pooling: Pooling::Cls,
+            normalize: true,
+            dims,
+        };
+        // One token, dim 2, CLS pooling: the row *is* the hidden state [3, 4].
+        let hidden = [3.0f32, 4.0];
+        let full = embed_row(&hidden, &[1], 2, reduce(None));
+        assert_eq!(full, vec![0.6, 0.8]);
+
+        // Truncated to 1 dim, the survivor is re-normalized to unit length,
+        // not left at its sliced value 0.6.
+        let cut = embed_row(&hidden, &[1], 2, reduce(Some(1)));
+        assert_eq!(cut, vec![1.0]);
+
+        // dims == dim is allowed and changes nothing.
+        let same = embed_row(&hidden, &[1], 2, reduce(Some(2)));
+        assert_eq!(same, full);
+    }
+
+    /// `output_dim` marks vectors that are not interchangeable with a full
+    /// run's. `--dims` equal to the model dimension produces identical
+    /// vectors, so it must produce identical metadata too.
+    #[test]
+    fn output_dim_claims_only_an_actual_truncation() {
+        assert_eq!(output_dim(Some(256), 512), Some(256));
+        assert_eq!(output_dim(Some(512), 512), None);
+        assert_eq!(output_dim(None, 512), None);
+    }
+
+    #[test]
+    fn dims_outside_the_model_are_refused_with_the_model_dimension_named() {
+        assert!(check_dims(None, 512).is_ok());
+        assert!(check_dims(Some(1), 512).is_ok());
+        assert!(check_dims(Some(512), 512).is_ok());
+        for bad in [0, 513] {
+            let e = check_dims(Some(bad), 512).unwrap_err().to_string();
+            assert!(e.contains("512"), "should name the model dim: {e}");
+        }
+    }
+
+    /// The combination is refused before any file is opened, so the error is
+    /// about the flags rather than a missing path.
+    #[test]
+    fn dims_without_normalization_is_refused_at_load() {
+        let result = Embedder::load(
+            &ModelSource::Files {
+                model: "/nonexistent/model.safetensors".into(),
+                tokenizer: "/nonexistent/tokenizer.json".into(),
+            },
+            Options {
+                dims: Some(256),
+                normalize: false,
+                ..Options::default()
+            },
+        );
+        let e = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("loading should have been refused"),
+        };
+        assert!(e.contains("--no-normalize"), "unexpected error: {e}");
+    }
 }
 
 #[cfg(test)]

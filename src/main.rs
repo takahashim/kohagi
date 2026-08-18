@@ -122,6 +122,21 @@ struct Args {
     /// make dot product = cosine).
     #[arg(long)]
     no_normalize: bool,
+    /// Keep only the first N dimensions of each embedding and re-normalize
+    /// (Matryoshka truncation — meaningful for models trained for it). dot =
+    /// cosine still holds on the shorter vectors, and they must not share an
+    /// index with full-dimension ones. Refused if N is 0 or exceeds the model
+    /// dimension, or combined with --no-normalize.
+    #[arg(long, value_name = "N")]
+    dims: Option<usize>,
+    /// Refuse to embed anything unless the loaded weights' sha256 starts with
+    /// this hex prefix — paste the 12 digits from a summary line or the full
+    /// digest from --print-model-info. A mismatch exits 1 before any record is
+    /// answered, so the wrong checkpoint cannot survive into results. With
+    /// --device coreml the bundle's recorded source_sha256 is checked instead,
+    /// and a bundle that recorded none is refused.
+    #[arg(long, value_name = "HEX")]
+    expect_sha256: Option<String>,
     /// Token-level truncation length.
     #[arg(long, default_value_t = 512)]
     max_seq_length: usize,
@@ -145,6 +160,7 @@ impl Args {
         Options {
             pooling: self.pooling.map(Into::into),
             normalize: !self.no_normalize,
+            dims: self.dims,
             max_seq_length: self.max_seq_length,
             batch_size: self.batch_size,
             precision: self.precision.into(),
@@ -174,10 +190,18 @@ impl Args {
     }
 }
 
+/// Load the model and, when `--expect-sha256` pinned a digest, refuse weights
+/// that do not carry it — before anything is embedded, whichever mode loads.
+fn load_checked(args: &Args, source: &ModelSource) -> anyhow::Result<Embedder> {
+    let embedder = Embedder::load(source, args.options())?;
+    cli::verify_fingerprint(args.expect_sha256.as_deref(), &embedder.info())?;
+    Ok(embedder)
+}
+
 /// `--text` mode: embed the arguments and print what stdio mode would, with the
 /// argument positions as ids.
 fn embed_arguments(args: &Args, source: &ModelSource, label: &str) -> anyhow::Result<()> {
-    let embedder = Embedder::load(source, args.options())?;
+    let embedder = load_checked(args, source)?;
     let prefixed: Vec<String> = args
         .text
         .iter()
@@ -217,7 +241,9 @@ fn run(args: Args) -> anyhow::Result<usize> {
     }
 
     if args.print_model_info {
-        let embedder = Embedder::load(&source, args.options())?;
+        // Checked here too, so `--print-model-info --expect-sha256 …` is a
+        // standalone "is this the checkpoint I think it is" that exits 1.
+        let embedder = load_checked(&args, &source)?;
         cli::print_model_info(&label, &embedder.info())?;
         return Ok(0);
     }
@@ -227,9 +253,8 @@ fn run(args: Args) -> anyhow::Result<usize> {
         return Ok(0);
     }
 
-    let opts = args.options();
     stdio::run(
-        || Embedder::load(&source, opts),
+        || load_checked(&args, &source),
         &args.prefix,
         args.report_tokens,
         &label,
