@@ -2,7 +2,7 @@
 
 `kohagi-rerank` is a pure function from id-tagged `(query, text)` pairs to
 id-tagged scores, spoken over stdin/stdout as JSONL. It is a separate binary
-from `kohagi` because it is a different function — pairs in, numbers out — but
+from `kohagi` because it is a different function (pairs in, numbers out), but
 every rule around the records is the one [PROTOCOL.md](PROTOCOL.md) states, and
 this document only says where the two differ.
 
@@ -21,14 +21,14 @@ instead of searching a corpus.
 | field | type | notes |
 |---|---|---|
 | `id` | any JSON value | **Opaque.** Echoed verbatim in the output; never interpreted. |
-| `query` | string | What was asked. Raw text, no prefix — a reranker takes none, unlike Ruri's embedding prefixes. |
+| `query` | string | What was asked, as raw text with no prefix. A reranker takes none, where Ruri's embedding models do. |
 | `text` | string | The candidate being scored against it. |
 
 - **Order matters.** `(query, text)`, not `(text, query)`: a cross-encoder is
   not symmetric, and swapping them returns a different number rather than an
   error.
-- **Skips (non-fatal).** A line is skipped — with `kohagi-rerank: skip line N:
-  <reason>` on stderr and a count in the summary — when it is not valid JSON,
+- **Skips (non-fatal).** A line is skipped (with `kohagi-rerank: skip line N:
+  <reason>` on stderr and a count in the summary) when it is not valid JSON,
   not a JSON object, has no `id`, or has a missing / empty / non-string `query`
   or `text`. A pair missing half of itself is skipped rather than scored
   against nothing, because scoring it would produce a plausible number.
@@ -43,8 +43,8 @@ instead of searching a corpus.
 ```
 
 - `id` is the input value, unchanged. **Map by id, not by order.**
-- `score` is the sigmoid of the model's logit — a number in 0..1, higher means
-  more relevant. This matches `sentence_transformers.CrossEncoder.predict` for
+- `score` is the sigmoid of the model's logit, a number in 0..1 where higher
+  means more relevant. This matches `sentence_transformers.CrossEncoder.predict` for
   a one-label model, which is what these rerankers are, so a threshold tuned
   against that library carries over unchanged.
 - **`--raw-logits`** reports the logit instead, unsquashed. The ranking is
@@ -68,8 +68,8 @@ Any ModernBERT sequence-classification checkpoint with one label:
 `cl-nagoya/ruri-v3-reranker-310m` (the default) and the
 `hotchpotch/japanese-reranker-{tiny,xsmall,small,base}-v2` family are all this
 shape. The head is `norm(gelu(dense(h_cls)))` into a single linear output, and
-the pair is joined by the tokenizer's own template — `<s> query </s> <s> text
-</s>` for these checkpoints — rather than by string concatenation here.
+the pair is joined by the tokenizer's own template (`<s> query </s> <s> text
+</s>` for these checkpoints) rather than by string concatenation here.
 
 Kohagi refuses rather than guesses when a checkpoint is something else: a model
 with more than one label is an error (one number per pair is the whole
@@ -86,13 +86,14 @@ kohagi-rerank: model=ruri-v3-reranker-310m sha256=1c342581efc2 pooling=cls dim=7
 a log of numbers cannot be read without it. `--print-model-info` prints the
 same facts as one JSON line, as in [PROTOCOL.md](PROTOCOL.md), with `score`
 added. Exit codes are the same: 0 every pair scored, 2 finished with skipped
-lines, 1 fatal, 3 the CoreML backend cannot serve this request — see
+lines, 1 fatal, 3 the CoreML backend cannot serve this request. See
 [PROTOCOL.md](PROTOCOL.md) for what each one means and what to do about it.
 
-`--expect-sha256 <hex>` works as in PROTOCOL.md: a prefix of the expected
-digest, checked at load, exit 1 with no output on a mismatch. It matters more
+`--expect-sha256 <hex>` works as in PROTOCOL.md. It takes a prefix of the
+expected digest, checks it at load, and exits 1 with no output on a mismatch.
+It matters more
 here than for embeddings, because a threshold belongs to the weights it was
-tuned on — two fine-tunes differ only in their bytes, and a config file
+tuned on. Two fine-tunes differ only in their bytes, and a config file
 carrying a threshold can carry the digest beside it and have Kohagi enforce
 the pairing.
 
@@ -100,7 +101,7 @@ the pairing.
 
 `--device cpu`, `--device metal` (`--features metal`), `--device cuda`
 (`--features cuda`), and `--device coreml` (`--features coreml`), which is the
-fastest by a wide margin — 18.5 pairs/s against 3.3 on the CPU for
+fastest by a wide margin, at 18.5 pairs/s against 3.3 on the CPU for
 `ruri-v3-reranker-310m` on an M2.
 
 The Neural Engine runs fixed shapes and fp16, so it needs a converted bundle.
@@ -117,8 +118,8 @@ That still moves the scores, and by more than any other backend does.
 A score is `sigmoid(logit)`, and the backend's error is in the logit. The
 sigmoid then compresses that error by `s(1-s)`: the same logit error `d` moves
 a score near 0.02 by `d * 0.0196` and a score near 0.5 by `d * 0.25`, **12.7
-times more**. So a worst-case score difference cannot be quoted on its own —
-without saying where in the range it happened, it says nothing about a
+times more**. So a worst-case score difference cannot be quoted on its own.
+Without saying where in the range it happened, it says nothing about a
 threshold anywhere else.
 
 Measuring `d` instead does transfer. For any threshold `t`, a pair can only
@@ -167,8 +168,8 @@ corpus and scoring them on both backends:
 | 0.5 | 636 | 200 | 24 | 12.0% | 76 |
 | 0.6 | 651 | 200 | 26 | 13.0% | 85 |
 
-The rates line up with `t(1-t)` — 0.0196, 0.09, 0.25, 0.24 against 0%, 2%, 12%,
-13% — which is the compression argument showing up in the data rather than
+The rates line up with `t(1-t)` (0.0196, 0.09, 0.25, 0.24 against 0%, 2%, 12%,
+13%), which is the compression argument showing up in the data rather than
 being assumed.
 
 **So the exposure is smallest where the stakes are highest.** A low threshold
@@ -180,7 +181,7 @@ landing on either side of 0.501 was never a meaningful distinction.
 
 This is a statement about *these* backends and *this* corpus, not a licence.
 For a new threshold, take `d = 0.058`, compute `d · t · (1 - t)`, and count how
-much of your own data is inside it — that is the upper bound on what can move,
+much of your own data is inside it. That is the upper bound on what can move,
 before any measurement. **A threshold tuned to three decimal places is still
 not automatically safe**, and scores from two backends should not be mixed in
 one comparison: treat them as different scales, as with a quantized embedding

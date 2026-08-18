@@ -100,15 +100,15 @@ that records a directory name records what someone meant to load. The digest is
 of the whole `model.safetensors`, so identical weights always agree and one
 byte's difference always shows, and `sha256sum` on the same file gives the same
 value. Hashing runs on its own thread beside the embedding and is collected at
-the end, so a run doing real work pays nothing for it — 0.36s of CPU for
-ruri-v3-130m's 528MB, and however long the disk takes for a model on a network
-share.
+the end, so a run doing real work pays nothing for it. The hash itself takes
+0.36s of CPU for ruri-v3-130m's 528MB, and however long the disk takes for a
+model on a network share.
 
-The recorded digest can also be enforced: `--expect-sha256 1c342581efc2`
+The recorded digest can also be enforced. `--expect-sha256 1c342581efc2`
 (paste the summary's 12 digits, or the full 64) refuses to embed anything with
-weights whose digest does not start with it — exit 1 before any output, so the
-wrong checkpoint cannot add a single vector to an index. Both binaries take
-it; see PROTOCOL.md.
+weights whose digest does not start with it. The run exits 1 before any
+output, so the wrong checkpoint cannot add a single vector to an index. Both
+binaries take it; see PROTOCOL.md.
 
 ## Reranking with `kohagi-rerank`
 
@@ -124,12 +124,12 @@ $ echo '{"id":1,"query":"Rubyで配列を並べ替えるには","text":"配列�
 It defaults to `cl-nagoya/ruri-v3-reranker-310m` and runs any ModernBERT
 sequence-classification checkpoint with one label, including the
 `hotchpotch/japanese-reranker-*-v2` family. The score is the sigmoid of the
-model's logit — the same number `sentence_transformers.CrossEncoder.predict`
+model's logit, the same number `sentence_transformers.CrossEncoder.predict`
 returns, so thresholds carry over; `--raw-logits` reports the logit instead.
 
 A separate binary rather than a flag on `kohagi`, because it is a different
-function: pairs in, numbers out. Everything around the records — opaque ids,
-skipped lines, blank-line batches, exit codes — is the same protocol. See
+function: pairs in, numbers out. Everything around the records (opaque ids,
+skipped lines, blank-line batches, exit codes) is the same protocol. See
 [PROTOCOL-rerank.md](PROTOCOL-rerank.md).
 
 ```bash
@@ -151,7 +151,7 @@ See [PROTOCOL.md](PROTOCOL.md) for the exit-code semantics.
 
 If the calling code is already written against OpenAI's `/v1/embeddings`, the
 value of that compatibility is swapping `base_url` and changing nothing else.
-Kohagi has no HTTP mode, so the examples supply one — the same ~150-line proxy in
+Kohagi has no HTTP mode, so the examples supply one, the same ~150-line proxy in
 [Python](examples/openai_proxy/proxy.py), [Ruby](examples/openai_proxy/proxy.rb) and
 [TypeScript](examples/openai_proxy/proxy.ts):
 
@@ -170,7 +170,7 @@ reply is that batch's complete response object, so there is nothing to assemble.
 A request costs about 40 ms warm. Two caveats before pointing production at it: an
 existing index has to be rebuilt, since `ruri-v3-130m` returns 512 dimensions
 where `text-embedding-3-small` returns 1536, and the request's `model` is
-ignored — the flags passed to Kohagi decide which checkpoint runs.
+ignored; the flags passed to Kohagi decide which checkpoint runs.
 
 ### Ruby
 
