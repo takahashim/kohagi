@@ -224,10 +224,12 @@ fn run(args: &Args) -> Result<()> {
 }
 
 fn main() -> ExitCode {
+    // Set the prefix before the emitter can write warnings.
+    kohagi::program::set("coreml-convert");
     match run(&Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("coreml-convert: error: {e:#}");
+            eprintln!("{}: error: {e:#}", kohagi::program::name());
             ExitCode::FAILURE
         }
     }

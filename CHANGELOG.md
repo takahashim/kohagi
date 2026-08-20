@@ -50,7 +50,11 @@
   `source_sha256`. `scripts/convert_coreml.py` records the same.
 
 - **New library API:** `kohagi::rerank`, `ModelInfo` with `Embedder::info` and
-  `Reranker::info`, and `kohagi::cli`.
+  `Reranker::info`, and `kohagi::cli`. `ModelInfo` carries a converted bundle's
+  facts as a `Bundle` and a run's answer shape as an `Output` (`Embedding` with
+  its `output_dim`, or `Score`), so a model cannot claim both; the JSON
+  `--print-model-info` writes is unchanged. `kohagi::program` names the running
+  binary, which is the prefix every stderr line carries.
 
 ### Changed
 

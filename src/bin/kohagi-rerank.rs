@@ -142,7 +142,11 @@ fn load_checked(args: &Args, source: &ModelSource) -> anyhow::Result<Reranker> {
 
 /// `--pair` mode: send argument pairs to the protocol, which writes them like
 /// stdin input.
-fn score_arguments(pair: &[String], reranker: &Reranker, report_tokens: bool) -> anyhow::Result<()> {
+fn score_arguments(
+    pair: &[String],
+    reranker: &Reranker,
+    report_tokens: bool,
+) -> anyhow::Result<()> {
     // `num_args = 2` accepts exactly two values or rejects the flag, so this
     // slice has an even length and `chunks_exact` leaves no remainder.
     let pairs: Vec<(&str, &str)> = pair
@@ -169,7 +173,8 @@ fn run(args: Args) -> anyhow::Result<usize> {
 }
 
 fn main() -> ExitCode {
-    cli::exit_code("kohagi-rerank", run(Args::parse()))
+    kohagi::program::set("kohagi-rerank");
+    cli::exit_code(run(Args::parse()))
 }
 
 #[cfg(test)]

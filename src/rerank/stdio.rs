@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::Reranker;
-use crate::stdio::{drive, summarize, Flushed, Records};
+use crate::stdio::{drive, parse_object, summarize, take_id, take_nonempty_str, Lazy, Records};
 use crate::TokenInfo;
 
 #[derive(Serialize)]
@@ -57,77 +57,59 @@ struct InRecord {
 }
 
 /// Parse one physical line. `Ok(None)` is a blank line — the batch boundary.
-/// `Err` = skip with a warning.
+/// `Err` means the line is skipped with a warning. The envelope rules match
+/// the embedding protocol; only the fields differ.
 fn parse_line(line: &str) -> Result<Option<InRecord>, String> {
-    if line.trim().is_empty() {
+    let Some(obj) = parse_object(line)? else {
         return Ok(None);
-    }
-    let v: Value = serde_json::from_str(line).map_err(|e| format!("invalid JSON: {e}"))?;
-    let obj = v.as_object().ok_or("not a JSON object")?;
-    let id = obj.get("id").ok_or("missing \"id\"")?.clone();
-    let field = |name: &str| -> Result<String, String> {
-        let s = obj
-            .get(name)
-            .and_then(Value::as_str)
-            .ok_or(format!("missing or non-string \"{name}\""))?;
-        if s.is_empty() {
-            return Err(format!("empty \"{name}\""));
-        }
-        Ok(s.to_string())
     };
-    let query = field("query")?;
-    let text = field("text")?;
-    Ok(Some(InRecord { id, query, text }))
+    Ok(Some(InRecord {
+        id: take_id(&obj)?,
+        query: take_nonempty_str(&obj, "query")?,
+        text: take_nonempty_str(&obj, "text")?,
+    }))
 }
 
 /// The scoring end of the protocol.
 struct Score<W: Write, F> {
-    reranker: Option<Reranker>,
-    load: F,
+    model: Lazy<Reranker, F>,
     report_tokens: bool,
     out: W,
 }
 
 impl<W: Write, F: Fn() -> Result<Reranker>> Records for Score<W, F> {
     type Record = InRecord;
+    type Answer = f32;
 
     fn parse(line: &str) -> Result<Option<InRecord>, String> {
         parse_line(line)
     }
 
-    fn flush(&mut self, chunk: &mut Vec<InRecord>) -> Result<Flushed> {
-        if chunk.is_empty() {
-            return Ok(Flushed {
-                written: 0,
-                truncated: 0,
-            });
-        }
-        let reranker = match &mut self.reranker {
-            Some(r) => r,
-            None => self.reranker.insert((self.load)()?),
-        };
-
+    fn answer(&mut self, chunk: &[InRecord]) -> Result<(Vec<f32>, Vec<TokenInfo>)> {
         let pairs: Vec<(&str, &str)> = chunk
             .iter()
             .map(|r| (r.query.as_str(), r.text.as_str()))
             .collect();
-        let (scores, tokens) = reranker.score(&pairs)?;
+        self.model.get()?.score(&pairs)
+    }
 
-        let mut truncated = 0usize;
-        for ((record, &score), info) in chunk.iter().zip(&scores).zip(&tokens) {
-            truncated += info.truncated as usize;
-            write_record(
-                &mut self.out,
-                &record.id,
-                score,
-                self.report_tokens.then_some(info),
-            )?;
-        }
+    fn write(
+        &mut self,
+        record: &InRecord,
+        answer: &Self::Answer,
+        tokens: &TokenInfo,
+    ) -> Result<()> {
+        write_record(
+            &mut self.out,
+            &record.id,
+            *answer,
+            self.report_tokens.then_some(tokens),
+        )
+    }
+
+    fn flush_output(&mut self) -> Result<()> {
         self.out.flush()?;
-
-        let written = chunk.len();
-        chunk.clear();
-        Ok(Flushed { written, truncated })
+        Ok(())
     }
 
     /// A blank line, so a long-lived caller can read until it instead of
@@ -148,20 +130,19 @@ pub fn run(
 ) -> Result<usize> {
     let stdout = std::io::stdout();
     let mut records = Score {
-        reranker: None,
-        load,
+        model: Lazy::new(load),
         report_tokens,
         out: BufWriter::new(stdout.lock()),
     };
 
-    let counts = drive(&mut records, "kohagi-rerank")?;
+    let counts = drive(&mut records)?;
     records.out.flush()?;
 
-    let facts = records.reranker.as_ref().map_or_else(
+    let facts = records.model.loaded().map_or_else(
         || "dim=0".to_string(),
         |r| crate::stdio::summary_facts(&r.info()),
     );
-    summarize("kohagi-rerank", model_label, &facts, &counts);
+    summarize(model_label, &facts, &counts);
     Ok(counts.skipped)
 }
 

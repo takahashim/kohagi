@@ -17,6 +17,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::program::remark;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
@@ -100,13 +101,11 @@ impl Fingerprint {
             let digest = match handle.join() {
                 Ok(Ok(digest)) => Some(digest),
                 Ok(Err(e)) => {
-                    eprintln!("kohagi: could not hash the weights ({e:#}); fingerprint unknown");
+                    remark!("could not hash the weights ({e:#}); fingerprint unknown");
                     None
                 }
                 Err(_) => {
-                    eprintln!(
-                        "kohagi: the thread hashing the weights panicked; fingerprint unknown"
-                    );
+                    remark!("the thread hashing the weights panicked; fingerprint unknown");
                     None
                 }
             };

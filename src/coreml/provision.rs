@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+use crate::program::remark;
 use objc2::rc::Retained;
 use objc2_core_ml::{MLComputeUnits, MLModel, MLModelConfiguration};
 use objc2_foundation::{NSString, NSURL};
@@ -129,8 +131,8 @@ pub(super) fn load_bucket(
         match load_model(c) {
             Ok(model) => return Ok(model),
             Err(e) if package.is_some() => {
-                eprintln!(
-                    "kohagi: the compiled bundle for seq-{seq} did not load ({e:#}); \
+                remark!(
+                    "the compiled bundle for seq-{seq} did not load ({e:#}); \
                      compiling its .mlpackage instead"
                 );
             }
@@ -157,8 +159,8 @@ fn load_model(located: &Located) -> Result<Retained<MLModel>> {
         // away on every point release, whether or not it mattered — treat a
         // failed load as the signal, drop the entry and compile once more.
         Err(e) if compiled.from_cache => {
-            eprintln!(
-                "kohagi: the cached compile of {} did not load ({e:#}); recompiling",
+            remark!(
+                "the cached compile of {} did not load ({e:#}); recompiling",
                 path.display()
             );
             let _ = std::fs::remove_dir_all(&compiled.path);
@@ -240,8 +242,8 @@ fn compile_cached(pkg: &Path) -> Result<Compiled> {
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&staged);
-            eprintln!(
-                "kohagi: could not cache the compiled model in {} ({e}); \
+            remark!(
+                "could not cache the compiled model in {} ({e}); \
                  this run will use a temporary copy",
                 entry.display()
             );
@@ -381,8 +383,8 @@ unsafe fn file_url(path: &Path) -> Result<Retained<NSURL>> {
 fn compile_package(pkg: &Path) -> Result<PathBuf> {
     // On the order of 20 seconds per bucket, and silent until now. Only reached
     // when the cache missed, so this prints on a first run and not afterwards.
-    eprintln!(
-        "kohagi: compiling {} for the Neural Engine — first run only ...",
+    remark!(
+        "compiling {} for the Neural Engine — first run only ...",
         pkg.file_name().unwrap_or_default().to_string_lossy()
     );
     if let Ok(out) = compile_at(pkg) {

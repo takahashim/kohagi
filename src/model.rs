@@ -29,6 +29,7 @@ use tokenizers::Tokenizer;
 use crate::batch::{l2_normalize, load_tokenizer, pool_row, BatchInput, Pooling, TokenInfo};
 use crate::config::CoreMlForm;
 use crate::errors::UnsupportedRequest;
+use crate::program::remark;
 
 /// Attention-scratch budget per forward, in `rows * seq^2` elements.
 ///
@@ -258,11 +259,26 @@ pub struct ModelInfo {
     pub precision: &'static str,
     /// sha256 of the `model.safetensors` these weights were loaded from.
     /// Absent on the CoreML path, which loads a converted bundle instead and
-    /// reports [`Self::source_sha256`].
+    /// reports [`Bundle::source_sha256`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    /// The checkpoint a CoreML bundle was converted from, as its converter
-    /// recorded it.
+    /// Metadata for a converted CoreML bundle.
+    #[serde(flatten)]
+    pub bundle: Option<Bundle>,
+    /// The pooling setting resolved at load time.
+    pub pooling: &'static str,
+    /// The model's own dimension, its `hidden_size`.
+    pub dim: usize,
+    pub max_seq_length: usize,
+    /// The value returned for each record.
+    #[serde(flatten)]
+    pub output: Output,
+}
+
+/// Metadata that applies only to a converted CoreML bundle.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Bundle {
+    /// The checkpoint recorded by the converter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// sha256 of that checkpoint's weights. `None` for a bundle converted
@@ -270,55 +286,70 @@ pub struct ModelInfo {
     /// borrowing the bundle's own identity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_sha256: Option<String>,
-    /// The fixed sequence lengths a CoreML bundle serves.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub buckets: Option<Vec<usize>>,
-    /// `embeddings-int8` / `all-int8` for a quantized CoreML bundle, `none`
-    /// for an fp16 one. A quantized bundle's vectors are not interchangeable
-    /// with an fp16 one's, so the number a run produced needs it recorded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantization: Option<String>,
-    /// The emitted graph's version (`GRAPH_VERSION`), for a CoreML bundle that
-    /// records one.
+    /// Supported sequence lengths.
+    pub buckets: Vec<usize>,
+    /// Bundle quantization: `embeddings-int8`, `all-int8`, or `none`.
+    pub quantization: String,
+    /// Emitted graph version, when recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_version: Option<String>,
-    /// The pooling that was resolved at load — the checkpoint's own choice
-    /// unless `--pooling` overrode it.
-    pub pooling: &'static str,
-    /// The model's own dimension, its `hidden_size`.
-    pub dim: usize,
-    /// `--dims`, when it truncates the output below [`Self::dim`]. Absent when
-    /// the flag was not given or equalled `dim` (which changes no vector), so
-    /// a results file only carries the claim when there is one. A truncated
-    /// vector must not share an index with a full one, which is exactly what
-    /// two files disagreeing on this field says.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_dim: Option<usize>,
-    pub max_seq_length: usize,
-    /// `sigmoid` or `logit` for a reranker: which of the two a score is. Absent
-    /// for an embedding model, which has no score to shape.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<&'static str>,
+}
+
+/// The value returned for each record.
+///
+/// It is flattened and untagged to preserve the existing JSON format.
+///
+/// Serialize only. Do not derive `Deserialize`: the optional field in
+/// [`Output::Embedding`] would make every object match that variant. Use a
+/// tagged or custom representation when reading model info.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum Output {
+    /// One vector per text.
+    Embedding {
+        /// Output dimension after `--dims`, when it changes the vector size.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_dim: Option<usize>,
+    },
+    /// One score per pair, represented as `sigmoid` or `logit`.
+    Score { score: &'static str },
 }
 
 impl ModelInfo {
-    /// Fill in what only a converted bundle can say about itself.
-    ///
-    /// Shared by the embedder and the reranker because it is one claim either
-    /// way: a bundle's provenance is a property of the bundle, not of what is
-    /// being asked of it.
+    /// Adds metadata from a converted CoreML bundle.
     #[cfg(feature = "coreml")]
     pub(crate) fn add_bundle(&mut self, encoder: &crate::coreml::CoreMlEncoder) {
         let p = encoder.provenance();
-        self.source = p.source;
-        self.source_sha256 = p.source_sha256;
-        self.graph_version = p.graph_version;
-        // Every bundle serves the lengths it was compiled for, whether or not
-        // its metadata says so, so this reads the loaded models.
-        self.buckets = Some(encoder.buckets());
-        // An fp16 bundle carries no quantization key; saying "none" is what
-        // makes the two cases distinguishable in a results file.
-        self.quantization = Some(p.quantization.unwrap_or_else(|| "none".to_string()));
+        self.bundle = Some(Bundle {
+            source: p.source,
+            source_sha256: p.source_sha256,
+            // Read the supported lengths from the loaded models.
+            buckets: encoder.buckets(),
+            // A missing quantization key means fp16.
+            quantization: p.quantization.unwrap_or_else(|| "none".to_string()),
+            graph_version: p.graph_version,
+        });
+    }
+
+    /// Returns the digest of the weights used and its field name.
+    pub fn digest(&self) -> Option<(&'static str, &str)> {
+        if let Some(sha) = &self.sha256 {
+            return Some(("sha256", sha));
+        }
+        Some((
+            "source_sha256",
+            self.bundle.as_ref()?.source_sha256.as_deref()?,
+        ))
+    }
+
+    /// Returns the actual embedding dimension.
+    pub fn reported_dim(&self) -> usize {
+        match self.output {
+            Output::Embedding {
+                output_dim: Some(n),
+            } => n,
+            _ => self.dim,
+        }
     }
 }
 
@@ -581,7 +612,7 @@ impl Embedder {
         // must not stop a working model from loading, but a silent skip would leave
         // no way to tell "checked and fine" from "never checked".
         let skip = |e: &anyhow::Error| {
-            eprintln!("kohagi: could not compare the converted model against float32 ({e:#})");
+            remark!("could not compare the converted model against float32 ({e:#})");
         };
         let reference = match Self::load(
             checkpoint,
@@ -610,8 +641,8 @@ impl Embedder {
         // fp16 rounding through a 19-layer encoder lands around 1e-5; anything past
         // 1e-4 is the checkpoint's own sensitivity rather than rounding.
         if worst > 1e-4 {
-            eprintln!(
-                "kohagi: warning: this model's Neural Engine output differs from its \
+            remark!(
+                "warning: this model's Neural Engine output differs from its \
                  float32 output by 1 - cosine = {worst:.1e}, more than fp16 rounding \
                  explains; the checkpoint is sensitive to fp16, so its ANE vectors are \
                  not interchangeable with its CPU ones"
@@ -654,16 +685,13 @@ impl Embedder {
             backend: self.opts.backend.name(),
             precision: self.opts.precision.name(),
             sha256: self.fingerprint.as_ref().and_then(|f| f.get()),
-            source: None,
-            source_sha256: None,
-            buckets: None,
-            quantization: None,
-            graph_version: None,
+            bundle: None,
             pooling: self.pooling.name(),
             dim: self.dim,
-            output_dim: output_dim(self.opts.dims, self.dim),
             max_seq_length: self.opts.max_seq_length,
-            score: None,
+            output: Output::Embedding {
+                output_dim: output_dim(self.opts.dims, self.dim),
+            },
         };
         #[cfg(feature = "coreml")]
         if let Engine::CoreMl(encoder) = &self.engine {
@@ -924,7 +952,7 @@ fn resolve_pooling(
 fn resolve_pooling_warned(requested: Option<Pooling>, detected: Option<Pooling>) -> Pooling {
     let (pooling, note) = resolve_pooling(requested, detected);
     if let Some(note) = note {
-        eprintln!("kohagi: {}", note.message());
+        remark!("{}", note.message());
     }
     pooling
 }
@@ -974,7 +1002,7 @@ pub(crate) fn convert_for_coreml(
             // the CPU path, and hf-hub is silent about it, so say so before
             // starting. Nothing is printed when the cache already has the files.
             if !hub_checkpoint_is_cached(repo) {
-                eprintln!("kohagi: downloading {repo} (safetensors; first run only) ...");
+                remark!("downloading {repo} (safetensors; first run only) ...");
             }
             let files = fetch_checkpoint(repo)?;
             crate::coreml_export::Checkpoint {

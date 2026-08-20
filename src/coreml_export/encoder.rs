@@ -14,6 +14,7 @@ use super::blob::Writer;
 use super::mil::{Builder, DType, Tensor};
 use super::modernbert::{self, Activation, BlockOffsets, Config, Stored};
 use super::Io;
+use crate::program::remark;
 
 /// A ModernBERT config, as far as emitting needs it.
 ///
@@ -761,7 +762,7 @@ pub fn emit_with(
         if crate::config::head::is_head(&name) {
             continue;
         }
-        eprintln!("kohagi: the checkpoint's `{name}` was not read; the emitted encoder has no place for it");
+        remark!("the checkpoint's `{name}` was not read; the emitted encoder has no place for it");
     }
     let mut per_length = Vec::with_capacity(sorted.len());
     for &seq in &sorted {

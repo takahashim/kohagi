@@ -45,10 +45,11 @@ mod fingerprint;
 mod fnv;
 mod fused;
 mod model;
+pub mod program;
 pub mod rerank;
 pub mod stdio;
 
 pub use batch::{Pooling, TokenInfo};
 pub use config::{CoreMlForm, CoreMlQuantize};
 pub use errors::UnsupportedRequest;
-pub use model::{Backend, Embedder, ModelInfo, ModelSource, Options, Precision};
+pub use model::{Backend, Bundle, Embedder, ModelInfo, ModelSource, Options, Output, Precision};

@@ -31,8 +31,9 @@ use crate::errors::UnsupportedRequest;
 use crate::fingerprint::Fingerprint;
 use crate::model::{
     check_precision, fetch_checkpoint, load_weights, open_device, parse_config, read_config_json,
-    run_batches, Backend, ModelInfo, ModelSource, Precision, Weights,
+    run_batches, Backend, ModelInfo, ModelSource, Output, Precision, Weights,
 };
+use crate::program::remark;
 
 /// Knobs for [`Reranker::load`]. `Default` matches the Ruri v3 reranker.
 #[derive(Clone, Copy)]
@@ -99,6 +100,28 @@ impl HeadConfig {
             )),
         }
     }
+
+    /// Validates a checkpoint before scoring.
+    fn validate(&self) -> Result<()> {
+        let labels = self.labels();
+        anyhow::ensure!(
+            labels == 1,
+            "this model produces {labels} labels per pair; kohagi-rerank scores a pair with \
+             one number, which only a one-label cross-encoder gives"
+        );
+        if let Some(names) = &self.architectures {
+            if !names
+                .iter()
+                .any(|n| n.ends_with("ForSequenceClassification"))
+            {
+                remark!(
+                    "warning: this checkpoint declares {names:?} rather than a \
+                     sequence-classification model; scoring it assumes a head it may not have"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `norm(act(dense(h)))` and then one linear down to a logit — HF's
@@ -139,8 +162,8 @@ fn bias(
         })?));
     }
     if vb.contains_tensor("bias") {
-        eprintln!(
-            "kohagi-rerank: warning: this checkpoint carries `{tensor}` but its config.json \
+        remark!(
+            "warning: this checkpoint carries `{tensor}` but its config.json \
              does not set `{flag}`; scoring without it, as sentence-transformers would"
         );
     }
@@ -192,24 +215,14 @@ impl Head {
         })
     }
 
-    /// The score for one pooled vector: the head, and then the shape the
-    /// caller asked for.
+    /// The raw logit for one pooled vector.
     ///
     /// A free-standing step on the head rather than on the [`Reranker`],
     /// because the CPU fan-out hands this to worker threads and a `Reranker`
     /// may hold a CoreML model, which is not shareable between them. The head
     /// is candle tensors and is.
-    fn score(&self, pooled: &[f32], sigmoid: bool) -> Result<f32> {
-        let logit = self.logit(pooled)?;
-        if !sigmoid {
-            return Ok(logit);
-        }
-        // In f64: a logit of -20 or below underflows an f32 exp long before
-        // the sigmoid itself would.
-        Ok((1.0 / (1.0 + f64::from(-logit).exp())) as f32)
-    }
-
-    /// The raw logit for one pooled vector.
+    ///
+    /// Sigmoid conversion happens after the backend work, once per run.
     fn logit(&self, pooled: &[f32]) -> Result<f32> {
         let x = Tensor::from_slice(pooled, (1, pooled.len()), &Device::Cpu)?;
         let x = self.dense.forward(&x)?;
@@ -269,16 +282,16 @@ impl Reranker {
             .parent()
             .map(|d| d.join("config.json"))
             .context("model path has no parent dir for config.json")?;
-        let (config, head_config, pooling) = read_head_config(&config_path)?;
+        let config = resolve_config(&config_path)?;
 
         check_precision(opts.backend, opts.precision)?;
 
         let device = open_device(opts.backend)?;
         let fingerprint = Fingerprint::spawn(model_path.clone());
-        let weights = load_weights(&model_path, &config, &device, opts.precision)?;
+        let weights = load_weights(&model_path, &config.encoder, &device, opts.precision)?;
         // A second view of the same file, on the CPU: the head runs there
         // whatever the encoder runs on.
-        let head = Head::load(&cpu_weights(&model_path)?, &config, &head_config)?;
+        let head = Head::load(&cpu_weights(&model_path)?, &config.encoder, &config.head)?;
         let tokenizer = load_tokenizer(&tokenizer_path, opts.max_seq_length)?;
 
         Ok(Self {
@@ -286,8 +299,8 @@ impl Reranker {
             head,
             tokenizer,
             opts,
-            pooling,
-            dim: config.hidden_size,
+            pooling: config.pooling,
+            dim: config.encoder.hidden_size,
             fingerprint: Some(fingerprint),
         })
     }
@@ -320,7 +333,7 @@ impl Reranker {
             }
         };
 
-        let (config, head_config, pooling) = read_head_config(&dir.join("config.json"))?;
+        let config = resolve_config(&dir.join("config.json"))?;
 
         // Before loading the encoder, which compiles the bundle on a first run:
         // a bundle that cannot score a pair should say so in a second, not
@@ -339,9 +352,9 @@ impl Reranker {
             ))
             .into());
         }
-        let head = Head::load(&cpu_weights(&head_path)?, &config, &head_config)?;
+        let head = Head::load(&cpu_weights(&head_path)?, &config.encoder, &config.head)?;
 
-        let encoder = crate::coreml::CoreMlEncoder::load(&dir, config.hidden_size)?;
+        let encoder = crate::coreml::CoreMlEncoder::load(&dir, config.encoder.hidden_size)?;
         if opts.max_seq_length > encoder.max_bucket() {
             return Err(UnsupportedRequest::new(format!(
                 "--max-seq-length {} exceeds the largest converted CoreML bucket ({}); \
@@ -359,8 +372,8 @@ impl Reranker {
             head,
             tokenizer,
             opts,
-            pooling,
-            dim: config.hidden_size,
+            pooling: config.pooling,
+            dim: config.encoder.hidden_size,
             // A bundle has no safetensors of its own; its provenance is what it
             // recorded at conversion, read by `info`.
             fingerprint: None,
@@ -383,22 +396,18 @@ impl Reranker {
             backend: self.opts.backend.name(),
             precision: self.opts.precision.name(),
             sha256: self.fingerprint.as_ref().and_then(|f| f.get()),
-            source: None,
-            source_sha256: None,
-            buckets: None,
-            quantization: None,
-            graph_version: None,
+            bundle: None,
             pooling: self.pooling.name(),
             dim: self.dim,
-            // A reranker's output is a score, not a vector; there is no
-            // dimension to truncate.
-            output_dim: None,
             max_seq_length: self.opts.max_seq_length,
-            score: Some(if self.opts.sigmoid {
-                "sigmoid"
-            } else {
-                "logit"
-            }),
+            // Scores have no output dimension, but must record their scale.
+            output: Output::Score {
+                score: if self.opts.sigmoid {
+                    "sigmoid"
+                } else {
+                    "logit"
+                },
+            },
         };
         #[cfg(feature = "coreml")]
         if let Engine::CoreMl(encoder) = &self.engine {
@@ -416,14 +425,21 @@ impl Reranker {
         if pairs.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        match &self.engine {
-            Engine::Candle { weights, device } => self.score_candle(pairs, weights, device),
+        let (logits, info) = match &self.engine {
+            Engine::Candle { weights, device } => self.logits_candle(pairs, weights, device)?,
             #[cfg(feature = "coreml")]
-            Engine::CoreMl(encoder) => self.score_coreml(pairs, encoder),
-        }
+            Engine::CoreMl(encoder) => self.logits_coreml(pairs, encoder)?,
+        };
+        // Convert logits after backend work so workers only compute logits.
+        let scores = if self.opts.sigmoid {
+            logits.into_iter().map(sigmoid).collect()
+        } else {
+            logits
+        };
+        Ok((scores, info))
     }
 
-    fn score_candle(
+    fn logits_candle(
         &self,
         pairs: &[(&str, &str)],
         weights: &Weights,
@@ -431,66 +447,67 @@ impl Reranker {
     ) -> Result<(Vec<f32>, Vec<TokenInfo>)> {
         let encodings = encode_pairs(&self.tokenizer, pairs)?;
         let (batches, info) = bucket_encodings(&encodings, self.opts.batch_size);
-        let (head, pooling, sigmoid) = (&self.head, self.pooling, self.opts.sigmoid);
-        let scores = run_batches(
+        let (head, pooling) = (&self.head, self.pooling);
+        let logits = run_batches(
             weights,
             device,
             self.opts.backend,
             &batches,
             pairs.len(),
-            |hidden, mask, dim| head.score(&pool_row(hidden, mask, dim, pooling), sigmoid),
+            |hidden, mask, dim| head.logit(&pool_row(hidden, mask, dim, pooling)),
         )?;
-        Ok((scores, info))
+        Ok((logits, info))
     }
 
     /// The ANE path: one fixed-shape, batch=1 forward per pair, routed to the
     /// smallest converted bucket it fits.
     #[cfg(feature = "coreml")]
-    fn score_coreml(
+    fn logits_coreml(
         &self,
         pairs: &[(&str, &str)],
         encoder: &crate::coreml::CoreMlEncoder,
     ) -> Result<(Vec<f32>, Vec<TokenInfo>)> {
         let encodings = encode_pairs(&self.tokenizer, pairs)?;
         let info: Vec<TokenInfo> = encodings.iter().map(crate::batch::token_info).collect();
-        let (head, pooling, sigmoid) = (&self.head, self.pooling, self.opts.sigmoid);
-        let scores = encoder.run_rows(&encodings, |hidden, mask, dim| {
-            head.score(&pool_row(hidden, mask, dim, pooling), sigmoid)
+        let (head, pooling) = (&self.head, self.pooling);
+        let logits = encoder.run_rows(&encodings, |hidden, mask, dim| {
+            head.logit(&pool_row(hidden, mask, dim, pooling))
         })?;
-        Ok((scores, info))
+        Ok((logits, info))
     }
 }
 
-/// The encoder config, the head config, and the pooling they imply — from one
-/// `config.json`, which both a checkpoint and a converted bundle carry.
-fn read_head_config(path: &std::path::Path) -> Result<(Config, HeadConfig, Pooling)> {
+/// Converts a logit to the 0..1 score returned by `CrossEncoder.predict`.
+///
+/// Uses f64 to avoid underflow for small logits.
+fn sigmoid(logit: f32) -> f32 {
+    (1.0 / (1.0 + f64::from(-logit).exp())) as f32
+}
+
+/// Parsed and validated cross-encoder configuration.
+struct ScoringConfig {
+    /// Encoder configuration.
+    encoder: Config,
+    /// Classifier head configuration.
+    head: HeadConfig,
+    /// Classifier pooling.
+    pooling: Pooling,
+}
+
+/// Reads, parses, and validates a cross-encoder configuration.
+fn resolve_config(path: &std::path::Path) -> Result<ScoringConfig> {
     // One read, two views: the encoder's and the head's.
     let json = read_config_json(path)?;
-    let config: Config = parse_config(json.clone(), path)?;
-    let head_config: HeadConfig = parse_config(json, path)?;
+    let encoder: Config = parse_config(json.clone(), path)?;
+    let head: HeadConfig = parse_config(json, path)?;
 
-    // Both of these are "this model is not what this binary scores with", and
-    // both are worth stopping for: getting them wrong produces a
-    // plausible-looking number rather than a crash.
-    let labels = head_config.labels();
-    anyhow::ensure!(
-        labels == 1,
-        "this model produces {labels} labels per pair; kohagi-rerank scores a pair with \
-         one number, which only a one-label cross-encoder gives"
-    );
-    if let Some(names) = &head_config.architectures {
-        if !names
-            .iter()
-            .any(|n| n.ends_with("ForSequenceClassification"))
-        {
-            eprintln!(
-                "kohagi-rerank: warning: this checkpoint declares {names:?} rather than a \
-                 sequence-classification model; scoring it assumes a head it may not have"
-            );
-        }
-    }
-    let pooling = head_config.pooling()?;
-    Ok((config, head_config, pooling))
+    head.validate()?;
+    let pooling = head.pooling()?;
+    Ok(ScoringConfig {
+        encoder,
+        head,
+        pooling,
+    })
 }
 
 /// A CPU f32 view of a safetensors file, for the head.

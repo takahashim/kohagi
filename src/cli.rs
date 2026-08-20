@@ -18,6 +18,8 @@ use std::process::ExitCode;
 
 use clap::ValueEnum;
 
+use crate::program::remark;
+
 use crate::{
     Backend, CoreMlForm, CoreMlQuantize, ModelInfo, ModelSource, Pooling, Precision,
     UnsupportedRequest,
@@ -255,15 +257,13 @@ pub fn verify_fingerprint(expected: Option<&str>, info: &ModelInfo) -> anyhow::R
         !want.is_empty() && want.len() <= 64 && want.bytes().all(|b| b.is_ascii_hexdigit()),
         "--expect-sha256 takes a hex prefix of the digest (up to 64 digits), not `{expected}`"
     );
-    let (claim, actual) = match (&info.sha256, &info.source_sha256) {
-        (Some(sha), _) => ("sha256", sha),
-        (None, Some(sha)) => ("source_sha256", sha),
-        (None, None) => anyhow::bail!(
+    let Some((claim, actual)) = info.digest() else {
+        anyhow::bail!(
             "--expect-sha256 was given, but this model has no digest to check it against \
              (the weights could not be hashed, or this CoreML bundle was converted before \
              its provenance was recorded); an expectation that cannot be verified is \
              refused rather than assumed"
-        ),
+        )
     };
     anyhow::ensure!(
         actual.starts_with(&want),
@@ -278,12 +278,12 @@ pub fn verify_fingerprint(expected: Option<&str>, info: &ModelInfo) -> anyhow::R
 /// 0 every record answered, 2 finished with lines skipped, 3 the CoreML backend
 /// cannot serve this request (so the caller can retry on `--device cpu`), 1
 /// anything else. See PROTOCOL.md; both binaries owe callers the same table.
-pub fn exit_code(program: &str, outcome: anyhow::Result<usize>) -> ExitCode {
+pub fn exit_code(outcome: anyhow::Result<usize>) -> ExitCode {
     match outcome {
         Ok(0) => ExitCode::SUCCESS,
         Ok(_) => ExitCode::from(2),
         Err(e) => {
-            eprintln!("{program}: error: {e:#}");
+            remark!("error: {e:#}");
             if e.chain().any(|c| c.is::<UnsupportedRequest>()) {
                 ExitCode::from(3)
             } else {
@@ -379,16 +379,18 @@ mod tests {
             backend: "cpu",
             precision: "f32",
             sha256: sha256.map(str::to_string),
-            source: None,
-            source_sha256: source_sha256.map(str::to_string),
-            buckets: None,
-            quantization: None,
-            graph_version: None,
+            // `source_sha256` applies only to converted bundles.
+            bundle: source_sha256.map(|sha| crate::Bundle {
+                source: None,
+                source_sha256: Some(sha.to_string()),
+                buckets: vec![512],
+                quantization: "none".to_string(),
+                graph_version: None,
+            }),
             pooling: "mean",
             dim: 512,
-            output_dim: None,
             max_seq_length: 512,
-            score: None,
+            output: crate::Output::Embedding { output_dim: None },
         }
     }
 

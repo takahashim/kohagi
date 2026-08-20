@@ -263,7 +263,8 @@ fn run(args: Args) -> anyhow::Result<usize> {
 }
 
 fn main() -> ExitCode {
-    cli::exit_code("kohagi", run(Args::parse()))
+    kohagi::program::set("kohagi");
+    cli::exit_code(run(Args::parse()))
 }
 
 #[cfg(test)]
