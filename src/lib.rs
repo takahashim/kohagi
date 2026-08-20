@@ -46,6 +46,7 @@ mod fnv;
 mod fused;
 mod model;
 pub mod program;
+mod protocol;
 pub mod rerank;
 pub mod stdio;
 

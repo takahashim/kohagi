@@ -13,7 +13,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::Reranker;
-use crate::stdio::{drive, parse_object, summarize, take_id, take_nonempty_str, Lazy, Records};
+use crate::protocol::{
+    drive, parse_object, summarize, summary_facts, take_id, take_nonempty_str, Lazy, Records,
+};
 use crate::TokenInfo;
 
 #[derive(Serialize)]
@@ -138,10 +140,10 @@ pub fn run(
     let counts = drive(&mut records)?;
     records.out.flush()?;
 
-    let facts = records.model.loaded().map_or_else(
-        || "dim=0".to_string(),
-        |r| crate::stdio::summary_facts(&r.info()),
-    );
+    let facts = records
+        .model
+        .loaded()
+        .map_or_else(|| "dim=0".to_string(), |r| summary_facts(&r.info()));
     summarize(model_label, &facts, &counts);
     Ok(counts.skipped)
 }
@@ -156,6 +158,18 @@ pub fn run(
 /// Like `kohagi --text`, this prints no summary line.
 pub fn run_pairs(reranker: &Reranker, pairs: &[(&str, &str)], report_tokens: bool) -> Result<()> {
     let (scores, tokens) = reranker.score(pairs)?;
+    anyhow::ensure!(
+        scores.len() == pairs.len(),
+        "model returned {} scores for {} pairs",
+        scores.len(),
+        pairs.len()
+    );
+    anyhow::ensure!(
+        tokens.len() == pairs.len(),
+        "model returned token information for {} scores and {} pairs",
+        tokens.len(),
+        pairs.len()
+    );
 
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());

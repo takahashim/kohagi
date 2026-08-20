@@ -7,20 +7,16 @@
 //! so an id's embedding always corresponds to exactly the text that was sent.
 //! stdout carries records only; warnings and the final summary go to stderr.
 
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufWriter, Write};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-use crate::program::remark;
+use crate::protocol::{
+    drive, parse_object, summarize, summary_facts, take_id, take_nonempty_str, Lazy, Records,
+};
 use crate::{Embedder, TokenInfo};
-
-/// Records encoded (and written out) per chunk. Bounds resident memory to one
-/// chunk's texts + embeddings instead of the whole input, while leaving
-/// plenty of rows for length bucketing and the parallel fan-out. Output is
-/// flushed after each chunk, so callers can consume it incrementally.
-const CHUNK_ROWS: usize = 1024;
 
 #[derive(Serialize)]
 struct OutRecord<'a> {
@@ -205,37 +201,6 @@ impl<W: Write> Writer<W> {
     }
 }
 
-/// Parses one JSON object input line. Blank lines mark batch boundaries.
-///
-/// Shared with the reranker because the envelope rules belong to the protocol.
-pub(crate) fn parse_object(line: &str) -> Result<Option<Map<String, Value>>, String> {
-    if line.trim().is_empty() {
-        return Ok(None);
-    }
-    let v: Value = serde_json::from_str(line).map_err(|e| format!("invalid JSON: {e}"))?;
-    match v {
-        Value::Object(obj) => Ok(Some(obj)),
-        _ => Err("not a JSON object".to_string()),
-    }
-}
-
-/// Returns the required opaque record ID.
-pub(crate) fn take_id(obj: &Map<String, Value>) -> Result<Value, String> {
-    Ok(obj.get("id").ok_or("missing \"id\"")?.clone())
-}
-
-/// Returns a required, nonempty string field.
-pub(crate) fn take_nonempty_str(obj: &Map<String, Value>, name: &str) -> Result<String, String> {
-    let s = obj
-        .get(name)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing or non-string \"{name}\""))?;
-    if s.is_empty() {
-        return Err(format!("empty \"{name}\""));
-    }
-    Ok(s.to_string())
-}
-
 /// One accepted input line: the opaque id and the raw text.
 struct InRecord {
     id: Value,
@@ -253,145 +218,6 @@ fn parse_line(line: &str) -> Result<Option<InRecord>, String> {
         id: take_id(&obj)?,
         text: take_nonempty_str(&obj, "text")?,
     }))
-}
-
-/// How many records a chunk produced, and how many of them were truncated.
-pub(crate) struct Flushed {
-    pub written: usize,
-    pub truncated: usize,
-}
-
-/// What a whole run produced, for the summary line.
-pub(crate) struct Counts {
-    pub written: usize,
-    pub skipped: usize,
-    pub truncated: usize,
-}
-
-/// Loads a model only when the first record requires it.
-pub(crate) struct Lazy<M, F> {
-    model: Option<M>,
-    load: F,
-}
-
-impl<M, F: Fn() -> Result<M>> Lazy<M, F> {
-    pub(crate) fn new(load: F) -> Self {
-        Self { model: None, load }
-    }
-
-    /// Returns the model, loading it if needed.
-    pub(crate) fn get(&mut self) -> Result<&M> {
-        if self.model.is_none() {
-            self.model = Some((self.load)()?);
-        }
-        Ok(self.model.as_ref().expect("loaded just above"))
-    }
-
-    /// Returns the model if it has been loaded.
-    pub(crate) fn loaded(&self) -> Option<&M> {
-        self.model.as_ref()
-    }
-}
-
-/// One end of the protocol. [`drive`] handles the shared input loop.
-///
-/// `kohagi` reads `{"id","text"}` and answers with embeddings; `kohagi-rerank`
-/// reads `{"id","query","text"}` and answers with scores. Every other rule is
-/// the same rule — an opaque echoed `id`, a malformed line skipped rather than
-/// fatal, a blank line meaning "answer what I have sent", a blank line back to
-/// mark the reply, output flushed per chunk, and the model loaded on first use
-/// so input with no valid records never loads it. Stated once here, because two
-/// statements of it are two things to keep in step with PROTOCOL.md.
-pub(crate) trait Records {
-    type Record;
-    /// The answer for one record.
-    type Answer;
-
-    /// `Ok(Some)` a record, `Ok(None)` a batch boundary, `Err` a skip reason.
-    fn parse(line: &str) -> Result<Option<Self::Record>, String>;
-
-    /// Answers a chunk and returns matching token information.
-    fn answer(&mut self, chunk: &[Self::Record]) -> Result<(Vec<Self::Answer>, Vec<TokenInfo>)>;
-
-    /// Writes one answered record.
-    fn write(
-        &mut self,
-        record: &Self::Record,
-        answer: &Self::Answer,
-        tokens: &TokenInfo,
-    ) -> Result<()>;
-
-    /// Flushes buffered output.
-    fn flush_output(&mut self) -> Result<()>;
-
-    /// Say that a batch is complete, so a reader knows not to wait for more.
-    fn boundary(&mut self) -> Result<()>;
-
-    /// Answers, writes, and clears a chunk.
-    fn flush(&mut self, chunk: &mut Vec<Self::Record>) -> Result<Flushed> {
-        if chunk.is_empty() {
-            return Ok(Flushed {
-                written: 0,
-                truncated: 0,
-            });
-        }
-        let (answers, tokens) = self.answer(chunk)?;
-
-        let mut truncated = 0usize;
-        for ((record, answer), info) in chunk.iter().zip(&answers).zip(&tokens) {
-            truncated += info.truncated as usize;
-            self.write(record, answer, info)?;
-        }
-        self.flush_output()?;
-
-        let written = chunk.len();
-        chunk.clear();
-        Ok(Flushed { written, truncated })
-    }
-}
-
-/// Read the protocol off stdin and hand it to `records`, chunk by chunk.
-///
-/// Does not write the summary or close the output: both need what the caller
-/// knows and this does not — which model answered, and whether the output shape
-/// has a document to close.
-pub(crate) fn drive<R: Records>(records: &mut R) -> Result<Counts> {
-    let stdin = std::io::stdin();
-    let mut chunk: Vec<R::Record> = Vec::new();
-    let mut counts = Counts {
-        written: 0,
-        skipped: 0,
-        truncated: 0,
-    };
-    let take = |f: Flushed, counts: &mut Counts| {
-        counts.written += f.written;
-        counts.truncated += f.truncated;
-    };
-
-    for (lineno, line) in stdin.lock().lines().enumerate() {
-        let line = line.context("reading stdin")?;
-        match R::parse(&line) {
-            Ok(Some(record)) => {
-                chunk.push(record);
-                if chunk.len() >= CHUNK_ROWS {
-                    take(records.flush(&mut chunk)?, &mut counts);
-                }
-            }
-            // A blank line is the caller saying "that is one batch": answer what
-            // is buffered even though the chunk is short, and mark the boundary
-            // so a reader knows not to wait for more.
-            Ok(None) => {
-                take(records.flush(&mut chunk)?, &mut counts);
-                records.boundary()?;
-            }
-            Err(why) => {
-                counts.skipped += 1;
-                remark!("skip line {}: {why}", lineno + 1);
-            }
-        }
-    }
-    take(records.flush(&mut chunk)?, &mut counts);
-    Ok(counts)
 }
 
 /// The embedding end of the protocol: prefix each text, embed the chunk, write
@@ -471,44 +297,6 @@ pub fn run(
         .map_or_else(|| "dim=0".to_string(), |e| summary_facts(&e.info()));
     summarize(model_label, &facts, &counts);
     Ok(counts.skipped)
-}
-
-/// The stderr line every run ends with, in the one shape a log parser has to
-/// know.
-pub(crate) fn summarize(model_label: &str, facts: &str, counts: &Counts) {
-    let n_in = counts.written + counts.skipped;
-    remark!(
-        "model={model_label} {facts} in={n_in} out={} skipped={} truncated={}",
-        counts.written,
-        counts.skipped,
-        counts.truncated
-    );
-}
-
-/// The model's part of the summary line: which weights, resolved how.
-///
-/// Enough to reconstruct what produced the vectors from a captured log alone —
-/// the fingerprint answers *which* checkpoint, and pooling and max_seq answer
-/// the two settings that silently change every vector when they differ.
-pub(crate) fn summary_facts(info: &crate::ModelInfo) -> String {
-    let mut out = String::new();
-    // A CoreML bundle has no weights of its own to hash, so it reports the
-    // checkpoint it was converted from — under a different key, because it is
-    // a different claim. `ModelInfo::digest` keeps this consistent with
-    // `--expect-sha256`.
-    if let Some((claim, sha)) = info.digest() {
-        out.push_str(&format!("{claim}={} ", crate::fingerprint::short(sha)));
-    }
-    out.push_str(&format!(
-        "pooling={} dim={} max_seq={}",
-        info.pooling,
-        info.reported_dim(),
-        info.max_seq_length
-    ));
-    if let crate::Output::Score { score } = info.output {
-        out.push_str(&format!(" score={score}"));
-    }
-    out
 }
 
 #[cfg(test)]
