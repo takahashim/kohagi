@@ -16,7 +16,7 @@
 //!    worker count is a direct memory multiplier, and SMT siblings only add
 //!    contention to these GEMM-bound forwards.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::encoder::{Config, ModernBert};
@@ -29,7 +29,9 @@ use tokenizers::Tokenizer;
 use crate::batch::{l2_normalize, load_tokenizer, pool_row, BatchInput, Pooling, TokenInfo};
 use crate::config::CoreMlForm;
 use crate::errors::UnsupportedRequest;
+use crate::info::{ModelInfo, Output};
 use crate::program::remark;
+use crate::source::ModelSource;
 
 /// Attention-scratch budget per forward, in `rows * seq^2` elements.
 ///
@@ -145,40 +147,6 @@ pub(crate) fn run_batches<T: Send>(
         .collect()
 }
 
-/// Where the model weights come from.
-pub enum ModelSource {
-    /// A Hugging Face Hub repo, e.g. `cl-nagoya/ruri-v3-130m`. Downloads
-    /// `model.safetensors`, `config.json`, and `tokenizer.json` into the
-    /// standard HF cache (`~/.cache/huggingface`, `HF_HOME` respected) on
-    /// first use; later runs are offline.
-    Hub { repo: String },
-    /// Local files: the safetensors weights and tokenizer.json, with
-    /// `config.json` expected next to the weights. No network access.
-    Files { model: PathBuf, tokenizer: PathBuf },
-    /// A directory of pre-converted CoreML models for [`Backend::CoreML`]:
-    /// one `seq-<N>.mlpackage` per bucket length, plus `tokenizer.json` and
-    /// `config.json`. Only valid with `--device coreml`.
-    CoreMl { dir: PathBuf },
-    /// A Hugging Face Hub repo holding the same CoreML layout (the
-    /// `seq-<N>.mlpackage` buckets plus `tokenizer.json` / `config.json`),
-    /// downloaded into the standard HF cache. Only valid with `--device
-    /// coreml`.
-    CoreMlHub { repo: String },
-    /// A plain checkpoint to convert for [`Backend::CoreML`] on first use, caching
-    /// the bundle so later runs load it directly. What `--device coreml` does when
-    /// given neither `--coreml-dir` nor `--coreml-model-id`.
-    ///
-    /// `checkpoint` is the [`Self::Hub`] or [`Self::Files`] source the CPU path
-    /// would have taken, so the same `--model-id` serves both devices. Needs a
-    /// build with the `coreml-export` feature.
-    CoreMlConvert {
-        checkpoint: Box<ModelSource>,
-        /// Fixed sequence lengths to emit, one CoreML function each.
-        buckets: Vec<usize>,
-        quantize: crate::CoreMlQuantize,
-    },
-}
-
 /// Numeric precision of the forward pass.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Precision {
@@ -241,114 +209,6 @@ impl Precision {
         match self {
             Self::F32 => "f32",
             Self::Bf16 => "bf16",
-        }
-    }
-}
-
-/// What a loaded model is, in the terms a results file should record.
-///
-/// The point of it is [`Self::sha256`]: everything else here can be inferred
-/// from the command line, but which weights actually answered cannot. Written
-/// by `--print-model-info` as one JSON line, and abbreviated into the stderr
-/// summary of every run.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ModelInfo {
-    /// `--device`, as its flag value.
-    pub backend: &'static str,
-    /// `--precision`, as its flag value.
-    pub precision: &'static str,
-    /// sha256 of the `model.safetensors` these weights were loaded from.
-    /// Absent on the CoreML path, which loads a converted bundle instead and
-    /// reports [`Bundle::source_sha256`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
-    /// Metadata for a converted CoreML bundle.
-    #[serde(flatten)]
-    pub bundle: Option<Bundle>,
-    /// The pooling setting resolved at load time.
-    pub pooling: &'static str,
-    /// The model's own dimension, its `hidden_size`.
-    pub dim: usize,
-    pub max_seq_length: usize,
-    /// The value returned for each record.
-    #[serde(flatten)]
-    pub output: Output,
-}
-
-/// Metadata that applies only to a converted CoreML bundle.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct Bundle {
-    /// The checkpoint recorded by the converter.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// sha256 of that checkpoint's weights. `None` for a bundle converted
-    /// before Kohagi recorded it — an unknown provenance says so rather than
-    /// borrowing the bundle's own identity.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_sha256: Option<String>,
-    /// Supported sequence lengths.
-    pub buckets: Vec<usize>,
-    /// Bundle quantization: `embeddings-int8`, `all-int8`, or `none`.
-    pub quantization: String,
-    /// Emitted graph version, when recorded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graph_version: Option<String>,
-}
-
-/// The value returned for each record.
-///
-/// It is flattened and untagged to preserve the existing JSON format.
-///
-/// Serialize only. Do not derive `Deserialize`: the optional field in
-/// [`Output::Embedding`] would make every object match that variant. Use a
-/// tagged or custom representation when reading model info.
-#[derive(Clone, Debug, serde::Serialize)]
-#[serde(untagged)]
-pub enum Output {
-    /// One vector per text.
-    Embedding {
-        /// Output dimension after `--dims`, when it changes the vector size.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        output_dim: Option<usize>,
-    },
-    /// One score per pair, represented as `sigmoid` or `logit`.
-    Score { score: &'static str },
-}
-
-impl ModelInfo {
-    /// Adds metadata from a converted CoreML bundle.
-    #[cfg(feature = "coreml")]
-    pub(crate) fn add_bundle(&mut self, encoder: &crate::coreml::CoreMlEncoder) {
-        let p = encoder.provenance();
-        self.bundle = Some(Bundle {
-            source: p.source,
-            source_sha256: p.source_sha256,
-            // Read the supported lengths from the loaded models.
-            buckets: encoder.buckets(),
-            // A missing quantization key means fp16.
-            quantization: p.quantization.unwrap_or_else(|| "none".to_string()),
-            graph_version: p.graph_version,
-        });
-    }
-
-    /// Returns the digest of the weights used and its field name.
-    pub fn digest(&self) -> Option<(&'static str, &str)> {
-        if let Some(sha) = &self.sha256 {
-            return Some(("sha256", sha));
-        }
-        Some((
-            "source_sha256",
-            self.bundle.as_ref()?.source_sha256.as_deref()?,
-        ))
-    }
-
-    /// Returns the actual embedding dimension.
-    pub fn reported_dim(&self) -> usize {
-        match self.output {
-            Output::Embedding {
-                output_dim: Some(n),
-            } => n,
-            _ => self.dim,
         }
     }
 }
@@ -461,27 +321,12 @@ impl Embedder {
         }
         // The candle path serves the Hub/Files sources; a CoreMl directory has
         // no safetensors to load.
-        let (model_path, tokenizer_path, detected_pooling) = match source {
-            ModelSource::Files { model, tokenizer } => {
-                (model.clone(), tokenizer.clone(), local_pooling(model))
-            }
-            ModelSource::Hub { repo } => {
-                let f = fetch_checkpoint(repo)?;
-                (f.weights, f.tokenizer, f.pooling)
-            }
-            ModelSource::CoreMl { .. }
-            | ModelSource::CoreMlHub { .. }
-            | ModelSource::CoreMlConvert { .. } => {
-                return Err(UnsupportedRequest::new(
-                    "a CoreML model source needs `--device coreml`",
-                )
-                .into())
-            }
-        };
+        let files = source.checkpoint_files()?;
 
-        let pooling = resolve_pooling_warned(opts.pooling, detected_pooling);
+        let pooling = resolve_pooling_warned(opts.pooling, files.pooling);
 
-        let config_path = model_path
+        let config_path = files
+            .weights
             .parent()
             .map(|d| d.join("config.json"))
             .context("model path has no parent dir for config.json")?;
@@ -496,9 +341,9 @@ impl Embedder {
         // about to be memory-mapped, so this reads the same file the forward
         // pass will fault in, and doing it on another thread keeps half a
         // gigabyte of hashing out of the caller's first result.
-        let fingerprint = crate::fingerprint::Fingerprint::spawn(model_path.clone());
-        let weights = load_weights(&model_path, &config, &device, opts.precision)?;
-        let tokenizer = load_tokenizer(&tokenizer_path, opts.max_seq_length)?;
+        let fingerprint = crate::fingerprint::Fingerprint::spawn(files.weights.clone());
+        let weights = load_weights(&files.weights, &config, &device, opts.precision)?;
+        let tokenizer = load_tokenizer(&files.tokenizer, opts.max_seq_length)?;
         Ok(Self {
             engine: Engine::Candle { weights, device },
             tokenizer,
@@ -515,25 +360,9 @@ impl Embedder {
     fn load_coreml(source: &ModelSource, opts: Options) -> Result<Self> {
         // `converted` says whether this run did the conversion, which is when the
         // self-check below is worth its few seconds.
-        let (dir, converted) = match source {
-            ModelSource::CoreMl { dir } => (dir.clone(), false),
-            ModelSource::CoreMlHub { repo } => (
-                crate::coreml::fetch_from_hub(repo, opts.coreml_form)?,
-                false,
-            ),
-            ModelSource::CoreMlConvert {
-                checkpoint,
-                buckets,
-                quantize,
-            } => convert_for_coreml(checkpoint, buckets, *quantize)?,
-            _ => {
-                return Err(UnsupportedRequest::new(
-                    "`--device coreml` needs a CoreML model directory (`--coreml-dir`) \
-                     or Hub repo (`--coreml-model-id`)",
-                )
-                .into())
-            }
-        };
+        let resolved = source.resolve_coreml(opts.coreml_form)?;
+        let dir = resolved.dir;
+        let converted = resolved.converted;
 
         let config: Config = read_config(&dir.join("config.json"))?;
         let dim = config.hidden_size;
@@ -555,7 +384,7 @@ impl Embedder {
 
         let tokenizer = load_tokenizer(&dir.join("tokenizer.json"), opts.max_seq_length)?;
 
-        let pooling = resolve_pooling_warned(opts.pooling, pooling_in_dir(&dir));
+        let pooling = resolve_pooling_warned(opts.pooling, crate::source::pooling_in_dir(&dir));
 
         let embedder = Self {
             engine: Engine::CoreMl(encoder),
@@ -796,7 +625,7 @@ fn embed_row(hidden: &[f32], mask: &[i64], dim: usize, reduce: Reduce) -> Vec<f3
     vector
 }
 
-/// What [`ModelInfo::output_dim`] should claim: a `--dims` that actually
+/// What `output_dim` should claim: a `--dims` that actually
 /// shortened the vectors, and nothing else.
 ///
 /// `--dims` equal to the model's own dimension changes no vector, so it
@@ -847,39 +676,6 @@ pub(crate) fn open_device(backend: Backend) -> Result<Device> {
         ),
         // CoreML is routed to its own loader before open_device is reached.
         Backend::CoreML => unreachable!("CoreML backend does not use a candle Device"),
-    }
-}
-
-/// What a checkpoint's `1_Pooling/config.json` says its pooling is, or `None`
-/// when it publishes neither a cls nor a mean flag (or has no such file).
-///
-/// Two spellings are in circulation. sentence-transformers 5 writes a single
-/// `pooling_mode` string; every earlier version wrote one `pooling_mode_*` bool
-/// per mode, which is still what most checkpoints on the Hub carry. Both are
-/// read, because a 5.x checkpoint judged by the older rule alone looks like a
-/// checkpoint with no pooling config at all — and that reads as mean, which is
-/// silently wrong for a cls model.
-///
-/// Only the two Kohagi supports are read; a checkpoint pooling some other way
-/// (max, weighted mean) reads as `None`, the same as no file at all, which is
-/// the honest answer since Kohagi cannot reproduce it. A checkpoint combining
-/// several modes writes an array there, which is not a string and so takes the
-/// same path.
-fn pooling_from_st_config(json: &str) -> Option<Pooling> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    if let Some(mode) = v.get("pooling_mode").and_then(|m| m.as_str()) {
-        return match mode {
-            "cls" => Some(Pooling::Cls),
-            "mean" => Some(Pooling::Mean),
-            _ => None,
-        };
-    }
-    if v.get("pooling_mode_cls_token")? == &serde_json::Value::Bool(true) {
-        Some(Pooling::Cls)
-    } else if v.get("pooling_mode_mean_tokens")? == &serde_json::Value::Bool(true) {
-        Some(Pooling::Mean)
-    } else {
-        None
     }
 }
 
@@ -980,156 +776,6 @@ pub(crate) fn parse_config<T: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<T> {
     serde_json::from_value(json).with_context(|| format!("cannot parse {}", path.display()))
-}
-
-/// Convert a checkpoint for the ANE, or reuse the cached bundle, and return the
-/// directory to load from.
-///
-/// The result has the layout `--coreml-dir` expects, so the caller carries on
-/// through the ordinary directory loader — which is what keeps `check_io` and the
-/// compile cache in the path.
-#[cfg(all(feature = "coreml", feature = "coreml-export"))]
-pub(crate) fn convert_for_coreml(
-    checkpoint: &ModelSource,
-    buckets: &[usize],
-    quantize: crate::CoreMlQuantize,
-) -> Result<(PathBuf, bool)> {
-    use crate::coreml::autoconvert;
-
-    let resolved = match checkpoint {
-        ModelSource::Hub { repo } => {
-            // The download dominates a first run on a machine that has never used
-            // the CPU path, and hf-hub is silent about it, so say so before
-            // starting. Nothing is printed when the cache already has the files.
-            if !hub_checkpoint_is_cached(repo) {
-                remark!("downloading {repo} (safetensors; first run only) ...");
-            }
-            let files = fetch_checkpoint(repo)?;
-            crate::coreml_export::Checkpoint {
-                config: beside(&files.weights, "config.json")?,
-                weights: files.weights,
-                tokenizer: files.tokenizer,
-                pooling: files.pooling_file,
-                source: repo.clone(),
-            }
-        }
-        ModelSource::Files { model, tokenizer } => crate::coreml_export::Checkpoint {
-            config: beside(model, "config.json")?,
-            weights: model.clone(),
-            tokenizer: tokenizer.clone(),
-            pooling: model
-                .parent()
-                .map(|d| d.join("1_Pooling").join("config.json"))
-                .filter(|p| p.is_file()),
-            source: model.display().to_string(),
-        },
-        // `Args::source` only ever wraps a checkpoint source.
-        _ => {
-            return Err(UnsupportedRequest::new(
-                "`--device coreml` can convert a checkpoint (`--model-id` or \
-                 `--model-path`), not another CoreML model",
-            )
-            .into())
-        }
-    };
-    let provisioned = autoconvert::provision(&resolved, buckets, quantize)?;
-    Ok((
-        provisioned.path().to_path_buf(),
-        matches!(provisioned, autoconvert::Provisioned::Converted(_)),
-    ))
-}
-
-#[cfg(all(feature = "coreml", not(feature = "coreml-export")))]
-pub(crate) fn convert_for_coreml(
-    _checkpoint: &ModelSource,
-    _buckets: &[usize],
-    _quantize: crate::CoreMlQuantize,
-) -> Result<(PathBuf, bool)> {
-    Err(UnsupportedRequest::new(
-        "this binary cannot convert checkpoints for CoreML; pass an already \
-         converted model with `--coreml-dir` or `--coreml-model-id`, or rebuild \
-         with `--features coreml,coreml-export`",
-    )
-    .into())
-}
-
-/// Whether the Hub cache already holds this checkpoint's weights, so that the
-/// "downloading" notice is only printed when there is a download to wait for.
-///
-/// Asks hf-hub for the file without hitting the network; a miss (or a cache layout
-/// this cannot read) errs towards printing the notice, which costs a line rather
-/// than a wrong wait.
-#[cfg(all(feature = "coreml", feature = "coreml-export"))]
-fn hub_checkpoint_is_cached(repo: &str) -> bool {
-    hf_hub::Cache::default()
-        .model(repo.to_string())
-        .get("model.safetensors")
-        .is_some()
-}
-
-/// A sibling of `path`, for the `config.json` that has to sit beside the weights.
-#[cfg(all(feature = "coreml", feature = "coreml-export"))]
-fn beside(path: &Path, name: &str) -> Result<PathBuf> {
-    path.parent()
-        .map(|d| d.join(name))
-        .with_context(|| format!("{} has no parent directory for {name}", path.display()))
-}
-
-/// What a Hub checkpoint download produced.
-pub(crate) struct Fetched {
-    pub(crate) weights: PathBuf,
-    pub(crate) tokenizer: PathBuf,
-    /// `1_Pooling/config.json` in the cache, when the checkpoint ships one. Kept as
-    /// a path as well as parsed, because the CoreML converter copies the file into
-    /// the bundle it writes.
-    #[cfg_attr(
-        not(all(feature = "coreml", feature = "coreml-export")),
-        allow(dead_code)
-    )]
-    pooling_file: Option<PathBuf>,
-    pooling: Option<Pooling>,
-}
-
-/// Download (or reuse from the HF cache) the files a model needs, plus its
-/// declared pooling if the checkpoint ships one.
-pub(crate) fn fetch_checkpoint(repo: &str) -> Result<Fetched> {
-    let api = hf_hub::api::sync::Api::new().context("initializing Hugging Face Hub client")?;
-    let repo = api.model(repo.to_string());
-    let get = |f: &str| {
-        repo.get(f)
-            .with_context(|| format!("cannot fetch {f} (network down? try local --model-path)"))
-    };
-    let weights = get("model.safetensors")?;
-    get("config.json")?; // lands next to the weights in the cache
-    let tokenizer = get("tokenizer.json")?;
-    // Optional: many checkpoints ship it, rerankers and base LMs do not, and a
-    // 404 here is information rather than an error.
-    let pooling_file = repo.get("1_Pooling/config.json").ok();
-    let pooling = pooling_file
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| pooling_from_st_config(&s));
-    Ok(Fetched {
-        weights,
-        tokenizer,
-        pooling_file,
-        pooling,
-    })
-}
-
-/// The declared pooling in a checkpoint directory, read from its
-/// `1_Pooling/config.json` if present. The one place the `1_Pooling/config.json`
-/// path convention lives for on-disk checkpoints (the Hub path fetches it
-/// through the API instead).
-fn pooling_in_dir(dir: &Path) -> Option<Pooling> {
-    let text = std::fs::read_to_string(dir.join("1_Pooling").join("config.json")).ok()?;
-    pooling_from_st_config(&text)
-}
-
-/// The declared pooling of a local model, read from `1_Pooling/config.json`
-/// beside the weights if present.
-fn local_pooling(model_path: &Path) -> Option<Pooling> {
-    pooling_in_dir(model_path.parent()?)
 }
 
 pub(crate) fn load_weights(
@@ -1335,43 +981,6 @@ mod pooling_tests {
     fn cuda_request_without_feature_explains_how_to_enable_it() {
         let err = open_device(Backend::Cuda).unwrap_err().to_string();
         assert!(err.contains("--features cuda"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn reads_cls_and_mean_from_st_config() {
-        let cls = r#"{"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false}"#;
-        let mean = r#"{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}"#;
-        assert_eq!(pooling_from_st_config(cls), Some(Pooling::Cls));
-        assert_eq!(pooling_from_st_config(mean), Some(Pooling::Mean));
-    }
-
-    #[test]
-    fn reads_cls_and_mean_from_the_5x_st_config() {
-        // What sentence-transformers 5 saves, and so what a model fine-tuned
-        // today ships: one string in place of the per-mode bools.
-        let cls = r#"{"embedding_dimension": 512, "pooling_mode": "cls"}"#;
-        let mean = r#"{"embedding_dimension": 512, "pooling_mode": "mean",
-                       "include_prompt": true}"#;
-        assert_eq!(pooling_from_st_config(cls), Some(Pooling::Cls));
-        assert_eq!(pooling_from_st_config(mean), Some(Pooling::Mean));
-    }
-
-    #[test]
-    fn unsupported_or_absent_pooling_reads_as_none() {
-        // A mode Kohagi cannot reproduce, and junk, both decline rather than guess.
-        let other = r#"{"pooling_mode_max_tokens": true}"#;
-        assert_eq!(pooling_from_st_config(other), None);
-        assert_eq!(pooling_from_st_config("not json"), None);
-    }
-
-    #[test]
-    fn unsupported_or_combined_pooling_reads_as_none_in_the_5x_config() {
-        let weighted = r#"{"pooling_mode": "weightedmean"}"#;
-        // Several modes at once are concatenated into one vector; the array is
-        // not a string, and Kohagi has no way to reproduce the result anyway.
-        let combined = r#"{"pooling_mode": ["mean", "cls"]}"#;
-        assert_eq!(pooling_from_st_config(weighted), None);
-        assert_eq!(pooling_from_st_config(combined), None);
     }
 
     #[test]

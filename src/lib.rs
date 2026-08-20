@@ -44,13 +44,17 @@ mod fingerprint;
 #[cfg(any(feature = "coreml", test))]
 mod fnv;
 mod fused;
+mod info;
 mod model;
 pub mod program;
 mod protocol;
 pub mod rerank;
+mod source;
 pub mod stdio;
 
 pub use batch::{Pooling, TokenInfo};
 pub use config::{CoreMlForm, CoreMlQuantize};
 pub use errors::UnsupportedRequest;
-pub use model::{Backend, Bundle, Embedder, ModelInfo, ModelSource, Options, Output, Precision};
+pub use info::{Bundle, ModelInfo, Output};
+pub use model::{Backend, Embedder, Options, Precision};
+pub use source::ModelSource;

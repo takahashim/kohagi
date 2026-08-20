@@ -29,11 +29,13 @@ use crate::config::head as names;
 use crate::encoder::{Activation, Config};
 use crate::errors::UnsupportedRequest;
 use crate::fingerprint::Fingerprint;
+use crate::info::{ModelInfo, Output};
 use crate::model::{
-    check_precision, fetch_checkpoint, load_weights, open_device, parse_config, read_config_json,
-    run_batches, Backend, ModelInfo, ModelSource, Output, Precision, Weights,
+    check_precision, load_weights, open_device, parse_config, read_config_json, run_batches,
+    Backend, Precision, Weights,
 };
 use crate::program::remark;
+use crate::source::ModelSource;
 
 /// Knobs for [`Reranker::load`]. `Default` matches the Ruri v3 reranker.
 #[derive(Clone, Copy)]
@@ -264,21 +266,11 @@ impl Reranker {
         if opts.backend == Backend::CoreML {
             return Self::load_coreml(source, opts);
         }
-        let (model_path, tokenizer_path) = match source {
-            ModelSource::Files { model, tokenizer } => (model.clone(), tokenizer.clone()),
-            ModelSource::Hub { repo } => {
-                let fetched = fetch_checkpoint(repo)?;
-                (fetched.weights, fetched.tokenizer)
-            }
-            _ => {
-                return Err(UnsupportedRequest::new(
-                    "a CoreML model source needs `--device coreml`",
-                )
-                .into())
-            }
-        };
+        // Cross-encoders use `classifier_pooling`, not `1_Pooling`.
+        let files = source.checkpoint_files()?;
 
-        let config_path = model_path
+        let config_path = files
+            .weights
             .parent()
             .map(|d| d.join("config.json"))
             .context("model path has no parent dir for config.json")?;
@@ -287,12 +279,12 @@ impl Reranker {
         check_precision(opts.backend, opts.precision)?;
 
         let device = open_device(opts.backend)?;
-        let fingerprint = Fingerprint::spawn(model_path.clone());
-        let weights = load_weights(&model_path, &config.encoder, &device, opts.precision)?;
+        let fingerprint = Fingerprint::spawn(files.weights.clone());
+        let weights = load_weights(&files.weights, &config.encoder, &device, opts.precision)?;
         // A second view of the same file, on the CPU: the head runs there
         // whatever the encoder runs on.
-        let head = Head::load(&cpu_weights(&model_path)?, &config.encoder, &config.head)?;
-        let tokenizer = load_tokenizer(&tokenizer_path, opts.max_seq_length)?;
+        let head = Head::load(&cpu_weights(&files.weights)?, &config.encoder, &config.head)?;
+        let tokenizer = load_tokenizer(&files.tokenizer, opts.max_seq_length)?;
 
         Ok(Self {
             engine: Engine::Candle { weights, device },
@@ -314,24 +306,7 @@ impl Reranker {
     /// CPU — the same code the other backends run.
     #[cfg(feature = "coreml")]
     fn load_coreml(source: &ModelSource, opts: Options) -> Result<Self> {
-        let dir = match source {
-            ModelSource::CoreMl { dir } => dir.clone(),
-            ModelSource::CoreMlHub { repo } => {
-                crate::coreml::fetch_from_hub(repo, opts.coreml_form)?
-            }
-            ModelSource::CoreMlConvert {
-                checkpoint,
-                buckets,
-                quantize,
-            } => crate::model::convert_for_coreml(checkpoint, buckets, *quantize)?.0,
-            _ => {
-                return Err(UnsupportedRequest::new(
-                    "`--device coreml` needs a CoreML bundle (`--coreml-dir`), a Hub repo \
-                     (`--coreml-model-id`), or a checkpoint to convert (`--model-id`)",
-                )
-                .into())
-            }
-        };
+        let dir = source.resolve_coreml(opts.coreml_form)?.dir;
 
         let config = resolve_config(&dir.join("config.json"))?;
 
