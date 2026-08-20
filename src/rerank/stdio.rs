@@ -27,6 +27,9 @@ struct OutRecord<'a> {
     truncated: Option<bool>,
 }
 
+/// Writes one output record as a JSONL line. Both the stdio loop and `--pair`
+/// use this output format. `tokens` is present only with `--report-tokens`,
+/// which adds the `n_tokens` and `truncated` fields.
 fn write_record(
     out: &mut impl Write,
     id: &Value,
@@ -160,6 +163,31 @@ pub fn run(
     );
     summarize("kohagi-rerank", model_label, &facts, &counts);
     Ok(counts.skipped)
+}
+
+/// Scores command-line pairs (`--pair`) instead of stdin input and writes
+/// records as [`run`] does, using the pair positions as IDs.
+///
+/// Keeping the output code here ensures both paths use the same format. The
+/// binary would otherwise use `serde_json::json!`, which converts `f32` scores
+/// to `f64` and can print them differently.
+///
+/// Like `kohagi --text`, this prints no summary line.
+pub fn run_pairs(reranker: &Reranker, pairs: &[(&str, &str)], report_tokens: bool) -> Result<()> {
+    let (scores, tokens) = reranker.score(pairs)?;
+
+    let stdout = std::io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    for (id, (&score, info)) in scores.iter().zip(&tokens).enumerate() {
+        write_record(
+            &mut out,
+            &Value::from(id),
+            score,
+            report_tokens.then_some(info),
+        )?;
+    }
+    out.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]

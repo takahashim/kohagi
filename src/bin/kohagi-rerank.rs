@@ -140,19 +140,16 @@ fn load_checked(args: &Args, source: &ModelSource) -> anyhow::Result<Reranker> {
     Ok(reranker)
 }
 
-/// `--pair` mode: score the arguments and print what stdio mode would, with
-/// the pair positions as ids.
-fn score_arguments(args: &Args, reranker: &Reranker) -> anyhow::Result<()> {
-    let pairs: Vec<(&str, &str)> = args
-        .pair
-        .chunks(2)
+/// `--pair` mode: send argument pairs to the protocol, which writes them like
+/// stdin input.
+fn score_arguments(pair: &[String], reranker: &Reranker, report_tokens: bool) -> anyhow::Result<()> {
+    // `num_args = 2` accepts exactly two values or rejects the flag, so this
+    // slice has an even length and `chunks_exact` leaves no remainder.
+    let pairs: Vec<(&str, &str)> = pair
+        .chunks_exact(2)
         .map(|p| (p[0].as_str(), p[1].as_str()))
         .collect();
-    let (scores, _) = reranker.score(&pairs)?;
-    for (id, score) in scores.iter().enumerate() {
-        println!("{}", serde_json::json!({"id": id, "score": score}));
-    }
-    Ok(())
+    rerank::stdio::run_pairs(reranker, &pairs, report_tokens)
 }
 
 fn run(args: Args) -> anyhow::Result<usize> {
@@ -163,7 +160,7 @@ fn run(args: Args) -> anyhow::Result<usize> {
         if args.print_model_info {
             cli::print_model_info(&label, &reranker.info())?;
         } else {
-            score_arguments(&args, &reranker)?;
+            score_arguments(&args.pair, &reranker, args.report_tokens)?;
         }
         return Ok(0);
     }
