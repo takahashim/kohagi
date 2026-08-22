@@ -348,6 +348,7 @@ impl Embedder {
         let config: Config = read_config(&config_path)?;
         let dim = config.hidden_size;
         check_dims(opts.dims, dim)?;
+        check_max_seq(opts.max_seq_length, config.max_position_embeddings)?;
 
         check_precision(opts.backend, opts.precision)?;
 
@@ -669,6 +670,26 @@ fn check_dims(dims: Option<usize>, dim: usize) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a `--max-seq-length` the model has no positions for.
+///
+/// The rotary tables are built at load with one entry per position the config
+/// declares, so a longer input reaches past them and candle reports a shape
+/// mismatch from inside the attention (`inconsistent last dim size in rope`).
+/// That is an error either way, but only after the model is loaded and the
+/// input tokenized, and it names candle's tensors rather than the flag.
+///
+/// The CoreML path does not need this: a bundle serves the lengths it was
+/// converted for, and `--max-seq-length` past the largest is already refused
+/// with the bucket list, which is the more useful of the two messages.
+pub(crate) fn check_max_seq(max_seq_length: usize, positions: usize) -> Result<()> {
+    anyhow::ensure!(
+        max_seq_length <= positions,
+        "--max-seq-length {max_seq_length} is longer than this model has positions for \
+         ({positions}); lower it, and split the text if all of it has to be embedded"
+    );
+    Ok(())
+}
+
 /// Open the requested device, failing with a fixable message rather than a
 /// silent fallback — a run that quietly lands on the CPU looks like a Metal
 /// benchmark result.
@@ -957,6 +978,18 @@ mod dims_tests {
             let e = check_dims(Some(bad), 512).unwrap_err().to_string();
             assert!(e.contains("512"), "should name the model dim: {e}");
         }
+    }
+
+    /// Ruri v3 has 8192 positions, and one token past them used to fail inside
+    /// candle's rotary embedding, after the model had loaded and the input had
+    /// been tokenized.
+    #[test]
+    fn a_length_past_the_models_positions_is_refused_with_the_limit_named() {
+        assert!(check_max_seq(512, 8192).is_ok());
+        assert!(check_max_seq(8192, 8192).is_ok());
+        let e = check_max_seq(8193, 8192).unwrap_err().to_string();
+        assert!(e.contains("8192"), "should name the model's limit: {e}");
+        assert!(e.contains("8193"), "should name what was asked for: {e}");
     }
 
     /// The combination is refused before any file is opened, so the error is

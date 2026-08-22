@@ -31,8 +31,8 @@ use crate::errors::UnsupportedRequest;
 use crate::fingerprint::Fingerprint;
 use crate::info::{ModelInfo, Output};
 use crate::model::{
-    check_precision, load_weights, open_device, parse_config, read_config_json, run_batches,
-    Backend, Precision, Weights,
+    check_max_seq, check_precision, load_weights, open_device, parse_config, read_config_json,
+    run_batches, Backend, Precision, Weights,
 };
 use crate::program::remark;
 use crate::source::ModelSource;
@@ -279,6 +279,7 @@ impl Reranker {
             .context("model path has no parent dir for config.json")?;
         let config = resolve_config(&config_path)?;
 
+        check_max_seq(opts.max_seq_length, config.encoder.max_position_embeddings)?;
         check_precision(opts.backend, opts.precision)?;
 
         let device = open_device(opts.backend)?;

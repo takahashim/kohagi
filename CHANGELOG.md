@@ -21,6 +21,12 @@
   Vectors are unchanged to f32 rounding (worst 1.8e-6 against values reaching
   1.0), so an index built with 0.6.0 does not need rebuilding.
 
+### Fixed
+
+- **`--max-seq-length` past the model's position count is refused at load.** It
+  used to fail inside candle's rotary embedding, after the model had loaded and
+  the input had been tokenized, naming tensors rather than the flag.
+
 ## [0.6.0] - 2026-08-18
 
 ### Added
