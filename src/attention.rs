@@ -18,7 +18,7 @@
 /// leaves out are masked shut, so they contribute `exp(-inf)`, which is an
 /// exact zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Block {
+pub(crate) struct Block {
     pub(crate) seq: usize,
     pub(crate) q0: usize,
     pub(crate) queries: usize,
@@ -33,13 +33,13 @@ impl Block {
     /// Only the bf16 encoder asks for it by name; the f32 one arrives at the
     /// same block through [`blocks`].
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    pub fn full(seq: usize) -> Self {
+    pub(crate) fn full(seq: usize) -> Self {
         Self::tile(seq, 0, seq)
     }
 
     /// A block of queries against every key: what a global layer needs when
     /// the sequence is too long to score in one piece.
-    pub fn tile(seq: usize, q0: usize, queries: usize) -> Self {
+    pub(crate) fn tile(seq: usize, q0: usize, queries: usize) -> Self {
         debug_assert!(queries > 0 && q0 + queries <= seq);
         Self {
             seq,
@@ -57,7 +57,7 @@ impl Block {
     /// block as a whole needs the union of those, clamped to the sequence.
     /// Covering every open key is what lets the caller drop the rest of the
     /// row.
-    pub fn band(seq: usize, q0: usize, queries: usize, window: usize) -> Self {
+    pub(crate) fn band(seq: usize, q0: usize, queries: usize, window: usize) -> Self {
         debug_assert!(queries > 0 && q0 + queries <= seq);
         let k0 = q0.saturating_sub(window);
         let last = (q0 + queries - 1 + window).min(seq - 1);
@@ -71,23 +71,23 @@ impl Block {
     }
 
     /// How many queries this block covers, for the caller sizing its buffers.
-    pub fn queries(&self) -> usize {
+    pub(crate) fn queries(&self) -> usize {
         self.queries
     }
 
     /// Where the block's keys start, and how many there are.
-    pub fn keys(&self) -> (usize, usize) {
+    pub(crate) fn keys(&self) -> (usize, usize) {
         (self.k0, self.keys)
     }
 
     /// Where the block's queries start.
-    pub fn q0(&self) -> usize {
+    pub(crate) fn q0(&self) -> usize {
         self.q0
     }
 
     /// Whether this block is the entire score matrix, which is the one case a
     /// caller can compute without narrowing anything or concatenating after.
-    pub fn is_full(&self) -> bool {
+    pub(crate) fn is_full(&self) -> bool {
         self.queries == self.seq && self.keys == self.seq
     }
 }
@@ -117,6 +117,50 @@ pub(crate) fn blocks(
 /// wants the band to be a real fraction of the row.
 pub(crate) fn banding_pays(seq: usize, window: usize) -> bool {
     seq > 2 * (2 * window + 1)
+}
+
+/// How one layer's queries are walked, and whether its keys are narrowed.
+///
+/// Two widths go in because two things bound a block, and they are unrelated:
+/// `tile` is what the score budget allows when every key is read, and `band` is
+/// what measured fastest when only the window's keys are. Which applies is this
+/// function's decision, and the only one: a caller that made it itself would be
+/// the second place [`banding_pays`] is consulted.
+pub(crate) fn plan(seq: usize, window: Option<usize>, tile: usize, band: usize) -> Plan {
+    match window {
+        Some(w) if banding_pays(seq, w) => Plan {
+            blocks: blocks(seq, band, Some(w)).collect(),
+            width: band,
+            banded: true,
+        },
+        _ => Plan {
+            blocks: blocks(seq, tile, None).collect(),
+            width: tile,
+            banded: false,
+        },
+    }
+}
+
+/// The blocks one layer runs, and the shape they came out of.
+pub(crate) struct Plan {
+    pub(crate) blocks: Vec<Block>,
+    /// Queries per block before the last one is cut short. A banded layer's
+    /// window mask repeats at this width, which is what lets it be built once.
+    pub(crate) width: usize,
+    /// Whether the keys were narrowed to the window, as opposed to a window
+    /// that has to be masked because every key is read anyway.
+    pub(crate) banded: bool,
+}
+
+impl Plan {
+    /// The one block that covers everything, when there is one. That case skips
+    /// every narrow and the concatenation, so it is worth knowing about.
+    pub(crate) fn whole(&self) -> Option<Block> {
+        match self.blocks[..] {
+            [only] if only.is_full() => Some(only),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

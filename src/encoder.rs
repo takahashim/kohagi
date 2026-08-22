@@ -272,14 +272,75 @@ enum Qkv {
     Split { q: Linear, k: Linear, v: Linear },
 }
 
+/// Which attention this model runs.
+///
+/// Resolved once, from the device, at load. Three things follow from it and
+/// have to agree: how the QKV projection is stored, which form the masks take,
+/// and how wide a block of scores may be. Asking the device once and keeping
+/// the answer is what makes them agree — asked separately they could disagree,
+/// and the failure would be a silently slow path or a mask the kernel cannot
+/// read, rather than an error.
+#[derive(Clone, Copy)]
+enum Attn {
+    /// Metal, whose sdpa fuses the whole attention and takes one dense mask.
+    Fused,
+    /// Everywhere else: query blocks over a mask kept in pieces. Carries the
+    /// scores one block may hold, which is not the same number on the CPU as on
+    /// a GPU running the same path.
+    Blocked { budget: usize },
+}
+
+impl Attn {
+    fn of(device: &Device) -> Self {
+        if device.is_metal() {
+            Self::Fused
+        } else if device.is_cuda() {
+            Self::Blocked {
+                budget: crate::model::GPU_ATTN_BUDGET,
+            }
+        } else {
+            Self::Blocked {
+                budget: crate::model::ATTN_BUDGET,
+            }
+        }
+    }
+
+    /// The global and local masks, in the form this attention consumes.
+    ///
+    /// The only place a [`Mask`] is built, which is what ties its form to the
+    /// rest of the choices above rather than to a second reading of the device.
+    fn masks(self, mask: &Tensor, seq: usize, window: usize, dev: &Device) -> Result<(Mask, Mask)> {
+        Ok(match self {
+            Self::Fused => {
+                let padding = prepare_4d_attention_mask(mask, DType::F32, None)?.to_device(dev)?;
+                // Summed once here rather than in each of the 13 local layers:
+                // the sliding-window mask and the padding mask are identical
+                // across layers, so their sum is too.
+                let sliding = get_local_attention_mask(seq, window, dev)?;
+                let local = padding.broadcast_add(&sliding)?;
+                (Mask::Dense(padding), Mask::Dense(local))
+            }
+            Self::Blocked { .. } => {
+                let keys = padding_mask(mask, DType::F32)?.to_device(dev)?;
+                (
+                    Mask::Blocked {
+                        keys: keys.clone(),
+                        window: None,
+                    },
+                    Mask::Blocked {
+                        keys,
+                        window: Some(window),
+                    },
+                )
+            }
+        })
+    }
+}
+
 /// What one layer's attention may attend to.
 ///
-/// The two forms are the backend dispatch. Metal's fused sdpa takes one dense
-/// `[b, 1, s, s]` additive mask; everywhere else the mask arrives in pieces,
-/// because summing them into that shape is itself an `s^2` tensor and the point
-/// of the tiled path is that no such tensor exists. Which form is built is
-/// decided once, in [`ModernBert::forward`], alongside the QKV layout
-/// [`ModernBertAttention::load`] picks for the same reason.
+/// Built only by [`Attn::masks`], so the form always matches the attention that
+/// will read it.
 enum Mask {
     /// Padding and window already summed, as sdpa wants them.
     Dense(Tensor),
@@ -288,7 +349,7 @@ enum Mask {
     /// [`attend_block`], which is what keeps either from being an `s^2` tensor,
     /// and the half-width is also what lets that path skip the keys the window
     /// shuts out instead of masking them.
-    Tiled { keys: Tensor, window: Option<usize> },
+    Blocked { keys: Tensor, window: Option<usize> },
 }
 
 #[derive(Clone)]
@@ -310,15 +371,21 @@ struct ModernBertAttention {
     num_attention_heads: usize,
     attention_head_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
+    attn: Attn,
 }
 
 impl ModernBertAttention {
-    fn load(vb: VarBuilder, config: &Config, rotary_emb: Arc<RotaryEmbedding>) -> Result<Self> {
+    fn load(
+        vb: VarBuilder,
+        config: &Config,
+        rotary_emb: Arc<RotaryEmbedding>,
+        attn: Attn,
+    ) -> Result<Self> {
         let num_attention_heads = config.num_attention_heads;
         let attention_head_size = config.hidden_size / config.num_attention_heads;
 
         let qkv = linear_no_bias(config.hidden_size, config.hidden_size * 3, vb.pp("Wqkv"))?;
-        let qkv = if vb.device().is_metal() {
+        let qkv = if matches!(attn, Attn::Fused) {
             // Linear weights are [out, in]; the fused Wqkv concatenates q, k
             // and v along the output axis, so the split is by rows.
             let w = qkv.weight();
@@ -339,6 +406,7 @@ impl ModernBertAttention {
             num_attention_heads,
             attention_head_size,
             rotary_emb,
+            attn,
         })
     }
 
@@ -404,14 +472,24 @@ impl ModernBertAttention {
                 ))?;
                 candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
             }
-            Mask::Tiled { keys, window } => {
+            Mask::Blocked { keys, window } => {
                 // The matmul cannot consume the transposed views, and there is
                 // no sdpa to hand them to, so materialize here rather than
                 // paying for it on both backends.
                 let (q, k, v) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
                 let q = (q * scale)?;
-                let tile = query_tile(seq_len, q.device());
-                attend_tiled(&q, &k, &v, keys, *window, tile)?
+                let budget = match self.attn {
+                    Attn::Blocked { budget } => budget,
+                    // `Mask::Blocked` is built only by `Attn::Blocked::masks`.
+                    Attn::Fused => unreachable!("a fused attention has no blocks"),
+                };
+                let plan = crate::attention::plan(
+                    seq_len,
+                    *window,
+                    query_tile(seq_len, budget),
+                    BAND_BLOCK,
+                );
+                attend_blocked(&q, &k, &v, keys, *window, &plan)?
             }
         };
 
@@ -463,35 +541,118 @@ const BAND_BLOCK: usize = 32;
 /// the same shapes come out bit-identical under one Accelerate and a few ULP
 /// apart under another. The tests measure the distance rather than assert the
 /// bits.
-fn attend_tiled(
+fn attend_blocked(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     keys: &Tensor,
     window: Option<usize>,
-    tile: usize,
+    plan: &crate::attention::Plan,
 ) -> Result<Tensor> {
-    let (_, _, seq, _) = q.dims4()?;
-    // Banding sets its own block width: the budget is not what limits it, since
-    // a band is `width * (width + 2w)` scores however long the sequence is.
-    let banded = matches!(window, Some(w) if crate::attention::banding_pays(seq, w));
-    let width = if banded { BAND_BLOCK } else { tile };
-    let blocks: Vec<_> =
-        crate::attention::blocks(seq, width, if banded { window } else { None }).collect();
+    let windows = Windows::new(window, plan, q.device())?;
 
-    // One block covering everything is the dense path, with no narrow, no copy
-    // and no concatenation: the settings measured at 512 tokens are the ones
-    // still running there.
-    if let [whole] = blocks[..] {
-        if whole.is_full() {
-            return attend_block(q, k, v, keys, window, whole);
-        }
+    // One block covering everything skips the narrows and the concatenation:
+    // the settings measured at 512 tokens are the ones still running there.
+    if let Some(whole) = plan.whole() {
+        return attend_block(q, k, v, keys, windows.of(&whole)?.as_ref(), whole);
     }
-    let mut out = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        out.push(attend_block(q, k, v, keys, window, block)?);
+    let mut out = Vec::with_capacity(plan.blocks.len());
+    for block in &plan.blocks {
+        let mask = windows.of(block)?;
+        out.push(attend_block(q, k, v, keys, mask.as_ref(), *block)?);
     }
     Tensor::cat(&out, 2)
+}
+
+/// Where a block's slice of the sliding-window mask comes from.
+///
+/// A banded layer's blocks all reach the same way — `window` keys to the left
+/// and to the right of their own queries — so the mask depends on the offset
+/// between a block's first query and its first key, not on where in the
+/// sequence the block sits. One table therefore serves every block, the ends
+/// included: they take a shifted or shortened view of it. That matters because
+/// a banded 8192-token layer has 256 blocks, and building a mask for each would
+/// be 256 allocations and 256 host-to-device copies per layer.
+///
+/// A layer that is windowed but not banded reads every key, so its blocks do
+/// not repeat and there is nothing to share. It has one block in every case
+/// Kohagi's models produce (a window too wide to band by is a window nearly as
+/// wide as the sequence, and a sequence that short fits one tile), so building
+/// per block costs one build.
+enum Windows {
+    None,
+    /// The `[width, width + 2 * window]` table every banded block views.
+    Table {
+        table: Tensor,
+        window: usize,
+    },
+    PerBlock {
+        window: usize,
+        device: Device,
+    },
+}
+
+impl Windows {
+    fn new(window: Option<usize>, plan: &crate::attention::Plan, device: &Device) -> Result<Self> {
+        Ok(match window {
+            None => Self::None,
+            Some(window) if plan.banded => Self::Table {
+                table: window_mask(plan.width, window, window, plan.width + 2 * window, device)?,
+                window,
+            },
+            Some(window) => Self::PerBlock {
+                window,
+                device: device.clone(),
+            },
+        })
+    }
+
+    /// This block's `[queries, keys]` additive mask, or `None` where the layer
+    /// has no window at all.
+    fn of(&self, block: &crate::attention::Block) -> Result<Option<Tensor>> {
+        let (k0, keys) = block.keys();
+        let offset = block.q0() - k0;
+        Ok(match self {
+            Self::None => None,
+            // Entry `(i, j)` of the block is `|i - j + offset| <= window`, and
+            // of the table `|i - j + window| <= window`, so the block's row of
+            // the table starts `window - offset` columns in.
+            Self::Table { table, window } => Some(table.narrow(0, 0, block.queries())?.narrow(
+                1,
+                window - offset,
+                keys,
+            )?),
+            Self::PerBlock { window, device } => {
+                Some(window_mask(block.queries(), offset, *window, keys, device)?)
+            }
+        })
+    }
+}
+
+/// An additive sliding-window mask: 0 where a query can reach a key, `-inf`
+/// where the window shuts it out.
+///
+/// `offset` is how far the first query is past the first key, which is what
+/// places the band inside the `[queries, keys]` rectangle.
+fn window_mask(
+    queries: usize,
+    offset: usize,
+    window: usize,
+    keys: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mask: Vec<f32> = (0..queries)
+        .flat_map(|i| {
+            (0..keys).map(move |j| {
+                if (i + offset).abs_diff(j) > window {
+                    f32::NEG_INFINITY
+                } else {
+                    0.
+                }
+            })
+        })
+        .collect();
+    Tensor::from_slice(&mask, (queries, keys), device)
 }
 
 /// One block's `softmax(q·kᵀ + mask)·v`.
@@ -500,7 +661,7 @@ fn attend_block(
     k: &Tensor,
     v: &Tensor,
     keys: &Tensor,
-    window: Option<usize>,
+    window: Option<&Tensor>,
     block: crate::attention::Block,
 ) -> Result<Tensor> {
     let (k0, n_keys) = block.keys();
@@ -513,10 +674,16 @@ fn attend_block(
     } else {
         q.narrow(2, q0, n_queries)?.contiguous()?
     };
-    let (kb, vb) = if n_keys == block.seq {
+    let whole_row = n_keys == block.seq;
+    let (kb, vb) = if whole_row {
         (k.clone(), v.clone())
     } else {
         (k.narrow(2, k0, n_keys)?, v.narrow(2, k0, n_keys)?)
+    };
+    let padding = if whole_row {
+        keys.clone()
+    } else {
+        keys.narrow(3, k0, n_keys)?
     };
 
     // Reassigned rather than shadowed: a shadowed binding lives to the end of
@@ -526,43 +693,12 @@ fn attend_block(
     let mut att = qb.matmul(&kb.transpose(D::Minus2, D::Minus1)?)?;
     // Padding and window are summed into the block's own shape first, which is
     // one pass over the scores instead of two.
-    let padding = if n_keys == block.seq {
-        keys.clone()
-    } else {
-        keys.narrow(3, k0, n_keys)?
-    };
     att = match window {
-        Some(w) => {
-            att.broadcast_add(&padding.broadcast_add(&window_mask(&block, w, q.device())?)?)?
-        }
+        Some(w) => att.broadcast_add(&padding.broadcast_add(w)?)?,
         None => att.broadcast_add(&padding)?,
     };
     att = softmax_last_dim(&att)?;
     att.matmul(&vb)
-}
-
-/// One block's slice of the sliding-window mask, `[queries, keys]`: 0 where the
-/// query can reach the key, `-inf` where the window shuts it out.
-///
-/// Built per block rather than once per forward as a `[s, s]` tensor. Summed
-/// over the blocks of a banded layer this touches `seq * (width + 2w)` entries
-/// instead of `seq^2`, which at 8192 tokens is 1.6M rather than 67M, and none
-/// of it stays resident.
-fn window_mask(block: &crate::attention::Block, window: usize, device: &Device) -> Result<Tensor> {
-    let (k0, n_keys) = block.keys();
-    let q0 = block.q0();
-    let mask: Vec<f32> = (q0..q0 + block.queries())
-        .flat_map(|i| {
-            (k0..k0 + n_keys).map(move |j| {
-                if j.abs_diff(i) > window {
-                    f32::NEG_INFINITY
-                } else {
-                    0.
-                }
-            })
-        })
-        .collect();
-    Tensor::from_slice(&mask, (block.queries(), n_keys), device)
 }
 
 /// How many query rows one score tile covers.
@@ -576,12 +712,7 @@ fn window_mask(block: &crate::attention::Block, window: usize, device: &Device) 
 /// the rows absorb the growth (`rows * seq^2 <= budget`), over it the rows are
 /// pinned at 1 and the tile absorbs it (`tile * seq <= budget`). Either way one
 /// forward holds at most `budget` scores per head.
-fn query_tile(seq: usize, device: &Device) -> usize {
-    let budget = if device.is_cuda() {
-        crate::model::GPU_ATTN_BUDGET
-    } else {
-        crate::model::ATTN_BUDGET
-    };
+fn query_tile(seq: usize, budget: usize) -> usize {
     (budget / seq.max(1)).max(1)
 }
 
@@ -678,8 +809,9 @@ impl ModernBertLayer {
         config: &Config,
         rotary_emb: Arc<RotaryEmbedding>,
         uses_local_attention: bool,
+        kind: Attn,
     ) -> Result<Self> {
-        let attn = ModernBertAttention::load(vb.pp("attn"), config, rotary_emb)?;
+        let attn = ModernBertAttention::load(vb.pp("attn"), config, rotary_emb, kind)?;
         let mlp = ModernBertMLP::load(vb.pp("mlp"), config)?;
         let attn_norm = layer_norm_fused(
             config.hidden_size,
@@ -783,6 +915,7 @@ pub struct ModernBert {
     layers: Vec<ModernBertLayer>,
     final_norm: LayerNorm,
     local_attention_size: usize,
+    attn: Attn,
 }
 
 impl ModernBert {
@@ -810,6 +943,7 @@ impl ModernBert {
             vb.device(),
         )?);
 
+        let attn = Attn::of(vb.device());
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_id in 0..config.num_hidden_layers {
             let layer_uses_local_attention = layer_id % config.global_attn_every_n_layers != 0;
@@ -822,6 +956,7 @@ impl ModernBert {
                     global_rotary_emb.clone()
                 },
                 layer_uses_local_attention,
+                attn,
             )?);
         }
 
@@ -837,34 +972,16 @@ impl ModernBert {
             layers,
             final_norm,
             local_attention_size: config.local_attention,
+            attn,
         })
     }
 
     pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let dev = xs.device();
         let seq_len = xs.shape().dims()[1];
-        let window = self.local_attention_size / 2;
-        let (global, local) = if dev.is_metal() {
-            let padding = prepare_4d_attention_mask(mask, DType::F32, None)?.to_device(dev)?;
-            // Summed once here rather than in each of the 13 local layers: the
-            // sliding-window mask and the padding mask are identical across
-            // layers, so their sum is too.
-            let sliding = get_local_attention_mask(seq_len, window, dev)?;
-            let local = padding.broadcast_add(&sliding)?;
-            (Mask::Dense(padding), Mask::Dense(local))
-        } else {
-            let keys = padding_mask(mask, DType::F32)?.to_device(dev)?;
-            (
-                Mask::Tiled {
-                    keys: keys.clone(),
-                    window: None,
-                },
-                Mask::Tiled {
-                    keys,
-                    window: Some(window),
-                },
-            )
-        };
+        let (global, local) = self
+            .attn
+            .masks(mask, seq_len, self.local_attention_size / 2, dev)?;
         let mut xs = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
         for layer in self.layers.iter() {
             xs = layer.forward(&xs, &global, &local)?;
@@ -968,7 +1085,8 @@ mod attention_tests {
         let (q, k, v) = (spread(0.0), spread(11.0), spread(23.0));
         let keys = keys();
         let sliding = window.map(|w| get_local_attention_mask(S, w, &Device::Cpu).unwrap());
-        let blocked = attend_tiled(&q, &k, &v, &keys, window, tile).unwrap();
+        let plan = crate::attention::plan(S, window, tile, BAND_BLOCK);
+        let blocked = attend_blocked(&q, &k, &v, &keys, window, &plan).unwrap();
         let dense = attend_dense(&q, &k, &v, &keys, sliding.as_ref());
         assert_eq!(blocked.dims(), dense.dims());
         (blocked, dense)
@@ -1036,12 +1154,12 @@ mod attention_tests {
     /// shrinks so that `tile * seq` stays inside it.
     #[test]
     fn the_tile_holds_the_budget_at_any_length() {
-        let cpu = Device::Cpu;
-        assert!(query_tile(512, &cpu) >= 512);
-        assert!(query_tile(724, &cpu) >= 724);
-        assert!(query_tile(725, &cpu) < 725);
+        let budget = crate::model::ATTN_BUDGET;
+        assert!(query_tile(512, budget) >= 512);
+        assert!(query_tile(724, budget) >= 724);
+        assert!(query_tile(725, budget) < 725);
         for seq in [725, 1024, 2048, 8192, 100_000] {
-            let tile = query_tile(seq, &cpu);
+            let tile = query_tile(seq, budget);
             assert!(tile >= 1, "seq {seq} tiled to nothing");
             assert!(
                 tile * seq <= crate::model::ATTN_BUDGET || tile == 1,
