@@ -43,7 +43,7 @@ const EXP_FLOOR: f32 = -87.0;
 /// A block's scores are their own contiguous `[rows, heads, queries, keys]`
 /// buffer, but the mask here is still the full `[rows, seq, seq]` one, which is
 /// why [`Block`] carries `seq` as well: it is the mask's row stride.
-pub use crate::attention::Block;
+pub(crate) use crate::attention::Block;
 
 /// Softmax `scores` in place, adding `mask` first.
 ///
@@ -51,7 +51,13 @@ pub use crate::attention::Block;
 /// buffer; `mask` is the full `[rows, seq, seq]` additive bias every head
 /// shares. Rows of both are the last axis, so each `(row, head, query)` triple
 /// owns one contiguous span in each.
-pub fn masked_softmax(scores: &mut [f32], mask: &[f32], rows: usize, heads: usize, b: Block) {
+pub(crate) fn masked_softmax(
+    scores: &mut [f32],
+    mask: &[f32],
+    rows: usize,
+    heads: usize,
+    b: Block,
+) {
     debug_assert_eq!(scores.len(), rows * heads * b.queries * b.keys);
     debug_assert_eq!(mask.len(), rows * b.seq * b.seq);
     debug_assert!(b.q0 + b.queries <= b.seq && b.k0 + b.keys <= b.seq);
