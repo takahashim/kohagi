@@ -449,17 +449,20 @@ const BAND_BLOCK: usize = 32;
 /// Attention one block of queries at a time, so the `[b, h, s, s]` score
 /// tensor is never built.
 ///
-/// Tiling alone is the dense computation, not an approximation of it. Softmax
-/// runs along the key axis, so query rows are independent: a row's scores, its
-/// softmax and its weighted sum of V are the same numbers reduced in the same
-/// order whether the row is computed with all the others or with 63 of them.
+/// This is the dense computation, not an approximation of it. Softmax runs
+/// along the key axis, so query rows are independent: a row's scores, its
+/// softmax and its weighted sum of V are over the same keys whether the row is
+/// computed with all the others or with 31 of them. A sliding-window layer
+/// narrows the keys as well, and what that drops are the ones the window masks
+/// shut, which contribute `exp(-inf)` — an exact zero — to both the softmax
+/// denominator and the sum over V.
 ///
-/// A sliding-window layer narrows the keys as well, which drops terms rather
-/// than reordering them. What it drops are the ones the window masks shut, and
-/// those contribute `exp(-inf)`, an exact zero, to both the softmax denominator
-/// and the sum over V. Nothing an f32 can hold is lost; what can move is how
-/// the remaining terms are grouped inside the GEMM, which is a rounding
-/// difference and is why this is measured rather than asserted.
+/// Exact in arithmetic is not the same as identical in f32, though. A GEMM
+/// blocks its reduction by the shape it is handed, so a 32-row block and a
+/// 128-row one can round differently, and whether they do depends on the BLAS:
+/// the same shapes come out bit-identical under one Accelerate and a few ULP
+/// apart under another. The tests measure the distance rather than assert the
+/// bits.
 fn attend_tiled(
     q: &Tensor,
     k: &Tensor,
@@ -878,12 +881,11 @@ mod attention_tests {
     const B: usize = 2;
     const H: usize = 3;
     const S: usize = 128;
-    /// Ruri v3's own head dimension, and not a smaller one on purpose: these
-    /// tests assert bit equality, and the GEMM picks its reduction order partly
-    /// from the shape. At `HEAD_DIM = 4` a 48-row tile and a 128-row one sum the
-    /// same four products in different orders and land 1 to 3 ULP apart, which
-    /// says nothing about the tiling and would only teach the test to accept a
-    /// tolerance it does not need at any real size.
+    /// Ruri v3's own head dimension, and not a smaller one on purpose. The
+    /// shapes decide how the GEMM rounds, so a toy head dimension would measure
+    /// a reduction no model runs: at `HEAD_DIM = 4` a 48-row tile and a 128-row
+    /// one sum the same four products in different orders and land ULPs apart
+    /// on a machine where the real shape lands on the same bits.
     const HEAD_DIM: usize = 64;
     /// Small enough that `S` needs three of them, the last one ragged.
     const TILE: usize = 48;
@@ -972,52 +974,61 @@ mod attention_tests {
         (blocked, dense)
     }
 
-    fn same_as_dense(window: Option<usize>, tile: usize) {
+    /// Within f32 rounding of the dense result, and pointing the same way.
+    ///
+    /// Not bit equality: a GEMM blocks its reduction by the shape it is handed,
+    /// so a 32-row block and a 128-row one need not round alike, and neither
+    /// need two versions of Accelerate. Both are correct, so an equality
+    /// assertion would be testing the BLAS.
+    ///
+    /// The ceilings sit above rounding and below a mistake. Rounding moves a
+    /// value by at most `keys * f32::EPSILON`, 1.5e-5 at these shapes, and
+    /// turns the output by ~1e-12. A key the window opens but the band left out
+    /// moves its row by a part in thirty and turns the output by ~1e-5.
+    fn matches_dense(window: Option<usize>, tile: usize) {
         let (blocked, dense) = against_dense(window, tile);
-        assert_eq!(bits(&blocked), bits(&dense));
+        let (worst, scale, off_cos) = distance(&blocked, &dense);
+        assert!(
+            worst <= 1e-4 * scale,
+            "moved a value by {worst:e} against a scale of {scale:e}"
+        );
+        assert!(off_cos <= 1e-9, "turned the output by {off_cos:e}");
     }
 
-    /// Tiling divides the queries and nothing else, so a global layer's output
-    /// is the dense one to the bit — including over the ragged last tile.
+    /// Tiling divides the queries and nothing else, including over the ragged
+    /// last tile.
     #[test]
-    fn tiled_global_attention_is_the_dense_one() {
-        same_as_dense(None, TILE);
+    fn tiling_matches_the_dense_result() {
+        matches_dense(None, TILE);
     }
 
     /// A window too wide to band by is still a window: every key is scored and
-    /// the mask does the work, so this is the dense result too.
+    /// the mask does the work.
     #[test]
-    fn a_window_too_wide_to_band_is_the_dense_one() {
+    fn a_window_too_wide_to_band_matches_the_dense_result() {
         assert!(!crate::attention::banding_pays(S, 60));
-        same_as_dense(Some(60), TILE);
+        matches_dense(Some(60), TILE);
     }
 
-    /// One block covering everything takes the path with no narrow and no
-    /// concatenation.
+    /// One block covering everything is the one case that has to be the dense
+    /// path exactly: it runs the same operations on the same whole tensors,
+    /// with no narrow and no concatenation, so any difference at all would mean
+    /// the fast path is not the path it claims to be.
     #[test]
     fn a_single_tile_is_the_dense_one() {
-        same_as_dense(None, S);
-        same_as_dense(None, S * 4);
+        for tile in [S, S * 4] {
+            let (blocked, dense) = against_dense(None, tile);
+            assert_eq!(bits(&blocked), bits(&dense));
+        }
     }
 
     /// Banding drops the keys the window shuts out rather than masking them.
     /// Those terms are `exp(-inf)`, an exact zero in both the softmax
     /// denominator and the sum over V, so nothing is lost by dropping them.
-    ///
-    /// What does move is the grouping of the terms that remain: a 96-key
-    /// reduction is not blocked the way a 128-key one is, and the GEMM rounds
-    /// accordingly. This pins how far that is allowed to go. Measured here:
-    /// 3.0e-7 against outputs reaching 0.98, and `1 - cos` of 8e-15.
     #[test]
     fn banding_matches_the_dense_result() {
         assert!(crate::attention::banding_pays(S, 16));
-        let (banded, dense) = against_dense(Some(16), TILE);
-        let (worst, scale, off_cos) = distance(&banded, &dense);
-        assert!(
-            worst <= 1e-6 * scale,
-            "banding moved a value by {worst:e} against a scale of {scale:e}"
-        );
-        assert!(off_cos <= 1e-12, "banding turned the output by {off_cos:e}");
+        matches_dense(Some(16), TILE);
     }
 
     /// The handover with `model::rows_per_forward`: up to `sqrt(budget)` a tile

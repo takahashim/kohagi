@@ -33,13 +33,20 @@
   | 4096 | 10.9 s / 2.00 GB | 4.6 s / 1.02 GB |
   | 8192 | 99.9 s / 6.83 GB | 15.6 s / 1.02 GB |
 
-  **Every vector is unchanged**, byte for byte. Blocking divides the queries and
-  nothing else, and softmax runs along the key axis, so each row is reduced over
-  the same keys in the same order. Narrowing to the window drops terms rather
-  than reordering them, and what it drops is `exp(-inf)`, an exact zero in both
-  the softmax denominator and the sum over V. Verified against the previous
-  build at 512, 1024, 2048, 4096 and 8192 tokens on the CPU, and at 512 and 2048
-  on Metal, whose fused kernel this does not touch.
+  **The vectors are the same ones.** Blocking divides the queries and nothing
+  else, and softmax runs along the key axis, so each row is scored over the same
+  keys. Narrowing to the window drops terms rather than reordering them, and
+  what it drops is `exp(-inf)`, an exact zero in both the softmax denominator
+  and the sum over V.
+
+  What that leaves is f32 rounding: a GEMM blocks its reduction by the shape it
+  is handed, so the arithmetic that is exactly equal need not land on the same
+  bits. It usually does. Against the previous build at 512, 1024, 2048, 4096 and
+  8192 tokens the output was byte-identical on macOS 26 (Accelerate, arm64), and
+  on Metal at 512 and 2048, whose fused kernel this does not touch. On a BLAS
+  that blocks differently the gap is a part in a million or so: 1.8e-6 against
+  values reaching 1.0 on macOS 14, with the direction of the vector moving by
+  1e-12. An index built with 0.6.0 does not need rebuilding.
 
 ## [0.6.0] - 2026-08-18
 
