@@ -357,8 +357,9 @@ impl Embedder {
         // about to be memory-mapped, so this reads the same file the forward
         // pass will fault in, and doing it on another thread keeps half a
         // gigabyte of hashing out of the caller's first result.
-        let fingerprint = crate::fingerprint::Fingerprint::spawn(files.weights.clone());
+        let fingerprint = crate::fingerprint::Fingerprint::spawn(&files.weights);
         let weights = load_weights(&files.weights, &config, &device, opts.precision)?;
+        fingerprint.confirm(&files.weights);
         let tokenizer = load_tokenizer(&files.tokenizer, opts.max_seq_length)?;
         Ok(Self {
             engine: Engine::Candle { weights, device },

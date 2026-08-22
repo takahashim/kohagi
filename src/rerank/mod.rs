@@ -283,8 +283,9 @@ impl Reranker {
         check_precision(opts.backend, opts.precision)?;
 
         let device = open_device(opts.backend)?;
-        let fingerprint = Fingerprint::spawn(files.weights.clone());
+        let fingerprint = Fingerprint::spawn(&files.weights);
         let weights = load_weights(&files.weights, &config.encoder, &device, opts.precision)?;
+        fingerprint.confirm(&files.weights);
         // A second view of the same file, on the CPU: the head runs there
         // whatever the encoder runs on.
         let head = Head::load(&cpu_weights(&files.weights)?, &config.encoder, &config.head)?;
