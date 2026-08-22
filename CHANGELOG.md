@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Long inputs no longer cost quadratic memory.** The CPU and CUDA attention
+  walked the whole `[rows, heads, seq, seq]` score matrix at once, and the
+  row-count cap that was supposed to bound it can go no lower than one row: past
+  seq 724 nothing held it back. One 8192-token document needed 6.8 GB and spent
+  most of its 100 seconds paging, so the eight-worker default asked for ~44 GB
+  and thrashed the machine instead of embedding anything.
+
+  The queries are now walked in tiles sized so a tile holds at most the same
+  budget the row cap enforces, and the padding mask is kept in its `[b, 1, 1, s]`
+  form instead of being spread over the query axis. That document now peaks at
+  1.1 GB and takes 43 seconds, and eight of them across the full pool fit in
+  5.8 GB. Peak memory is flat from 512 to 8192 tokens (1.02 GB to 1.07 GB, was
+  1.02 GB to 6.8 GB).
+
+  **Every vector is unchanged**, byte for byte: tiling divides the queries and
+  nothing else, and softmax runs along the key axis, so each row is reduced over
+  the same keys in the same order. Verified against the previous build at 512,
+  1024, 2048, 4096 and 8192 tokens on the CPU, and at 512 and 2048 on Metal,
+  whose fused kernel this does not touch. Compute is unchanged too, so long
+  inputs are still quadratic in time: what went away is the paging.
+
 ## [0.6.0] - 2026-08-18
 
 ### Added

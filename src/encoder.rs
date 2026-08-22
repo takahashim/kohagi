@@ -272,6 +272,25 @@ enum Qkv {
     Split { q: Linear, k: Linear, v: Linear },
 }
 
+/// What one layer's attention may attend to.
+///
+/// The two forms are the backend dispatch. Metal's fused sdpa takes one dense
+/// `[b, 1, s, s]` additive mask; everywhere else the mask arrives in pieces,
+/// because summing them into that shape is itself an `s^2` tensor and the point
+/// of the tiled path is that no such tensor exists. Which form is built is
+/// decided once, in [`ModernBert::forward`], alongside the QKV layout
+/// [`ModernBertAttention::load`] picks for the same reason.
+enum Mask {
+    /// Padding and window already summed, as sdpa wants them.
+    Dense(Tensor),
+    /// The padding mask `[b, 1, 1, s]`, plus the sliding window `[s, s]` on a
+    /// local layer. Summed one query tile at a time in [`attend_tile`].
+    Tiled {
+        keys: Tensor,
+        sliding: Option<Tensor>,
+    },
+}
+
 #[derive(Clone)]
 struct ModernBertAttention {
     /// How the QKV projection is stored, which differs by backend.
@@ -323,7 +342,7 @@ impl ModernBertAttention {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, mask: &Mask) -> Result<Tensor> {
         let xs = hidden_states.clone();
         let (b, seq_len, d) = xs.dims3()?;
         let heads = (
@@ -360,37 +379,40 @@ impl ModernBertAttention {
 
         let scale = (self.attention_head_size as f64).powf(-0.5);
 
-        // On Metal, fuse the whole attention so the [b, h, s, s] score tensor is
-        // never materialized. sdpa is Metal-only, so the CPU keeps the explicit
-        // path.
-        let xs = if q.device().is_metal() {
-            let (mb, _, ms, mk) = attention_mask.dims4()?;
-            // Clamp on the small [b, 1, s, s] mask, then widen to the head count
-            // as a *view*: sdpa checks dims but reads the mask through strides,
-            // so a stride-0 head axis satisfies it without materializing the
-            // [b, h, s, s] tensor this fusion exists to avoid.
-            //
-            // The floor is finite because a fully padded query row is all -inf,
-            // and softmax of that is NaN. The explicit path hides it — pooling
-            // skips padded positions — but the fused kernel lets the NaN reach
-            // the whole row.
-            let mask = attention_mask.clamp(-60f32, 0f32)?.broadcast_as((
-                mb,
-                self.num_attention_heads,
-                ms,
-                mk,
-            ))?;
-            candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
-        } else {
-            // The CPU matmul cannot consume the transposed views, and there is
-            // no sdpa to hand them to, so materialize here rather than paying
-            // for it on both backends.
-            let (q, k, v) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
-            let q = (q * scale)?;
-            let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-            let att = att.broadcast_add(attention_mask)?;
-            let att = softmax_last_dim(&att)?;
-            att.matmul(&v)?
+        // Neither arm materializes the [b, h, s, s] score tensor: Metal fuses
+        // the whole attention into one kernel, and the other backends walk the
+        // queries in tiles. sdpa is Metal-only, which is why that is two
+        // implementations rather than one.
+        let xs = match mask {
+            Mask::Dense(dense) => {
+                let (mb, _, ms, mk) = dense.dims4()?;
+                // Clamp on the small [b, 1, s, s] mask, then widen to the head
+                // count as a *view*: sdpa checks dims but reads the mask through
+                // strides, so a stride-0 head axis satisfies it without
+                // materializing the [b, h, s, s] tensor this fusion exists to
+                // avoid.
+                //
+                // The floor is finite because a fully padded query row is all
+                // -inf, and softmax of that is NaN. The explicit path hides it —
+                // pooling skips padded positions — but the fused kernel lets the
+                // NaN reach the whole row.
+                let mask = dense.clamp(-60f32, 0f32)?.broadcast_as((
+                    mb,
+                    self.num_attention_heads,
+                    ms,
+                    mk,
+                ))?;
+                candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
+            }
+            Mask::Tiled { keys, sliding } => {
+                // The matmul cannot consume the transposed views, and there is
+                // no sdpa to hand them to, so materialize here rather than
+                // paying for it on both backends.
+                let (q, k, v) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
+                let q = (q * scale)?;
+                let tile = query_tile(seq_len, q.device());
+                attend_tiled(&q, &k, &v, keys, sliding.as_ref(), tile)?
+            }
         };
 
         let xs = xs.transpose(1, 2)?.reshape((b, seq_len, d))?;
@@ -399,6 +421,88 @@ impl ModernBertAttention {
 
         Ok(xs)
     }
+}
+
+/// Attention one query tile at a time, so the `[b, h, s, s]` score tensor is
+/// never built.
+///
+/// This is the dense computation, not an approximation of it. Softmax runs
+/// along the key axis, so query rows are independent: a row's scores, its
+/// softmax and its weighted sum of V are the same numbers reduced in the same
+/// order whether the row is computed with all the others or with 63 of them.
+/// What changes is only how many of them are in memory at once.
+fn attend_tiled(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    keys: &Tensor,
+    sliding: Option<&Tensor>,
+    tile: usize,
+) -> Result<Tensor> {
+    let (_, _, seq, _) = q.dims4()?;
+    let kt = k.transpose(D::Minus2, D::Minus1)?;
+    // Short inputs are one tile, which is the dense path with no narrow, no
+    // copy and no concatenation: the settings measured at 512 tokens are the
+    // ones still running there.
+    if tile >= seq {
+        return attend_tile(q, &kt, v, keys, sliding, 0, seq);
+    }
+    let mut tiles = Vec::with_capacity(seq.div_ceil(tile));
+    for start in (0..seq).step_by(tile) {
+        let rows = tile.min(seq - start);
+        // Narrowing the query axis leaves a strided view, and matmul wants its
+        // operands whole. The copy is `rows * heads * head_dim`, which is the
+        // small side of everything here.
+        let qt = q.narrow(2, start, rows)?.contiguous()?;
+        tiles.push(attend_tile(&qt, &kt, v, keys, sliding, start, rows)?);
+    }
+    Tensor::cat(&tiles, 2)
+}
+
+/// One tile's `softmax(q·kᵀ + mask)·v`, for query rows `start .. start + rows`.
+fn attend_tile(
+    q: &Tensor,
+    kt: &Tensor,
+    v: &Tensor,
+    keys: &Tensor,
+    sliding: Option<&Tensor>,
+    start: usize,
+    rows: usize,
+) -> Result<Tensor> {
+    // Reassigned rather than shadowed: a shadowed binding lives to the end of
+    // its block, so the pre-mask scores, the masked scores and the softmax
+    // would all be alive at once. Reassigning drops each as the next is bound,
+    // leaving the operation's own input and output as the peak.
+    let mut att = q.matmul(kt)?;
+    att = match sliding {
+        // Padding and window are summed into the tile's own shape first, which
+        // is one pass over the scores instead of two, and keeps the association
+        // the dense path used: `scores + (padding + window)`.
+        Some(w) => att.broadcast_add(&keys.broadcast_add(&w.narrow(0, start, rows)?)?)?,
+        None => att.broadcast_add(keys)?,
+    };
+    att = softmax_last_dim(&att)?;
+    att.matmul(v)
+}
+
+/// How many query rows one score tile covers.
+///
+/// `budget / seq`, so a tile holds at most `budget` scores per head and per
+/// batch row however long the input is. Below `sqrt(budget)` (724 rows on the
+/// CPU) a tile is the whole sequence.
+///
+/// The same budget caps the rows [`crate::model::rows_per_forward`] puts in one
+/// forward, and the pair is what bounds the score memory: under the threshold
+/// the rows absorb the growth (`rows * seq^2 <= budget`), over it the rows are
+/// pinned at 1 and the tile absorbs it (`tile * seq <= budget`). Either way one
+/// forward holds at most `budget` scores per head.
+fn query_tile(seq: usize, device: &Device) -> usize {
+    let budget = if device.is_cuda() {
+        crate::model::GPU_ATTN_BUDGET
+    } else {
+        crate::model::ATTN_BUDGET
+    };
+    (budget / seq.max(1)).max(1)
 }
 
 /// ModernBERT's norms have no bias, and `layer_norm_no_bias` routes to
@@ -514,27 +618,19 @@ impl ModernBertLayer {
         })
     }
 
-    fn forward(
-        &self,
-        xs: &Tensor,
-        global_attention_mask: &Tensor,
-        local_attention_mask: &Tensor,
-    ) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, global: &Mask, local: &Mask) -> Result<Tensor> {
         let residual = xs.clone();
         let mut xs = xs.clone();
         if let Some(norm) = &self.attn_norm {
             xs = xs.apply(norm)?;
         }
 
-        // `local_attention_mask` already holds `global + local` (combined once
-        // in ModernBert::forward, since every local layer would otherwise redo
-        // the same broadcast_add — 12 of 13 of them redundant).
-        let attention_mask = if self.uses_local_attention {
-            local_attention_mask
+        let mask = if self.uses_local_attention {
+            local
         } else {
-            global_attention_mask
+            global
         };
-        let xs = self.attn.forward(&xs, attention_mask)?;
+        let xs = self.attn.forward(&xs, mask)?;
         let xs = (xs + residual)?;
         let mlp_out = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
         let xs = (xs + mlp_out)?;
@@ -542,6 +638,23 @@ impl ModernBertLayer {
     }
 }
 
+/// The additive padding mask, `[b, 1, 1, s]`: 0 where the position holds a
+/// token, `f32::MIN` where it is padding.
+///
+/// Whether a position is padding is a property of the key being attended to,
+/// not of the query attending to it, so the query axis is 1 and the
+/// `[b, 1, s, s]` that [`prepare_4d_attention_mask`] builds is these same
+/// numbers repeated `s` times.
+fn padding_mask(mask: &Tensor, dtype: DType) -> Result<Tensor> {
+    let (bsz, src_len) = mask.dims2()?;
+    let mask = mask.reshape((bsz, 1, 1, src_len))?.to_dtype(dtype)?;
+    ((1.0 - mask)? * f32::MIN as f64)?.to_dtype(dtype)
+}
+
+/// The same mask spread over the query axis as well, `[b, 1, s, s]`.
+///
+/// Only Metal's sdpa needs it in this shape (see [`Mask`]); everything else
+/// takes [`padding_mask`] and never pays for the `s^2`.
 fn prepare_4d_attention_mask(
     mask: &Tensor,
     dtype: DType,
@@ -648,21 +761,156 @@ impl ModernBert {
     }
 
     pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let dev = xs.device();
         let seq_len = xs.shape().dims()[1];
-        let global_attention_mask =
-            prepare_4d_attention_mask(mask, DType::F32, None)?.to_device(xs.device())?;
-        // Combined once here rather than in each of the 13 local layers: the
-        // sliding-window mask and the padding mask are identical across layers,
-        // so their sum is too.
-        let sliding =
-            get_local_attention_mask(seq_len, self.local_attention_size / 2, xs.device())?;
-        let local_attention_mask = global_attention_mask.broadcast_add(&sliding)?;
+        let sliding = get_local_attention_mask(seq_len, self.local_attention_size / 2, dev)?;
+        let (global, local) = if dev.is_metal() {
+            let padding = prepare_4d_attention_mask(mask, DType::F32, None)?.to_device(dev)?;
+            // Summed once here rather than in each of the 13 local layers: the
+            // sliding-window mask and the padding mask are identical across
+            // layers, so their sum is too.
+            let local = padding.broadcast_add(&sliding)?;
+            (Mask::Dense(padding), Mask::Dense(local))
+        } else {
+            let keys = padding_mask(mask, DType::F32)?.to_device(dev)?;
+            (
+                Mask::Tiled {
+                    keys: keys.clone(),
+                    sliding: None,
+                },
+                Mask::Tiled {
+                    keys,
+                    sliding: Some(sliding),
+                },
+            )
+        };
         let mut xs = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
         for layer in self.layers.iter() {
-            xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask)?;
+            xs = layer.forward(&xs, &global, &local)?;
         }
         let xs = xs.apply(&self.final_norm)?;
         Ok(xs)
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+
+    const B: usize = 2;
+    const H: usize = 3;
+    const S: usize = 128;
+    /// Ruri v3's own head dimension, and not a smaller one on purpose: these
+    /// tests assert bit equality, and the GEMM picks its reduction order partly
+    /// from the shape. At `HEAD_DIM = 4` a 48-row tile and a 128-row one sum the
+    /// same four products in different orders and land 1 to 3 ULP apart, which
+    /// says nothing about the tiling and would only teach the test to accept a
+    /// tolerance it does not need at any real size.
+    const HEAD_DIM: usize = 64;
+    /// Small enough that `S` needs three of them, the last one ragged.
+    const TILE: usize = 48;
+
+    /// Deterministic values spread over `[-1, 1]`, so no two positions score
+    /// alike and a wrong offset cannot pass by symmetry.
+    fn spread(offset: f32) -> Tensor {
+        let n = B * H * S * HEAD_DIM;
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32 + offset) * 0.37).sin()).collect();
+        Tensor::from_vec(data, (B, H, S, HEAD_DIM), &Device::Cpu).unwrap()
+    }
+
+    /// One row whole and one with two padding positions at the end.
+    fn keys() -> Tensor {
+        let mut m = vec![1u32; B * S];
+        m[B * S - 1] = 0;
+        m[B * S - 2] = 0;
+        let m = Tensor::from_vec(m, (B, S), &Device::Cpu).unwrap();
+        padding_mask(&m, DType::F32).unwrap()
+    }
+
+    /// What the tiled path replaced: the whole `[b, h, s, s]` score tensor,
+    /// masked, softmaxed and applied in one go.
+    fn attend_dense(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        keys: &Tensor,
+        sliding: Option<&Tensor>,
+    ) -> Tensor {
+        let mask = match sliding {
+            Some(w) => keys.broadcast_add(w).unwrap(),
+            None => keys.clone(),
+        };
+        let att = q
+            .matmul(&k.transpose(D::Minus2, D::Minus1).unwrap())
+            .unwrap();
+        let att = att.broadcast_add(&mask).unwrap();
+        let att = softmax_last_dim(&att).unwrap();
+        att.matmul(v).unwrap()
+    }
+
+    /// Bit patterns rather than values: this is an identity claim, and `==` on
+    /// floats would let a rounding difference through.
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
+    }
+
+    fn same_as_dense(sliding: Option<&Tensor>, tile: usize) {
+        let (q, k, v) = (spread(0.0), spread(11.0), spread(23.0));
+        let keys = keys();
+        let tiled = attend_tiled(&q, &k, &v, &keys, sliding, tile).unwrap();
+        let dense = attend_dense(&q, &k, &v, &keys, sliding);
+        assert_eq!(tiled.dims(), dense.dims());
+        assert_eq!(bits(&tiled), bits(&dense));
+    }
+
+    /// Tiling divides the queries and nothing else, so a global layer's output
+    /// is the dense one to the bit — including over the ragged last tile.
+    #[test]
+    fn tiled_global_attention_is_the_dense_one() {
+        same_as_dense(None, TILE);
+    }
+
+    /// The same for a sliding-window layer, where each tile also has to take
+    /// its own rows of the window mask.
+    #[test]
+    fn tiled_window_attention_is_the_dense_one() {
+        let sliding = get_local_attention_mask(S, 16, &Device::Cpu).unwrap();
+        same_as_dense(Some(&sliding), TILE);
+    }
+
+    /// A tile at least as wide as the sequence takes the single-tile path,
+    /// which skips the narrow and the concatenation.
+    #[test]
+    fn a_single_tile_is_the_dense_one() {
+        let sliding = get_local_attention_mask(S, 16, &Device::Cpu).unwrap();
+        same_as_dense(None, S);
+        same_as_dense(Some(&sliding), S);
+        same_as_dense(Some(&sliding), S * 4);
+    }
+
+    /// The handover with `model::rows_per_forward`: up to `sqrt(budget)` a tile
+    /// is the whole sequence and the rows carry the budget, past it the tile
+    /// shrinks so that `tile * seq` stays inside it.
+    #[test]
+    fn the_tile_holds_the_budget_at_any_length() {
+        let cpu = Device::Cpu;
+        assert!(query_tile(512, &cpu) >= 512);
+        assert!(query_tile(724, &cpu) >= 724);
+        assert!(query_tile(725, &cpu) < 725);
+        for seq in [725, 1024, 2048, 8192, 100_000] {
+            let tile = query_tile(seq, &cpu);
+            assert!(tile >= 1, "seq {seq} tiled to nothing");
+            assert!(
+                tile * seq <= crate::model::ATTN_BUDGET || tile == 1,
+                "seq {seq} tile {tile} holds more than the budget"
+            );
+        }
     }
 }
 

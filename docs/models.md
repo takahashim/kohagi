@@ -87,5 +87,9 @@ $ echo '{"id": 1, "text": "…a very long document…"}' | kohagi --report-token
 - Raising `--max-seq-length` embeds more of each text at a quadratic cost in
   attention compute. It is the single flag with the largest effect on
   throughput.
+- Memory is not the constraint it costs, though: the encoder splits the
+  attention into fixed-size tiles, so peak memory is flat from 512 tokens to
+  8192 (measured 1.02 GB to 1.07 GB on `ruri-v3-130m`, f32, one worker). Time is
+  what a longer window buys with.
 - On `--device coreml` the largest converted bucket caps `--max-seq-length`; see
   [CoreML bundles](coreml.md).

@@ -5,16 +5,25 @@
 //! weights are shared behind an `Arc`, each worker runs an independent
 //! forward, and the result is identical to serial execution.
 //!
-//! Two guardrails keep peak memory flat no matter what the caller passes:
+//! Two guardrails keep the attention scratch of one forward under
+//! [`ATTN_BUDGET`] scores per head, whatever the caller passes:
 //!
-//! 1. Rows per forward are capped by [`ATTN_BUDGET`]: candle's ModernBERT
-//!    materializes ~`batch * heads * seq^2` f32 of attention scratch per
-//!    layer, so a 64-row batch of seq-512 inputs would hold ~2 GB per worker.
-//!    2 rows at seq 512 (~67 MB) measured both fastest and smallest on an
-//!    8-core Zen4 — finer units also load-balance better across the pool.
-//! 2. The pool defaults to *physical* cores (`RAYON_NUM_THREADS` overrides):
-//!    worker count is a direct memory multiplier, and SMT siblings only add
-//!    contention to these GEMM-bound forwards.
+//! 1. Rows per forward are capped by [`ATTN_BUDGET`]: a forward holds
+//!    ~`rows * heads * seq^2` f32 of scores, so a 64-row batch of seq-512
+//!    inputs would hold ~2 GB per worker. 2 rows at seq 512 (~67 MB) measured
+//!    both fastest and smallest on an 8-core Zen4 — finer units also
+//!    load-balance better across the pool.
+//! 2. Past seq 724 one row already exceeds the budget and this cap can go no
+//!    lower, so the encoder splits the *queries* instead: `attend_tiled` in
+//!    `encoder.rs` divides the same budget by `seq` to size a tile. The two
+//!    hand over at exactly that length, and neither regime holds more than
+//!    `ATTN_BUDGET` scores per head.
+//!
+//! What is not flat is everything linear in the input: hidden states, Q/K/V,
+//! the MLP activations and the output all grow with `seq * hidden_size`, and
+//! the pool is a multiplier on all of it. It defaults to *physical* cores
+//! (`RAYON_NUM_THREADS` overrides), since SMT siblings only add contention to
+//! these GEMM-bound forwards.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,23 +42,26 @@ use crate::info::{ModelInfo, Output};
 use crate::program::remark;
 use crate::source::ModelSource;
 
-/// Attention-scratch budget per forward, in `rows * seq^2` elements.
+/// Attention-scratch budget per forward, in scores per head: `rows * seq^2`
+/// while a row still fits, `tile * seq` once one does not (see the module
+/// note, and `encoder::query_tile` for the other half).
 ///
 /// It bounds memory, but it also lands on the fastest setting: at 512 tokens
 /// it allows 2 rows, and 240 512-token texts encode in 20.0s there against
 /// 22.4s at 1 row, 25.3s at 4 and 27.5s at 8 (bf16, median of five
 /// interleaved runs). Wider forwards spill the score matrix out of cache
 /// without buying any parallelism, since the rows already run in parallel.
-const ATTN_BUDGET: usize = 2 * 512 * 512;
+pub(crate) const ATTN_BUDGET: usize = 2 * 512 * 512;
 
 /// Same budget for a GPU, which runs one stream of wide forwards rather than
 /// many narrow ones.
 ///
-/// The width barely matters now: with the vendored candle's SDPA the attention
-/// scores are never materialized, so 4 rows measured 16.80s against 17.59s at
-/// 64 on a 240-text run. It mattered a great deal before that, in the opposite
-/// direction, which is why the constant exists at all.
-const GPU_ATTN_BUDGET: usize = 16 * 512 * 512;
+/// The width barely matters on Metal: its SDPA never materializes the attention
+/// scores, so 4 rows measured 16.80s against 17.59s at 64 on a 240-text run. It
+/// mattered a great deal before that, in the opposite direction, which is why
+/// the constant exists at all. CUDA has no such kernel here and runs the tiled
+/// path, where this is also the tile size.
+pub(crate) const GPU_ATTN_BUDGET: usize = 16 * 512 * 512;
 
 /// Rows allowed in one forward of padded length `seq`.
 fn rows_per_forward(seq: usize, backend: Backend) -> usize {
