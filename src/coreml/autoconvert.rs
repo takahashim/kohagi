@@ -295,6 +295,7 @@ mod tests {
             config: dir.join("config.json"),
             tokenizer: dir.join("tokenizer.json"),
             pooling: None,
+            sentence_config: None,
             source: dir.display().to_string(),
         };
         let first = revision(&checkpoint);

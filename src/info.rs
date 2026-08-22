@@ -18,6 +18,13 @@ pub struct ModelInfo {
     /// The model's own dimension, its `hidden_size`.
     pub dim: usize,
     pub max_seq_length: usize,
+    /// What `sentence_bert_config.json` says the model can take, when it says
+    /// anything. Reported rather than obeyed: `--max-seq-length` decides the
+    /// run, and the two differ on checkpoints whose declared ceiling is higher
+    /// than Kohagi's default (`ruri-v3-130m` declares 8192). This is where the
+    /// difference is visible, since sentence-transformers reads the same field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_max_seq_length: Option<usize>,
     /// The value returned for each record.
     #[serde(flatten)]
     pub output: Output,

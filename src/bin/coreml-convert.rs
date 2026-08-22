@@ -130,6 +130,7 @@ fn gather(args: &Args) -> Result<Checkpoint> {
             config: fetch("config.json")?,
             tokenizer: fetch("tokenizer.json")?,
             pooling,
+            sentence_config: fetch("sentence_bert_config.json").ok(),
             source: repo.clone(),
         });
     }
@@ -148,6 +149,10 @@ fn gather(args: &Args) -> Result<Checkpoint> {
         pooling: weights
             .parent()
             .map(|d| d.join("1_Pooling").join("config.json"))
+            .filter(|p| p.is_file()),
+        sentence_config: weights
+            .parent()
+            .map(|d| d.join("sentence_bert_config.json"))
             .filter(|p| p.is_file()),
         source: weights.display().to_string(),
         weights,

@@ -32,6 +32,8 @@ pub(crate) struct CheckpointFiles {
     pub(crate) tokenizer: PathBuf,
     /// Pooling declared in `1_Pooling/config.json`, if present.
     pub(crate) pooling: Option<Pooling>,
+    /// Token limit declared in `sentence_bert_config.json`, if present.
+    pub(crate) declared_max_seq: Option<usize>,
 }
 
 /// A resolved CoreML bundle.
@@ -48,7 +50,8 @@ impl ModelSource {
             Self::Files { model, tokenizer } => Ok(CheckpointFiles {
                 weights: model.clone(),
                 tokenizer: tokenizer.clone(),
-                pooling: local_pooling(model),
+                pooling: model.parent().and_then(pooling_in_dir),
+                declared_max_seq: model.parent().and_then(declared_max_seq_in_dir),
             }),
             Self::Hub { repo } => {
                 let f = fetch_checkpoint(repo)?;
@@ -56,6 +59,7 @@ impl ModelSource {
                     weights: f.weights,
                     tokenizer: f.tokenizer,
                     pooling: f.pooling,
+                    declared_max_seq: f.declared_max_seq,
                 })
             }
             Self::CoreMl { .. } | Self::CoreMlHub { .. } | Self::CoreMlConvert { .. } => {
@@ -111,6 +115,7 @@ fn convert_for_coreml(
                 weights: files.weights,
                 tokenizer: files.tokenizer,
                 pooling: files.pooling_file,
+                sentence_config: files.sentence_config,
                 source: repo.clone(),
             }
         }
@@ -121,6 +126,10 @@ fn convert_for_coreml(
             pooling: model
                 .parent()
                 .map(|d| d.join("1_Pooling").join("config.json"))
+                .filter(|p| p.is_file()),
+            sentence_config: model
+                .parent()
+                .map(|d| d.join(SENTENCE_CONFIG))
                 .filter(|p| p.is_file()),
             source: model.display().to_string(),
         },
@@ -181,7 +190,14 @@ pub(crate) struct Fetched {
         allow(dead_code)
     )]
     pooling_file: Option<PathBuf>,
+    /// `sentence_bert_config.json`, if present.
+    #[cfg_attr(
+        not(all(feature = "coreml", feature = "coreml-export")),
+        allow(dead_code)
+    )]
+    sentence_config: Option<PathBuf>,
     pooling: Option<Pooling>,
+    declared_max_seq: Option<usize>,
 }
 
 /// Fetches or reuses the files needed to load a model.
@@ -195,19 +211,29 @@ fn fetch_checkpoint(repo: &str) -> Result<Fetched> {
     let weights = get("model.safetensors")?;
     get("config.json")?; // Cache it beside the weights.
     let tokenizer = get("tokenizer.json")?;
-    // Optional: rerankers and base models may not provide it.
+    // Optional: rerankers and base models may not provide either.
     let pooling_file = repo.get("1_Pooling/config.json").ok();
     let pooling = pooling_file
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| pooling_from_st_config(&s));
+    let sentence_config = repo.get(SENTENCE_CONFIG).ok();
+    let declared_max_seq = sentence_config
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| max_seq_from_st_config(&s));
     Ok(Fetched {
         weights,
         tokenizer,
         pooling_file,
+        sentence_config,
         pooling,
+        declared_max_seq,
     })
 }
+
+/// Where sentence-transformers records the token limit it would use.
+pub(crate) const SENTENCE_CONFIG: &str = "sentence_bert_config.json";
 
 /// Reads pooling from a checkpoint directory, if present.
 pub(crate) fn pooling_in_dir(dir: &std::path::Path) -> Option<Pooling> {
@@ -215,9 +241,26 @@ pub(crate) fn pooling_in_dir(dir: &std::path::Path) -> Option<Pooling> {
     pooling_from_st_config(&text)
 }
 
-/// Reads pooling beside local weights, if present.
-fn local_pooling(model_path: &std::path::Path) -> Option<Pooling> {
-    pooling_in_dir(model_path.parent()?)
+/// Reads the declared token limit from a checkpoint directory, if present.
+pub(crate) fn declared_max_seq_in_dir(dir: &std::path::Path) -> Option<usize> {
+    let text = std::fs::read_to_string(dir.join(SENTENCE_CONFIG)).ok()?;
+    max_seq_from_st_config(&text)
+}
+
+/// Reads `max_seq_length` from a sentence-transformers config.
+///
+/// This is what the model says it can take, which is not what Kohagi takes:
+/// `--max-seq-length` decides that, and its default is 512 whatever the file
+/// says. The two disagree often enough to be worth reporting — `ruri-v3-130m`
+/// declares 8192 — and sentence-transformers reads this same field, so a
+/// checkpoint that behaves differently under the two libraries says so here.
+///
+/// The newer sentence-transformers format drops the field, so absent is as
+/// ordinary as present.
+fn max_seq_from_st_config(json: &str) -> Option<usize> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let n = v.get("max_seq_length")?.as_u64()?;
+    (n > 0).then_some(n as usize)
 }
 
 /// Reads `cls` or `mean` pooling from a sentence-transformers config.
@@ -262,6 +305,27 @@ mod tests {
                        "include_prompt": true}"#;
         assert_eq!(pooling_from_st_config(cls), Some(Pooling::Cls));
         assert_eq!(pooling_from_st_config(mean), Some(Pooling::Mean));
+    }
+
+    /// What `ruri-v3-130m` ships, and the 8192 that makes this worth reading:
+    /// Kohagi's default takes 512 of it.
+    #[test]
+    fn reads_the_declared_token_limit() {
+        let base = r#"{"max_seq_length": 8192, "do_lower_case": false}"#;
+        assert_eq!(max_seq_from_st_config(base), Some(8192));
+    }
+
+    /// A checkpoint saved by a newer sentence-transformers has no such field,
+    /// and a fine-tuned ruri is exactly that. Absent is ordinary, not an error.
+    #[test]
+    fn a_config_without_the_field_declares_nothing() {
+        let tuned = r#"{"transformer_task": "feature-extraction",
+                        "module_output_name": "token_embeddings"}"#;
+        assert_eq!(max_seq_from_st_config(tuned), None);
+        assert_eq!(max_seq_from_st_config("not json"), None);
+        // Nothing usable is nothing declared, rather than a limit of zero.
+        assert_eq!(max_seq_from_st_config(r#"{"max_seq_length": 0}"#), None);
+        assert_eq!(max_seq_from_st_config(r#"{"max_seq_length": "512"}"#), None);
     }
 
     #[test]

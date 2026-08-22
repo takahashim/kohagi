@@ -385,6 +385,10 @@ pub struct Checkpoint {
     /// `1_Pooling/config.json`, when the checkpoint ships one. A reranker or a
     /// base LM does not, and Kohagi falls back to mean pooling with a warning.
     pub pooling: Option<PathBuf>,
+    /// `sentence_bert_config.json`, when the checkpoint ships one. Copied so a
+    /// bundle reports the same declared token limit as the checkpoint it came
+    /// from.
+    pub sentence_config: Option<PathBuf>,
     /// The Hub id, or the path for a local checkpoint. Recorded in the bundle's
     /// provenance.
     pub source: String,
@@ -466,6 +470,10 @@ pub fn convert(
         std::fs::create_dir_all(&into).with_context(|| format!("creating {}", into.display()))?;
         std::fs::copy(pooling, into.join("config.json"))
             .with_context(|| format!("copying {}", pooling.display()))?;
+    }
+    if let Some(declared) = &checkpoint.sentence_config {
+        std::fs::copy(declared, dir.join(crate::source::SENTENCE_CONFIG))
+            .with_context(|| format!("copying {}", declared.display()))?;
     }
     Ok(cfg)
 }

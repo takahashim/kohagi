@@ -513,7 +513,10 @@ fn wanted(rfilename: &str, prefer: CoreMlForm, forms: &BTreeMap<usize, (bool, bo
         // sentence-embedding model, however faithfully it was converted.
         None => matches!(
             rfilename,
-            "config.json" | "tokenizer.json" | "1_Pooling/config.json"
+            "config.json"
+                | "tokenizer.json"
+                | "1_Pooling/config.json"
+                | "sentence_bert_config.json"
         ),
     }
 }

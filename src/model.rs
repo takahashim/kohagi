@@ -316,6 +316,9 @@ pub struct Embedder {
     /// collected when something asks. `None` on the CoreML path, whose
     /// provenance is read from the bundle instead (see [`Embedder::info`]).
     fingerprint: Option<crate::fingerprint::Fingerprint>,
+    /// What the checkpoint declares it can take, for [`Embedder::info`] to
+    /// report beside what this run actually took.
+    declared_max_seq: Option<usize>,
 }
 
 impl Embedder {
@@ -363,6 +366,7 @@ impl Embedder {
             pooling,
             dim,
             fingerprint: Some(fingerprint),
+            declared_max_seq: files.declared_max_seq,
         })
     }
 
@@ -407,6 +411,7 @@ impl Embedder {
             // A bundle has no safetensors to hash; what it can say about the
             // checkpoint behind it is in its own metadata, read by `info`.
             fingerprint: None,
+            declared_max_seq: crate::source::declared_max_seq_in_dir(&dir),
         };
         #[cfg(feature = "coreml-export")]
         if converted {
@@ -530,6 +535,7 @@ impl Embedder {
             pooling: self.pooling.name(),
             dim: self.dim,
             max_seq_length: self.opts.max_seq_length,
+            declared_max_seq_length: self.declared_max_seq,
             output: Output::Embedding {
                 output_dim: output_dim(self.opts.dims, self.dim),
             },

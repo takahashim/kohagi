@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`--print-model-info` reports `declared_max_seq_length`.** The token limit
+  the checkpoint's `sentence_bert_config.json` declares, which
+  sentence-transformers obeys and Kohagi does not: `--max-seq-length` still
+  decides the run, and still defaults to 512. `ruri-v3-130m` declares 8192, so
+  the same directory embeds a long text differently under the two libraries;
+  this is where that is visible. Converted CoreML bundles carry the file too.
+
 ### Changed
 
 - **Long inputs cost far less time and memory.** Peak memory is now flat from

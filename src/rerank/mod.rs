@@ -259,6 +259,9 @@ pub struct Reranker {
     /// The checkpoint's digest on the candle path. `None` on the CoreML path,
     /// which reports the bundle's recorded provenance instead.
     fingerprint: Option<Fingerprint>,
+    /// What the checkpoint declares it can take. A cross-encoder rarely ships
+    /// `sentence_bert_config.json` at all, so this is usually `None`.
+    declared_max_seq: Option<usize>,
 }
 
 impl Reranker {
@@ -294,6 +297,7 @@ impl Reranker {
             pooling: config.pooling,
             dim: config.encoder.hidden_size,
             fingerprint: Some(fingerprint),
+            declared_max_seq: files.declared_max_seq,
         })
     }
 
@@ -352,6 +356,7 @@ impl Reranker {
             // A bundle has no safetensors of its own; its provenance is what it
             // recorded at conversion, read by `info`.
             fingerprint: None,
+            declared_max_seq: crate::source::declared_max_seq_in_dir(&dir),
         })
     }
 
@@ -375,6 +380,7 @@ impl Reranker {
             pooling: self.pooling.name(),
             dim: self.dim,
             max_seq_length: self.opts.max_seq_length,
+            declared_max_seq_length: self.declared_max_seq,
             // Scores have no output dimension, but must record their scale.
             output: Output::Score {
                 score: if self.opts.sigmoid {

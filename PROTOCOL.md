@@ -142,6 +142,7 @@ change what the numbers say they came from.
 | `dim` | The model's own dimension. |
 | `output_dim` | `--dims N`, when it truncated the output below `dim`. Absent when nothing was truncated, whether because the flag was not given or because `--dims` equalled `dim` and changed no vector. |
 | `max_seq_length` | Token-level truncation length for this run. |
+| `declared_max_seq_length` | What the checkpoint's `sentence_bert_config.json` says it can take, when it ships one. Reported, not obeyed: `--max-seq-length` decides the run. sentence-transformers reads this field, so a value above `max_seq_length` is where the two libraries embed the same long text differently (`ruri-v3-130m` declares 8192). |
 | `source`, `source_sha256` | `--device coreml` only: the checkpoint the bundle was converted from, and the digest of *its* weights. Absent for a bundle whose converter recorded none; an unknown provenance is reported as unknown rather than guessed. |
 | `buckets`, `quantization` | `--device coreml` only: the sequence lengths the bundle serves, and `none` / `embeddings-int8` / `all-int8`. A quantized bundle's vectors are not interchangeable with an fp16 one's, so a result that came from one should say so. |
 
