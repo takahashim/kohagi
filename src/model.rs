@@ -678,9 +678,11 @@ fn check_dims(dims: Option<usize>, dim: usize) -> Result<()> {
 /// That is an error either way, but only after the model is loaded and the
 /// input tokenized, and it names candle's tensors rather than the flag.
 ///
-/// The CoreML path does not need this: a bundle serves the lengths it was
-/// converted for, and `--max-seq-length` past the largest is already refused
-/// with the bucket list, which is the more useful of the two messages.
+/// The CoreML path does not need this. A bundle cannot be converted for a
+/// length past its positions in the first place (`EncoderConfig::check_lengths`
+/// refuses it: "the model would run and be wrong"), and a `--max-seq-length`
+/// past the largest bucket is already refused at load with the bucket named,
+/// which is the more useful of the two messages.
 pub(crate) fn check_max_seq(max_seq_length: usize, positions: usize) -> Result<()> {
     anyhow::ensure!(
         max_seq_length <= positions,
