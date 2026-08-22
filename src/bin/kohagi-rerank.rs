@@ -148,10 +148,12 @@ fn score_arguments(
     report_tokens: bool,
 ) -> anyhow::Result<()> {
     // `num_args = 2` accepts exactly two values or rejects the flag, so this
-    // slice has an even length and `chunks_exact` leaves no remainder.
+    // slice has an even length and `as_chunks` leaves no remainder.
     let pairs: Vec<(&str, &str)> = pair
-        .chunks_exact(2)
-        .map(|p| (p[0].as_str(), p[1].as_str()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[q, t]| (q.as_str(), t.as_str()))
         .collect();
     rerank::stdio::run_pairs(reranker, &pairs, report_tokens)
 }
