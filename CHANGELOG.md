@@ -11,19 +11,35 @@
   most of its 100 seconds paging, so the eight-worker default asked for ~44 GB
   and thrashed the machine instead of embedding anything.
 
-  The queries are now walked in tiles sized so a tile holds at most the same
+  The queries are now walked in blocks sized so a block holds at most the same
   budget the row cap enforces, and the padding mask is kept in its `[b, 1, 1, s]`
-  form instead of being spread over the query axis. That document now peaks at
-  1.1 GB and takes 43 seconds, and eight of them across the full pool fit in
-  5.8 GB. Peak memory is flat from 512 to 8192 tokens (1.02 GB to 1.07 GB, was
-  1.02 GB to 6.8 GB).
+  form instead of being spread over the query axis. Peak memory is flat from 512
+  to 8192 tokens (1.02 GB, was 1.02 GB to 6.8 GB), and eight 8192-token
+  documents across the full pool now fit in 2.4 GB.
 
-  **Every vector is unchanged**, byte for byte: tiling divides the queries and
+- **Long inputs are also several times faster.** ModernBERT gives 12 of ruri
+  v3's 19 layers a 128-token sliding window, and those layers were scoring every
+  key against every query only to mask almost all of it off again. Each block of
+  queries now reads just the keys its window opens.
+
+  One 8192-token document: 100 seconds before, 16 now, on one worker. Eight of
+  them across the full pool: 57 seconds, which the previous build could not run
+  at all. 120 512-token texts: 20.8 seconds before, 17.9 now.
+
+  | `--max-seq-length` | before | after |
+  |---:|---:|---:|
+  | 512 | 1.0 s / 1.02 GB | 1.0 s / 1.02 GB |
+  | 2048 | 3.2 s / 1.21 GB | 1.9 s / 1.02 GB |
+  | 4096 | 10.9 s / 2.00 GB | 4.6 s / 1.02 GB |
+  | 8192 | 99.9 s / 6.83 GB | 15.6 s / 1.02 GB |
+
+  **Every vector is unchanged**, byte for byte. Blocking divides the queries and
   nothing else, and softmax runs along the key axis, so each row is reduced over
-  the same keys in the same order. Verified against the previous build at 512,
-  1024, 2048, 4096 and 8192 tokens on the CPU, and at 512 and 2048 on Metal,
-  whose fused kernel this does not touch. Compute is unchanged too, so long
-  inputs are still quadratic in time: what went away is the paging.
+  the same keys in the same order. Narrowing to the window drops terms rather
+  than reordering them, and what it drops is `exp(-inf)`, an exact zero in both
+  the softmax denominator and the sum over V. Verified against the previous
+  build at 512, 1024, 2048, 4096 and 8192 tokens on the CPU, and at 512 and 2048
+  on Metal, whose fused kernel this does not touch.
 
 ## [0.6.0] - 2026-08-18
 

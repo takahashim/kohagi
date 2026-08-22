@@ -37,74 +37,13 @@ use super::simd::{exp512, Avx512};
 /// contributor.
 const EXP_FLOOR: f32 = -87.0;
 
-/// Which slice of the score matrix a call covers.
+/// The block geometry both encoders share, re-exported so [`super::modernbert`]
+/// can name it alongside [`masked_softmax`].
 ///
-/// A sliding-window layer only needs a band, and [`super::modernbert`] walks
-/// it one query block at a time: `queries` rows starting at `q0`, against
-/// `keys` columns starting at `k0`. The scores for that block are their own
-/// contiguous `[rows, heads, queries, keys]` buffer, but the mask is still the
-/// full `[rows, seq, seq]` one, so it is indexed with `seq` as the row stride.
-///
-/// The fields are read-only from outside; [`Block::full`] and [`Block::band`]
-/// are the two shapes that exist, and the second is where the arithmetic that
-/// makes banding correct lives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Block {
-    pub(super) seq: usize,
-    pub(super) q0: usize,
-    pub(super) queries: usize,
-    pub(super) k0: usize,
-    pub(super) keys: usize,
-}
-
-impl Block {
-    /// The whole matrix, which is what a global-attention layer wants.
-    pub fn full(seq: usize) -> Self {
-        Self {
-            seq,
-            q0: 0,
-            queries: seq,
-            k0: 0,
-            keys: seq,
-        }
-    }
-
-    /// The keys a block of queries can reach through a sliding window of
-    /// half-width `window`.
-    ///
-    /// Query `q0 + i` attends `[q0 + i - window, q0 + i + window]`, so the
-    /// block as a whole needs the union of those, clamped to the sequence.
-    /// Covering every open key is what lets the caller drop the rest of the
-    /// row: whatever this leaves out is masked shut, and contributes `exp` of
-    /// the mask floor rather than anything f32 can hold.
-    pub fn band(seq: usize, q0: usize, queries: usize, window: usize) -> Self {
-        debug_assert!(queries > 0 && q0 + queries <= seq);
-        let k0 = q0.saturating_sub(window);
-        let last = (q0 + queries - 1 + window).min(seq - 1);
-        Self {
-            seq,
-            q0,
-            queries,
-            k0,
-            keys: last + 1 - k0,
-        }
-    }
-
-    /// How many queries this block covers, for the caller sizing its buffers.
-    pub fn queries(&self) -> usize {
-        self.queries
-    }
-
-    /// Where the block's keys start, and how many there are.
-    pub fn keys(&self) -> (usize, usize) {
-        (self.k0, self.keys)
-    }
-
-    /// Where the block's queries start.
-    pub fn q0(&self) -> usize {
-        self.q0
-    }
-}
+/// A block's scores are their own contiguous `[rows, heads, queries, keys]`
+/// buffer, but the mask here is still the full `[rows, seq, seq]` one, which is
+/// why [`Block`] carries `seq` as well: it is the mask's row stride.
+pub use crate::attention::Block;
 
 /// Softmax `scores` in place, adding `mask` first.
 ///
@@ -451,67 +390,5 @@ mod block_tests {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod band_tests {
-    use super::*;
-
-    /// The band must contain every key the window leaves open for every query
-    /// in the block, and nothing is required beyond that. This is the whole
-    /// correctness argument for computing a band instead of a full row, so it
-    /// is checked exhaustively over the shapes rather than spot-checked.
-    #[test]
-    fn covers_every_key_the_window_opens() {
-        for seq in [1usize, 5, 32, 64, 129, 512] {
-            for window in [0usize, 1, 8, 64, 600] {
-                for size in [1usize, 3, 32] {
-                    for q0 in (0..seq).step_by(size) {
-                        let queries = size.min(seq - q0);
-                        let b = Block::band(seq, q0, queries, window);
-                        let (k0, keys) = b.keys();
-
-                        assert!(
-                            k0 + keys <= seq,
-                            "seq {seq} w {window} q0 {q0}: past the end"
-                        );
-                        for i in 0..queries {
-                            let q = q0 + i;
-                            let lo = q.saturating_sub(window);
-                            let hi = (q + window).min(seq - 1);
-                            assert!(
-                                k0 <= lo && hi < k0 + keys,
-                                "seq {seq} w {window} q0 {q0}: query {q} wants {lo}..={hi}, \
-                                 block has {k0}..{}",
-                                k0 + keys
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// A window wide enough to span the sequence degenerates to the full row,
-    /// which is what makes `banding_pays` in `super::modernbert` a pure
-    /// optimization rather than a correctness switch.
-    #[test]
-    fn a_window_spanning_the_sequence_is_the_full_row() {
-        let seq = 32;
-        assert_eq!(Block::band(seq, 0, seq, seq), Block::full(seq));
-    }
-
-    /// The first and last blocks are the ones that clamp, and an off-by-one in
-    /// either direction would silently drop a key.
-    #[test]
-    fn clamps_at_both_ends() {
-        let (seq, w) = (100usize, 10usize);
-        // At the start there is nothing to the left to reach for.
-        assert_eq!(Block::band(seq, 0, 8, w).keys(), (0, 8 + w));
-        // In the middle both sides are open.
-        assert_eq!(Block::band(seq, 50, 8, w).keys(), (40, 8 + 2 * w));
-        // At the end the right side runs out.
-        assert_eq!(Block::band(seq, 92, 8, w).keys(), (82, 18));
     }
 }

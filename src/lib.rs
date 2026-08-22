@@ -26,6 +26,7 @@
 //! [Ruri v3]: https://huggingface.co/cl-nagoya/ruri-v3-130m
 //! [candle]: https://github.com/huggingface/candle
 
+mod attention;
 mod batch;
 #[cfg(target_arch = "x86_64")]
 pub mod bf16;

@@ -283,12 +283,12 @@ enum Qkv {
 enum Mask {
     /// Padding and window already summed, as sdpa wants them.
     Dense(Tensor),
-    /// The padding mask `[b, 1, 1, s]`, plus the sliding window `[s, s]` on a
-    /// local layer. Summed one query tile at a time in [`attend_tile`].
-    Tiled {
-        keys: Tensor,
-        sliding: Option<Tensor>,
-    },
+    /// The padding mask `[b, 1, 1, s]`, plus a local layer's window as a
+    /// half-width rather than a matrix. Both are applied one block at a time in
+    /// [`attend_block`], which is what keeps either from being an `s^2` tensor,
+    /// and the half-width is also what lets that path skip the keys the window
+    /// shuts out instead of masking them.
+    Tiled { keys: Tensor, window: Option<usize> },
 }
 
 #[derive(Clone)]
@@ -404,14 +404,14 @@ impl ModernBertAttention {
                 ))?;
                 candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
             }
-            Mask::Tiled { keys, sliding } => {
+            Mask::Tiled { keys, window } => {
                 // The matmul cannot consume the transposed views, and there is
                 // no sdpa to hand them to, so materialize here rather than
                 // paying for it on both backends.
                 let (q, k, v) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
                 let q = (q * scale)?;
                 let tile = query_tile(seq_len, q.device());
-                attend_tiled(&q, &k, &v, keys, sliding.as_ref(), tile)?
+                attend_tiled(&q, &k, &v, keys, *window, tile)?
             }
         };
 
@@ -423,66 +423,143 @@ impl ModernBertAttention {
     }
 }
 
-/// Attention one query tile at a time, so the `[b, h, s, s]` score tensor is
-/// never built.
+/// Queries per block in a sliding-window layer.
 ///
-/// This is the dense computation, not an approximation of it. Softmax runs
-/// along the key axis, so query rows are independent: a row's scores, its
+/// A block reads `BAND_BLOCK + 2w` keys to serve `BAND_BLOCK` queries, so
+/// narrower blocks compute less of the score matrix, down to the `2w + 1` keys
+/// a single query needs. What stops it there is that each block is its own
+/// narrow, matmul, mask, softmax and matmul, and candle charges per call.
+///
+/// 120 512-token texts, fastest of five interleaved runs on an 8-core M-series:
+///
+/// | `BAND_BLOCK` | keys read per query block | encode |
+/// |---:|---:|---:|
+/// | 32 | 160 | **17.2 s** |
+/// | 64 | 192 | 20.2 s |
+/// | 128 | 256 | 22.0 s |
+/// | 256 | 384 | 23.2 s |
+///
+/// The order follows the key count, so nothing here has yet reached the width
+/// where per-call overhead takes over. At 8192 tokens all four land within 4%,
+/// because banding has already cut the sliding-window layers to 3% of the
+/// attention and the seven global ones decide the time. `bf16`'s `Q_BLOCK`
+/// measured the same 32 against its own kernels, which are not these.
+const BAND_BLOCK: usize = 32;
+
+/// Attention one block of queries at a time, so the `[b, h, s, s]` score
+/// tensor is never built.
+///
+/// Tiling alone is the dense computation, not an approximation of it. Softmax
+/// runs along the key axis, so query rows are independent: a row's scores, its
 /// softmax and its weighted sum of V are the same numbers reduced in the same
 /// order whether the row is computed with all the others or with 63 of them.
-/// What changes is only how many of them are in memory at once.
+///
+/// A sliding-window layer narrows the keys as well, which drops terms rather
+/// than reordering them. What it drops are the ones the window masks shut, and
+/// those contribute `exp(-inf)`, an exact zero, to both the softmax denominator
+/// and the sum over V. Nothing an f32 can hold is lost; what can move is how
+/// the remaining terms are grouped inside the GEMM, which is a rounding
+/// difference and is why this is measured rather than asserted.
 fn attend_tiled(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     keys: &Tensor,
-    sliding: Option<&Tensor>,
+    window: Option<usize>,
     tile: usize,
 ) -> Result<Tensor> {
     let (_, _, seq, _) = q.dims4()?;
-    let kt = k.transpose(D::Minus2, D::Minus1)?;
-    // Short inputs are one tile, which is the dense path with no narrow, no
-    // copy and no concatenation: the settings measured at 512 tokens are the
-    // ones still running there.
-    if tile >= seq {
-        return attend_tile(q, &kt, v, keys, sliding, 0, seq);
+    // Banding sets its own block width: the budget is not what limits it, since
+    // a band is `width * (width + 2w)` scores however long the sequence is.
+    let banded = matches!(window, Some(w) if crate::attention::banding_pays(seq, w));
+    let width = if banded { BAND_BLOCK } else { tile };
+    let blocks: Vec<_> =
+        crate::attention::blocks(seq, width, if banded { window } else { None }).collect();
+
+    // One block covering everything is the dense path, with no narrow, no copy
+    // and no concatenation: the settings measured at 512 tokens are the ones
+    // still running there.
+    if let [whole] = blocks[..] {
+        if whole.is_full() {
+            return attend_block(q, k, v, keys, window, whole);
+        }
     }
-    let mut tiles = Vec::with_capacity(seq.div_ceil(tile));
-    for start in (0..seq).step_by(tile) {
-        let rows = tile.min(seq - start);
-        // Narrowing the query axis leaves a strided view, and matmul wants its
-        // operands whole. The copy is `rows * heads * head_dim`, which is the
-        // small side of everything here.
-        let qt = q.narrow(2, start, rows)?.contiguous()?;
-        tiles.push(attend_tile(&qt, &kt, v, keys, sliding, start, rows)?);
+    let mut out = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        out.push(attend_block(q, k, v, keys, window, block)?);
     }
-    Tensor::cat(&tiles, 2)
+    Tensor::cat(&out, 2)
 }
 
-/// One tile's `softmax(q·kᵀ + mask)·v`, for query rows `start .. start + rows`.
-fn attend_tile(
+/// One block's `softmax(q·kᵀ + mask)·v`.
+fn attend_block(
     q: &Tensor,
-    kt: &Tensor,
+    k: &Tensor,
     v: &Tensor,
     keys: &Tensor,
-    sliding: Option<&Tensor>,
-    start: usize,
-    rows: usize,
+    window: Option<usize>,
+    block: crate::attention::Block,
 ) -> Result<Tensor> {
+    let (k0, n_keys) = block.keys();
+    let (q0, n_queries) = (block.q0(), block.queries());
+    // Narrowing the query axis leaves a strided view, and matmul wants its lhs
+    // whole. The copy is `queries * heads * head_dim`, the small side of
+    // everything here.
+    let qb = if n_queries == block.seq {
+        q.clone()
+    } else {
+        q.narrow(2, q0, n_queries)?.contiguous()?
+    };
+    let (kb, vb) = if n_keys == block.seq {
+        (k.clone(), v.clone())
+    } else {
+        (k.narrow(2, k0, n_keys)?, v.narrow(2, k0, n_keys)?)
+    };
+
     // Reassigned rather than shadowed: a shadowed binding lives to the end of
     // its block, so the pre-mask scores, the masked scores and the softmax
     // would all be alive at once. Reassigning drops each as the next is bound,
     // leaving the operation's own input and output as the peak.
-    let mut att = q.matmul(kt)?;
-    att = match sliding {
-        // Padding and window are summed into the tile's own shape first, which
-        // is one pass over the scores instead of two, and keeps the association
-        // the dense path used: `scores + (padding + window)`.
-        Some(w) => att.broadcast_add(&keys.broadcast_add(&w.narrow(0, start, rows)?)?)?,
-        None => att.broadcast_add(keys)?,
+    let mut att = qb.matmul(&kb.transpose(D::Minus2, D::Minus1)?)?;
+    // Padding and window are summed into the block's own shape first, which is
+    // one pass over the scores instead of two.
+    let padding = if n_keys == block.seq {
+        keys.clone()
+    } else {
+        keys.narrow(3, k0, n_keys)?
+    };
+    att = match window {
+        Some(w) => {
+            att.broadcast_add(&padding.broadcast_add(&window_mask(&block, w, q.device())?)?)?
+        }
+        None => att.broadcast_add(&padding)?,
     };
     att = softmax_last_dim(&att)?;
-    att.matmul(v)
+    att.matmul(&vb)
+}
+
+/// One block's slice of the sliding-window mask, `[queries, keys]`: 0 where the
+/// query can reach the key, `-inf` where the window shuts it out.
+///
+/// Built per block rather than once per forward as a `[s, s]` tensor. Summed
+/// over the blocks of a banded layer this touches `seq * (width + 2w)` entries
+/// instead of `seq^2`, which at 8192 tokens is 1.6M rather than 67M, and none
+/// of it stays resident.
+fn window_mask(block: &crate::attention::Block, window: usize, device: &Device) -> Result<Tensor> {
+    let (k0, n_keys) = block.keys();
+    let q0 = block.q0();
+    let mask: Vec<f32> = (q0..q0 + block.queries())
+        .flat_map(|i| {
+            (k0..k0 + n_keys).map(move |j| {
+                if j.abs_diff(i) > window {
+                    f32::NEG_INFINITY
+                } else {
+                    0.
+                }
+            })
+        })
+        .collect();
+    Tensor::from_slice(&mask, (block.queries(), n_keys), device)
 }
 
 /// How many query rows one score tile covers.
@@ -763,12 +840,13 @@ impl ModernBert {
     pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let dev = xs.device();
         let seq_len = xs.shape().dims()[1];
-        let sliding = get_local_attention_mask(seq_len, self.local_attention_size / 2, dev)?;
+        let window = self.local_attention_size / 2;
         let (global, local) = if dev.is_metal() {
             let padding = prepare_4d_attention_mask(mask, DType::F32, None)?.to_device(dev)?;
             // Summed once here rather than in each of the 13 local layers: the
             // sliding-window mask and the padding mask are identical across
             // layers, so their sum is too.
+            let sliding = get_local_attention_mask(seq_len, window, dev)?;
             let local = padding.broadcast_add(&sliding)?;
             (Mask::Dense(padding), Mask::Dense(local))
         } else {
@@ -776,11 +854,11 @@ impl ModernBert {
             (
                 Mask::Tiled {
                     keys: keys.clone(),
-                    sliding: None,
+                    window: None,
                 },
                 Mask::Tiled {
                     keys,
-                    sliding: Some(sliding),
+                    window: Some(window),
                 },
             )
         };
@@ -860,13 +938,43 @@ mod attention_tests {
             .collect()
     }
 
-    fn same_as_dense(sliding: Option<&Tensor>, tile: usize) {
+    /// How far apart two outputs are: the largest absolute gap, the largest
+    /// value in the reference, and `1 - cos` between them.
+    ///
+    /// Absolute rather than in ULP. An attention output is a weighted mean of
+    /// values spread over `[-1, 1]`, so many of them sit near zero by
+    /// cancellation, and there a gap of one part in ten million is hundreds of
+    /// ULP while meaning nothing. What the vectors downstream are sensitive to
+    /// is the gap against the scale of the output, and their direction.
+    fn distance(a: &Tensor, b: &Tensor) -> (f32, f32, f64) {
+        let (a, b) = (
+            a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        let scale = b.iter().map(|y| y.abs()).fold(0f32, f32::max);
+        let norm = |t: &[f32]| t.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let dot: f64 = a.iter().zip(&b).map(|(x, y)| *x as f64 * *y as f64).sum();
+        (worst, scale, 1.0 - dot / (norm(&a) * norm(&b)))
+    }
+
+    fn against_dense(window: Option<usize>, tile: usize) -> (Tensor, Tensor) {
         let (q, k, v) = (spread(0.0), spread(11.0), spread(23.0));
         let keys = keys();
-        let tiled = attend_tiled(&q, &k, &v, &keys, sliding, tile).unwrap();
-        let dense = attend_dense(&q, &k, &v, &keys, sliding);
-        assert_eq!(tiled.dims(), dense.dims());
-        assert_eq!(bits(&tiled), bits(&dense));
+        let sliding = window.map(|w| get_local_attention_mask(S, w, &Device::Cpu).unwrap());
+        let blocked = attend_tiled(&q, &k, &v, &keys, window, tile).unwrap();
+        let dense = attend_dense(&q, &k, &v, &keys, sliding.as_ref());
+        assert_eq!(blocked.dims(), dense.dims());
+        (blocked, dense)
+    }
+
+    fn same_as_dense(window: Option<usize>, tile: usize) {
+        let (blocked, dense) = against_dense(window, tile);
+        assert_eq!(bits(&blocked), bits(&dense));
     }
 
     /// Tiling divides the queries and nothing else, so a global layer's output
@@ -876,22 +984,40 @@ mod attention_tests {
         same_as_dense(None, TILE);
     }
 
-    /// The same for a sliding-window layer, where each tile also has to take
-    /// its own rows of the window mask.
+    /// A window too wide to band by is still a window: every key is scored and
+    /// the mask does the work, so this is the dense result too.
     #[test]
-    fn tiled_window_attention_is_the_dense_one() {
-        let sliding = get_local_attention_mask(S, 16, &Device::Cpu).unwrap();
-        same_as_dense(Some(&sliding), TILE);
+    fn a_window_too_wide_to_band_is_the_dense_one() {
+        assert!(!crate::attention::banding_pays(S, 60));
+        same_as_dense(Some(60), TILE);
     }
 
-    /// A tile at least as wide as the sequence takes the single-tile path,
-    /// which skips the narrow and the concatenation.
+    /// One block covering everything takes the path with no narrow and no
+    /// concatenation.
     #[test]
     fn a_single_tile_is_the_dense_one() {
-        let sliding = get_local_attention_mask(S, 16, &Device::Cpu).unwrap();
         same_as_dense(None, S);
-        same_as_dense(Some(&sliding), S);
-        same_as_dense(Some(&sliding), S * 4);
+        same_as_dense(None, S * 4);
+    }
+
+    /// Banding drops the keys the window shuts out rather than masking them.
+    /// Those terms are `exp(-inf)`, an exact zero in both the softmax
+    /// denominator and the sum over V, so nothing is lost by dropping them.
+    ///
+    /// What does move is the grouping of the terms that remain: a 96-key
+    /// reduction is not blocked the way a 128-key one is, and the GEMM rounds
+    /// accordingly. This pins how far that is allowed to go. Measured here:
+    /// 3.0e-7 against outputs reaching 0.98, and `1 - cos` of 8e-15.
+    #[test]
+    fn banding_matches_the_dense_result() {
+        assert!(crate::attention::banding_pays(S, 16));
+        let (banded, dense) = against_dense(Some(16), TILE);
+        let (worst, scale, off_cos) = distance(&banded, &dense);
+        assert!(
+            worst <= 1e-6 * scale,
+            "banding moved a value by {worst:e} against a scale of {scale:e}"
+        );
+        assert!(off_cos <= 1e-12, "banding turned the output by {off_cos:e}");
     }
 
     /// The handover with `model::rows_per_forward`: up to `sqrt(budget)` a tile
