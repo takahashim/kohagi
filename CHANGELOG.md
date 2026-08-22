@@ -4,49 +4,13 @@
 
 ### Changed
 
-- **Long inputs no longer cost quadratic memory.** The CPU and CUDA attention
-  walked the whole `[rows, heads, seq, seq]` score matrix at once, and the
-  row-count cap that was supposed to bound it can go no lower than one row: past
-  seq 724 nothing held it back. One 8192-token document needed 6.8 GB and spent
-  most of its 100 seconds paging, so the eight-worker default asked for ~44 GB
-  and thrashed the machine instead of embedding anything.
+- **Long inputs cost far less time and memory.** Peak memory is now flat from
+  512 to 8192 tokens (1.0 GB, was up to 6.8 GB), and an 8192-token document
+  takes 16 s instead of 100 s on one worker. The eight-worker default can embed
+  8192-token documents at all, in 2.4 GB.
 
-  The queries are now walked in blocks sized so a block holds at most the same
-  budget the row cap enforces, and the padding mask is kept in its `[b, 1, 1, s]`
-  form instead of being spread over the query axis. Peak memory is flat from 512
-  to 8192 tokens (1.02 GB, was 1.02 GB to 6.8 GB), and eight 8192-token
-  documents across the full pool now fit in 2.4 GB.
-
-- **Long inputs are also several times faster.** ModernBERT gives 12 of ruri
-  v3's 19 layers a 128-token sliding window, and those layers were scoring every
-  key against every query only to mask almost all of it off again. Each block of
-  queries now reads just the keys its window opens.
-
-  One 8192-token document: 100 seconds before, 16 now, on one worker. Eight of
-  them across the full pool: 57 seconds, which the previous build could not run
-  at all. 120 512-token texts: 20.8 seconds before, 17.9 now.
-
-  | `--max-seq-length` | before | after |
-  |---:|---:|---:|
-  | 512 | 1.0 s / 1.02 GB | 1.0 s / 1.02 GB |
-  | 2048 | 3.2 s / 1.21 GB | 1.9 s / 1.02 GB |
-  | 4096 | 10.9 s / 2.00 GB | 4.6 s / 1.02 GB |
-  | 8192 | 99.9 s / 6.83 GB | 15.6 s / 1.02 GB |
-
-  **The vectors are the same ones.** Blocking divides the queries and nothing
-  else, and softmax runs along the key axis, so each row is scored over the same
-  keys. Narrowing to the window drops terms rather than reordering them, and
-  what it drops is `exp(-inf)`, an exact zero in both the softmax denominator
-  and the sum over V.
-
-  What that leaves is f32 rounding: a GEMM blocks its reduction by the shape it
-  is handed, so the arithmetic that is exactly equal need not land on the same
-  bits. It usually does. Against the previous build at 512, 1024, 2048, 4096 and
-  8192 tokens the output was byte-identical on macOS 26 (Accelerate, arm64), and
-  on Metal at 512 and 2048, whose fused kernel this does not touch. On a BLAS
-  that blocks differently the gap is a part in a million or so: 1.8e-6 against
-  values reaching 1.0 on macOS 14, with the direction of the vector moving by
-  1e-12. An index built with 0.6.0 does not need rebuilding.
+  Vectors are unchanged to f32 rounding (worst 1.8e-6 against values reaching
+  1.0), so an index built with 0.6.0 does not need rebuilding.
 
 ## [0.6.0] - 2026-08-18
 

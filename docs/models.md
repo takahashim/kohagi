@@ -84,12 +84,8 @@ $ echo '{"id": 1, "text": "…a very long document…"}' | kohagi --report-token
 {"id":1,"embedding":[…],"n_tokens":512,"truncated":true}
 ```
 
-- Raising `--max-seq-length` embeds more of each text at a cost in attention
-  compute that grows faster than the text does. It is the single flag with the
-  largest effect on throughput: on `ruri-v3-130m` (f32, one worker) a document
-  takes 1.0 s at 512 tokens, 4.6 s at 4096 and 15.6 s at 8192.
-- Memory is not what it costs. The encoder scores the attention in fixed-size
-  blocks, so peak memory is flat across that whole range (1.02 GB). Time is what
-  a longer window buys with.
+- Raising `--max-seq-length` embeds more of each text, and time is what it costs
+  (`ruri-v3-130m`, f32, one worker: 1.0 s per document at 512 tokens, 4.6 s at
+  4096, 15.6 s at 8192). Peak memory is flat across that range.
 - On `--device coreml` the largest converted bucket caps `--max-seq-length`; see
   [CoreML bundles](coreml.md).
