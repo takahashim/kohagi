@@ -41,6 +41,22 @@ kohagi --model-id cl-nagoya/ruri-v3-310m --prefix "検索文書: " < texts.jsonl
   `--print-model-info`. Two runs of the same weights under different pooling
   produce embeddings that must not share an index.
 
+## Truncated dimensions (`--dims`)
+
+- `--dims N` keeps the first N dimensions of each embedding and re-normalizes,
+  matching `SentenceTransformer(model, truncate_dim=N)`. This is Matryoshka
+  truncation, for models trained so a prefix of the vector is itself a usable
+  embedding.
+- Whether the shorter vectors retrieve well is the model's property, not
+  Kohagi's. A checkpoint trained with Matryoshka loss keeps most of its
+  quality at half dimension; one that was not may lose a great deal. Measure
+  on your own data before committing an index to it.
+- Truncated and full vectors must not share an index. The summary's `dim=` and
+  `--print-model-info`'s `output_dim` record which one a run produced.
+- N outside `1..=dim` is refused at load, as is combining with
+  `--no-normalize` (re-normalization is what keeps dot product = cosine on the
+  shorter vectors).
+
 ## Offline files
 
 - Point Kohagi at local files and it makes no network requests:
@@ -68,8 +84,8 @@ $ echo '{"id": 1, "text": "…a very long document…"}' | kohagi --report-token
 {"id":1,"embedding":[…],"n_tokens":512,"truncated":true}
 ```
 
-- Raising `--max-seq-length` embeds more of each text at a quadratic cost in
-  attention compute. It is the single flag with the largest effect on
-  throughput.
+- Raising `--max-seq-length` embeds more of each text, and time is what it costs
+  (`ruri-v3-130m`, f32, one worker: 1.0 s per document at 512 tokens, 4.6 s at
+  4096, 15.6 s at 8192). Peak memory is flat across that range.
 - On `--device coreml` the largest converted bucket caps `--max-seq-length`; see
   [CoreML bundles](coreml.md).

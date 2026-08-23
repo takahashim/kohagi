@@ -22,6 +22,7 @@
 
 use std::sync::Arc;
 
+use crate::attention::{banding_pays, blocks, Block};
 use crate::encoder::Config;
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor, D};
@@ -29,7 +30,7 @@ use candle_nn::{embedding, layer_norm_no_bias, Embedding, LayerNorm, VarBuilder}
 
 use super::geglu;
 use super::gemm::Bf16Linear;
-use super::softmax::{self, Block};
+use super::softmax;
 
 /// Queries per block in the sliding-window attention path.
 ///
@@ -51,15 +52,6 @@ use super::softmax::{self, Block};
 ///
 /// 16 computes the least and finishes no faster than not banding at all.
 const Q_BLOCK: usize = 32;
-
-/// Whether walking the band beats computing the whole score matrix.
-///
-/// It cannot help once the window already spans the sequence, and near that
-/// point the block overhead outweighs what little is masked off, so this
-/// wants the band to be a real fraction of the row.
-fn banding_pays(seq: usize, window: usize) -> bool {
-    seq > 2 * (2 * window + 1)
-}
 
 /// Apply a bf16 `Linear` to a tensor whose last dimension is the Linear's
 /// input width, flattening the leading dimensions into GEMM rows.
@@ -205,12 +197,11 @@ impl Attention {
     /// dropping them moves the result by far less than f32 can represent.
     fn banded(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: &[f32], w: usize) -> Result<Tensor> {
         let seq = q.dim(2)?;
-        let mut blocks = Vec::with_capacity(seq.div_ceil(Q_BLOCK));
-        for q0 in (0..seq).step_by(Q_BLOCK) {
-            let block = Block::band(seq, q0, Q_BLOCK.min(seq - q0), w);
-            blocks.push(self.attend(q, k, v, mask, block)?);
+        let mut out = Vec::with_capacity(seq.div_ceil(Q_BLOCK));
+        for block in blocks(seq, Q_BLOCK, Some(w)) {
+            out.push(self.attend(q, k, v, mask, block)?);
         }
-        Tensor::cat(&blocks, 2).map_err(Into::into)
+        Tensor::cat(&out, 2).map_err(Into::into)
     }
 }
 

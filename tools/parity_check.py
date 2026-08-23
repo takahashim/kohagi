@@ -56,6 +56,12 @@ def main() -> int:
         help="'model' uses the checkpoint's own 1_Pooling config on both sides; "
         "'mean'/'cls' force that mode on both sides instead",
     )
+    p.add_argument(
+        "--dims",
+        type=int,
+        help="Matryoshka truncation on both sides: kohagi --dims N against "
+        "SentenceTransformer(..., truncate_dim=N)",
+    )
     p.add_argument("--texts", help="file with one text per line (default: built-in samples)")
     args = p.parse_args()
 
@@ -77,6 +83,10 @@ def main() -> int:
     ]
     if args.pooling != "model":
         cmd += ["--pooling", args.pooling]
+    # `is not None`, not truthiness: --dims 0 must reach kohagi (which refuses
+    # it, exit 1) rather than silently configure the two sides differently.
+    if args.dims is not None:
+        cmd += ["--dims", str(args.dims)]
     proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
     if proc.returncode == 1:
         sys.stderr.write(proc.stderr)
@@ -86,14 +96,14 @@ def main() -> int:
 
     # --- the reference -------------------------------------------------------
     if args.pooling == "model":
-        model = SentenceTransformer(args.model_id)
+        model = SentenceTransformer(args.model_id, truncate_dim=args.dims)
     else:
         # Rebuild the stack so the pooling mode is ours rather than the
         # checkpoint's, which is the only way to exercise a mode the model was
         # not published with.
         body = models.Transformer(args.model_id, max_seq_length=args.max_seq_length)
         head = models.Pooling(body.get_word_embedding_dimension(), pooling_mode=args.pooling)
-        model = SentenceTransformer(modules=[body, head])
+        model = SentenceTransformer(modules=[body, head], truncate_dim=args.dims)
     model.max_seq_length = args.max_seq_length  # match Kohagi's truncation
     ref = model.encode(
         [args.prefix + t for t in texts],

@@ -23,7 +23,7 @@ client.embeddings.create(model="ruri-v3-130m", input=["…", "…"])
 
 ## Why this exists
 
-That `base_url` swap is the whole value of OpenAI compatibility — it is what
+That `base_url` swap is the whole value of OpenAI compatibility. It is what
 lets LangChain, LlamaIndex and everything else built against that API use a
 local model without a rewrite. The JSON shape alone does not get you there; the
 HTTP transport does.
@@ -31,7 +31,7 @@ HTTP transport does.
 Kohagi has no HTTP mode and should not grow one. It speaks JSONL over a pipe,
 which is a smaller contract and works from any language that can spawn a
 process. These files are the bridge, so declining to build a server into Kohagi
-does not cost anyone the OpenAI ecosystem — and if nobody wants them, they are
+does not cost anyone the OpenAI ecosystem. And if nobody wants them, they are
 examples, so they can go.
 
 ## How they work
@@ -45,8 +45,8 @@ assemble here.
 A request costs about 40 ms warm, against 300 ms when each spawned its own
 Kohagi.
 
-**One request at a time.** All three serialize — a lock in Python, a mutex in
-Ruby, a promise chain in TypeScript. Kohagi's stdout carries batches in the
+**One request at a time.** All three serialize, with a lock in Python, a
+mutex in Ruby, and a promise chain in TypeScript. Kohagi's stdout carries batches in the
 order the batches were asked for and nothing ties a reply to a requester, so two
 overlapping requests would each read the other's response. This is not
 theoretical for `proxy.rb`: Puma serves on a thread pool, so the threads queue

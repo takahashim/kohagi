@@ -130,6 +130,7 @@ fn gather(args: &Args) -> Result<Checkpoint> {
             config: fetch("config.json")?,
             tokenizer: fetch("tokenizer.json")?,
             pooling,
+            sentence_config: fetch("sentence_bert_config.json").ok(),
             source: repo.clone(),
         });
     }
@@ -148,6 +149,10 @@ fn gather(args: &Args) -> Result<Checkpoint> {
         pooling: weights
             .parent()
             .map(|d| d.join("1_Pooling").join("config.json"))
+            .filter(|p| p.is_file()),
+        sentence_config: weights
+            .parent()
+            .map(|d| d.join("sentence_bert_config.json"))
             .filter(|p| p.is_file()),
         source: weights.display().to_string(),
         weights,
@@ -224,10 +229,12 @@ fn run(args: &Args) -> Result<()> {
 }
 
 fn main() -> ExitCode {
+    // Set the prefix before the emitter can write warnings.
+    kohagi::program::set("coreml-convert");
     match run(&Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("coreml-convert: error: {e:#}");
+            eprintln!("{}: error: {e:#}", kohagi::program::name());
             ExitCode::FAILURE
         }
     }

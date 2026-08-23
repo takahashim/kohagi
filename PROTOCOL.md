@@ -6,7 +6,7 @@ schema; the caller owns the data and maps results back by `id`.
 
 A design principle follows from that: **text shaping is the caller's job.**
 Kohagi never trims, truncates (by characters), deduplicates, or otherwise
-edits the text it receives — it only prepends the configured `--prefix`,
+edits the text it receives. It only prepends the configured `--prefix`,
 tokenizes (with token-level truncation to `--max-seq-length`), and embeds. If
 you store a digest of what you sent, it corresponds to exactly what was
 embedded.
@@ -22,8 +22,8 @@ embedded.
 | `id` | any JSON value | **Opaque.** Echoed verbatim in the output; never interpreted. |
 | `text` | string | Raw text, without the task prefix. Keep newlines JSON-escaped (`\n`) so each record is one physical line. |
 
-- **Skips (non-fatal).** A line is skipped — with `kohagi: skip line N:
-  <reason>` on stderr and a count in the summary — when it is not valid JSON,
+- **Skips (non-fatal).** A line is skipped (with `kohagi: skip line N:
+  <reason>` on stderr and a count in the summary) when it is not valid JSON,
   not a JSON object, has no `id`, or has a missing / empty / non-string
   `text`. Processing continues; resend skipped records in a later run.
 - **Blank lines** (empty or whitespace-only) are silently ignored and not
@@ -62,6 +62,14 @@ costs a marker rather than a deadlock.
   output order matches input order, but the contract doesn't promise it).
 - `embedding` has the model's dimension (512 for ruri-v3-130m) and is
   L2-normalized unless `--no-normalize` is set.
+- **`--dims N`** keeps only the first N dimensions and re-normalizes them
+  (Matryoshka truncation), so dot = cosine still holds on the shorter vectors.
+  That is why the flag refuses to combine with `--no-normalize`, and why a
+  truncated run's vectors must not share an index with a full run's. N outside
+  `1..=dim` is refused at load, before any input is read. The result matches
+  `SentenceTransformer(model, truncate_dim=N)`; whether the shorter vectors are
+  any good is the model's property (one trained with Matryoshka loss keeps
+  most of its quality, others may not).
 - **`--report-tokens`** adds two fields per record; without the flag they are
   omitted entirely, so the default output is unchanged.
 
@@ -71,14 +79,14 @@ costs a marker rather than a deadlock.
 
   | field | type | notes |
   |---|---|---|
-  | `n_tokens` | integer | Tokens actually embedded, special tokens included — `min(true length, --max-seq-length)`. |
+  | `n_tokens` | integer | The number of tokens actually embedded, special tokens included, which is `min(true length, --max-seq-length)`. |
   | `truncated` | bool | The text ran past `--max-seq-length`, so its tail was dropped; the vector reflects only the kept prefix. Route these to a chunking pass if whole-document coverage matters. |
 - stdout carries records only; every line is written whole (one `write` per
   record), so a reader never sees a partial line. Logs, warnings, and the
   summary go to stderr.
 - Internally Kohagi encodes in chunks (1024 records) against a single model
-  load and flushes output after each chunk — resident memory stays flat on
-  arbitrarily large input, and the caller can consume results incrementally.
+  load and flushes output after each chunk, so resident memory stays flat on
+  arbitrarily large input and the caller can consume results incrementally.
   **Read stdout concurrently while writing stdin** (e.g. a reader thread);
   writing everything before reading anything can deadlock both processes on
   the pipe buffer.
@@ -99,8 +107,9 @@ to raise `--max-seq-length` or chunk those documents, not an error.
 The fields before `in` describe the model rather than the run: `sha256` is the
 first 12 hex digits of the weights file's digest, and `pooling` / `dim` /
 `max_seq` are the three settings that silently change every vector when they
-differ. Together they make a captured log say *which* model produced the
-vectors, not just which one was asked for — two fine-tunes of one checkpoint,
+differ. `dim` is the dimension the vectors actually have, which is `--dims N`
+when that flag truncated them and the model's own otherwise. Together they make a captured log say *which* model produced the
+vectors, not just which one was asked for. Two fine-tunes of one checkpoint,
 or two blends of one pair, are otherwise indistinguishable in a log.
 
 Input with no valid records never loads the model, and the line then carries
@@ -129,20 +138,50 @@ change what the numbers say they came from.
 | `model` | The name this run used: the `--model-id` repo, or the directory of a `--model-path` checkpoint. |
 | `backend` / `precision` | `--device` and `--precision`, as their flag values. |
 | `sha256` | Of every byte of `model.safetensors`. Identical weights always give an identical digest, and one byte's difference gives a different one. Absent on `--device coreml`, which has no safetensors to hash. |
-| `pooling` | What was resolved at load — the checkpoint's own `1_Pooling/config.json` unless `--pooling` overrode it. |
-| `dim` | Output dimension. |
+| `pooling` | The pooling resolved at load, taken from the checkpoint's own `1_Pooling/config.json` unless `--pooling` overrode it. |
+| `dim` | The model's own dimension. |
+| `output_dim` | `--dims N`, when it truncated the output below `dim`. Absent when nothing was truncated, whether because the flag was not given or because `--dims` equalled `dim` and changed no vector. |
 | `max_seq_length` | Token-level truncation length for this run. |
-| `source`, `source_sha256` | `--device coreml` only: the checkpoint the bundle was converted from, and the digest of *its* weights. Absent for a bundle whose converter recorded none — an unknown provenance is reported as unknown rather than guessed. |
+| `declared_max_seq_length` | What the checkpoint's `sentence_bert_config.json` says it can take, when it ships one. Reported, not obeyed: `--max-seq-length` decides the run. sentence-transformers reads this field, so a value above `max_seq_length` is where the two libraries embed the same long text differently (`ruri-v3-130m` declares 8192). |
+| `source`, `source_sha256` | `--device coreml` only: the checkpoint the bundle was converted from, and the digest of *its* weights. Absent for a bundle whose converter recorded none; an unknown provenance is reported as unknown rather than guessed. |
 | `buckets`, `quantization` | `--device coreml` only: the sequence lengths the bundle serves, and `none` / `embeddings-int8` / `all-int8`. A quantized bundle's vectors are not interchangeable with an fp16 one's, so a result that came from one should say so. |
 
 Fields that do not apply to a run are omitted rather than set to null.
 
+## `--expect-sha256`
+
+The digest above makes a run recordable; this flag makes the record
+enforceable. Pass a hex prefix of the expected digest (the summary's 12
+digits, or the full 64 from `--print-model-info`) and Kohagi refuses to embed
+anything with weights whose digest does not start with it:
+
+```console
+$ kohagi --model-path models/alpha05/model.safetensors … --expect-sha256 1c342581efc2 < texts.jsonl
+kohagi: error: these are not the expected weights: --expect-sha256 1c342581efc2, but the loaded model's sha256 is e831a463bddb…
+$ echo $?
+1
+```
+
+- The check runs when the model loads, so a mismatch produces **no output at
+  all**. The run exits 1 before any record is answered. A pipeline that recorded the
+  digest beside its index can paste it back and be certain the wrong
+  checkpoint (a renamed directory, a mixed-up interpolation, a stale download)
+  never adds a vector to that index.
+- On `--device coreml` the check reads the bundle's recorded `source_sha256`,
+  the digest of the checkpoint it was converted from, which is the value a
+  caller has. A bundle that recorded
+  none (converted before Kohagi 0.6) cannot be verified and is refused.
+- Empty input still exits 0 without loading the model, as ever; nothing was
+  embedded, so nothing needed verifying.
+- `--print-model-info --expect-sha256 <hex>` is a standalone check. It exits 0
+  with the model's facts when the digest matches, and 1 when it does not.
+
 | exit | meaning |
 |---|---|
-| 0 | every record embedded (`skipped=0`). Empty input is also 0 — nothing to do is success, and the model is not even loaded. |
-| 2 | finished, but ≥1 line was skipped. Received output lines are all valid — consume them, then investigate stderr and resend the skipped records. |
+| 0 | every record embedded (`skipped=0`). Empty input is also 0. Nothing to do is success, and the model is not even loaded. |
+| 2 | finished, but ≥1 line was skipped. Received output lines are all valid. Consume them, then investigate stderr and resend the skipped records. |
 | 1 | fatal: model load failure, bad flags, I/O error. Output may be truncated at a line boundary (never mid-line). |
-| 3 | the requested CoreML backend (`--device coreml`) cannot serve this request: built without the `coreml` feature, no `--coreml-dir`, no converted bucket for `--max-seq-length`, or a missing model. Detected before any input is read, so no output is produced — the caller can retry on `--device cpu`. Only ever returned when `--device coreml` is passed. |
+| 3 | the requested CoreML backend (`--device coreml`) cannot serve this request: built without the `coreml` feature, no `--coreml-dir`, no converted bucket for `--max-seq-length`, or a missing model. Detected before any input is read, so no output is produced and the caller can retry on `--device cpu`. Only ever returned when `--device coreml` is passed. |
 
 ## `--format openai`
 
@@ -156,7 +195,7 @@ replaces the JSONL stream with one response object for the whole run:
  "usage": {"prompt_tokens": 15, "total_tokens": 15}}
 ```
 
-Everything on stdin is unchanged — the input is still this protocol's JSONL.
+Everything on stdin is unchanged; the input is still this protocol's JSONL.
 What changes on stdout:
 
 - **Embeddings are identified by `index`, not by id.** `index` is the position
@@ -168,7 +207,7 @@ What changes on stdout:
   summary line still reports `truncated=N`.
 - **One document per batch.** A blank line closes the current response and
   starts the next, with `index` counting from zero again and `usage` covering
-  that batch alone — one flush is one request's worth. With no blank lines the
+  that batch alone; one flush is one request's worth. With no blank lines the
   whole run is one document, which is what `kohagi --format openai < in.jsonl >
   out.json` produces.
 - **An aborted run leaves an incomplete JSON document.** JSONL degrades to a

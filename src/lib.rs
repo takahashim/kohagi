@@ -26,6 +26,7 @@
 //! [Ruri v3]: https://huggingface.co/cl-nagoya/ruri-v3-130m
 //! [candle]: https://github.com/huggingface/candle
 
+mod attention;
 mod batch;
 #[cfg(target_arch = "x86_64")]
 pub mod bf16;
@@ -44,11 +45,17 @@ mod fingerprint;
 #[cfg(any(feature = "coreml", test))]
 mod fnv;
 mod fused;
+mod info;
 mod model;
+pub mod program;
+mod protocol;
 pub mod rerank;
+mod source;
 pub mod stdio;
 
 pub use batch::{Pooling, TokenInfo};
 pub use config::{CoreMlForm, CoreMlQuantize};
 pub use errors::UnsupportedRequest;
-pub use model::{Backend, Embedder, ModelInfo, ModelSource, Options, Precision};
+pub use info::{Bundle, ModelInfo, Output};
+pub use model::{Backend, Embedder, Options, Precision};
+pub use source::ModelSource;

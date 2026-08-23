@@ -39,6 +39,7 @@ use objc2_core_ml::{
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 use tokenizers::Encoding;
 
+use crate::program::remark;
 use crate::UnsupportedRequest;
 
 pub use provision::fetch_from_hub;
@@ -55,8 +56,8 @@ fn warn_if_quantized(model: &MLModel) {
     else {
         return;
     };
-    eprintln!(
-        "kohagi: this CoreML bundle is quantized ({quantization}); its vectors are not \
+    remark!(
+        "this CoreML bundle is quantized ({quantization}); its vectors are not \
          interchangeable with an fp16 bundle's, so do not mix them in one index"
     );
 }

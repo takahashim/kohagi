@@ -1,5 +1,128 @@
 # Changelog
 
+## [0.6.0] - 2026-08-23
+
+### Added
+
+- **`--dims N`: Matryoshka truncation.** Keeps the first N dimensions of each
+  embedding and re-normalizes, matching `SentenceTransformer(model,
+  truncate_dim=N)` (worst `1 - cos` 1.8e-11), on every device. The summary's
+  `dim=` reports the output dimension; `--print-model-info` keeps `dim` as the
+  model's own and adds `output_dim`. N outside `1..=dim` and combining with
+  `--no-normalize` are refused at load. Truncated and full vectors must not
+  share an index.
+
+- **`--expect-sha256 <hex>`.** Pass a prefix of the expected digest (the
+  summary's 12 digits or the full 64) and either binary refuses weights whose
+  digest does not start with it. The run exits 1 at load, before any output. On
+  `--device coreml` the bundle's recorded `source_sha256` is checked; a bundle
+  that recorded none (converted before 0.6) is refused, as is one whose weights
+  were rewritten while they loaded: an expectation that cannot be verified is
+  refused rather than assumed. Combine with `--print-model-info` for a
+  standalone check.
+
+- **`kohagi-rerank`: a cross-encoder for reordering search results.** Reads
+  `{"id","query","text"}` JSONL and writes `{"id","score"}`, under the same
+  protocol rules as `kohagi`; see [PROTOCOL-rerank.md](PROTOCOL-rerank.md).
+  Retrieval finds candidates; this reorders them, at a forward pass per pair.
+
+  It runs any one-label ModernBERT sequence-classification checkpoint, which
+  `cl-nagoya/ruri-v3-reranker-310m` and the `hotchpotch/japanese-reranker-*-v2`
+  family all are. The score is the sigmoid `sentence_transformers.CrossEncoder`
+  returns for such a model, matched to f32 rounding (worst |diff| 5.1e-07), so
+  **thresholds tuned against that library carry over unchanged**; `--raw-logits`
+  gives the logit instead.
+
+  `--device coreml` runs it on the Neural Engine at 18.5 pairs/s against 3.3 on
+  the CPU (`ruri-v3-reranker-310m`, M2).
+
+- **Every run says which weights answered.** The stderr summary now carries the
+  sha256 of the loaded `model.safetensors`, plus the resolved pooling, dimension
+  and `max_seq_length`. Fine-tuned checkpoints differ only in their bytes, so a
+  results file that records a path records what someone meant to run rather than
+  what ran. The digest matches `sha256sum` on the same file, and costs nothing:
+  it is computed alongside the encoding.
+
+- **`--print-model-info`** writes those same facts as one JSON line on stdout and
+  exits without reading stdin, for an evaluation script to record beside its
+  numbers. On both binaries.
+
+- **`--print-model-info` also reports `declared_max_seq_length`**: the token
+  limit the checkpoint's `sentence_bert_config.json` declares, which
+  sentence-transformers obeys and Kohagi does not. `--max-seq-length` decides
+  the run and still defaults to 512, so a model declaring more (`ruri-v3-130m`
+  declares 8192) embeds a long text differently under the two libraries. This
+  is where that is visible. Converted CoreML bundles carry the file too.
+
+- **A converted CoreML bundle records the checkpoint it came from**, as a Hub id
+  or path and as that checkpoint's sha256, reported as `source` and
+  `source_sha256`. `scripts/convert_coreml.py` records the same.
+
+- **New library API:** `kohagi::rerank`, `ModelInfo` with `Embedder::info` and
+  `Reranker::info`, and `kohagi::cli`. `ModelInfo` carries a converted bundle's
+  facts as a `Bundle` and a run's answer shape as an `Output` (`Embedding` with
+  its `output_dim`, or `Score`), so a model cannot claim both; the JSON
+  `--print-model-info` writes is unchanged. `kohagi::program` names the running
+  binary, which is the prefix every stderr line carries.
+
+### Changed
+
+- **Long inputs cost far less time and memory.** Peak memory is now flat from
+  512 to 8192 tokens (1.0 GB, was up to 6.8 GB), and an 8192-token document
+  takes 16 s instead of 100 s on one worker. The eight-worker default can embed
+  8192-token documents at all, in 2.4 GB. Vectors are unchanged to f32 rounding
+  (worst 1.8e-6 against values reaching 1.0), so an index built with 0.5.1 does
+  not need rebuilding.
+
+- **The stderr summary line has more fields, and `dim=` moved.** From
+  `model=… dim=512 in=…` to
+  `model=… sha256=1c342581efc2 pooling=mean dim=512 max_seq=512 in=…`.
+  **Anything parsing that line by position needs updating**; by key it does not.
+  A CoreML bundle reports `source_sha256=` in place of `sha256=`.
+
+- **A checkpoint is labelled by its directory** when its weights file is
+  `model.safetensors`, which every fine-tune's is: `model=alpha05` rather than
+  `model=model.safetensors` for every model on the machine.
+
+- **`Options` has a new `dims` field**, and `Embedder::dim` returns the output
+  dimension (`dims` when set, `hidden_size` otherwise). A breaking change for
+  library code building `Options` by struct literal; `..Options::default()`
+  spellings are unaffected.
+
+- **Release archives contain both binaries**, `kohagi` and `kohagi-rerank`. The
+  archive name is unchanged.
+
+### Fixed
+
+- **`--max-seq-length` past the model's position count is refused at load.** It
+  used to fail inside candle's rotary embedding, after the model had loaded and
+  the input had been tokenized, naming tensors rather than the flag.
+
+- **A head bias the config does not declare is reported rather than dropped in
+  silence.** `classifier_bias` and `norm_bias` decide whether the head's biases
+  load, as they do in Hugging Face; a checkpoint carrying one its config does not
+  declare used to lose it without a word, and a head missing a term does not
+  fail, it scores slightly wrong.
+
+- **`tools/rerank_parity.py` and `tools/rerank_fp16_bands.py` stop at any nonzero
+  exit.** They checked only for exit 1, so a run that finished with skipped lines
+  reported a number computed over a different sample than the one asked for.
+
+- **`tools/eval_retrieval.py` takes its passthrough arguments from an explicit
+  `--` split**, whose survival through argparse differs by Python version.
+
+### Compatibility
+
+- **A CoreML bundle converted before 0.6 cannot be used for reranking.** It has
+  no `head.safetensors`, so `kohagi-rerank --device coreml` says so at load and
+  exits 3. Reconvert the checkpoint, or score on `--device cpu`. **Embedding with
+  an old bundle is unaffected**; it simply reports no `source_sha256`.
+
+- **A reranker on `--device coreml` is not interchangeable with one on the CPU at
+  a fixed threshold**, because the encoder is fp16 there. How much of a corpus
+  can cross a given threshold, and how to work it out for a threshold of your
+  own, is in PROTOCOL-rerank.md.
+
 ## [0.5.1] - 2026-08-08
 
 ### Fixed

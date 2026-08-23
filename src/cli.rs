@@ -18,6 +18,8 @@ use std::process::ExitCode;
 
 use clap::ValueEnum;
 
+use crate::program::remark;
+
 use crate::{
     Backend, CoreMlForm, CoreMlQuantize, ModelInfo, ModelSource, Pooling, Precision,
     UnsupportedRequest,
@@ -229,17 +231,59 @@ pub fn print_model_info(label: &str, info: &ModelInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--expect-sha256`: refuse to work with weights whose digest does not start
+/// with what the caller pinned.
+///
+/// The summary line and `--print-model-info` make a run's digest recordable;
+/// this makes the record enforceable. A caller that wrote the digest beside
+/// its results pastes it back — the summary's 12 digits or the full 64 — and a
+/// renamed directory, a mixed-up interpolation, or a stale download then stops
+/// the run before it answers anything, instead of surviving into the numbers.
+///
+/// A CoreML bundle has no weights file of its own, so the claim checked there
+/// is the `source_sha256` its converter recorded — the checkpoint's digest,
+/// which is the value a caller has. A bundle that recorded none cannot satisfy
+/// the expectation and is refused rather than waved through.
+///
+/// `None` means the flag was not given: no expectation, nothing to enforce.
+/// Taking the `Option` here keeps that decision in one place instead of at
+/// every load site in every binary.
+pub fn verify_fingerprint(expected: Option<&str>, info: &ModelInfo) -> anyhow::Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let want = expected.to_ascii_lowercase();
+    anyhow::ensure!(
+        !want.is_empty() && want.len() <= 64 && want.bytes().all(|b| b.is_ascii_hexdigit()),
+        "--expect-sha256 takes a hex prefix of the digest (up to 64 digits), not `{expected}`"
+    );
+    let Some((claim, actual)) = info.digest() else {
+        anyhow::bail!(
+            "--expect-sha256 was given, but this model has no digest to check it against \
+             (the weights could not be hashed, or this CoreML bundle was converted before \
+             its provenance was recorded); an expectation that cannot be verified is \
+             refused rather than assumed"
+        )
+    };
+    anyhow::ensure!(
+        actual.starts_with(&want),
+        "these are not the expected weights: --expect-sha256 {want}, but the loaded \
+         model's {claim} is {actual}"
+    );
+    Ok(())
+}
+
 /// The protocol's exit codes, from a run's skipped-line count.
 ///
 /// 0 every record answered, 2 finished with lines skipped, 3 the CoreML backend
 /// cannot serve this request (so the caller can retry on `--device cpu`), 1
 /// anything else. See PROTOCOL.md; both binaries owe callers the same table.
-pub fn exit_code(program: &str, outcome: anyhow::Result<usize>) -> ExitCode {
+pub fn exit_code(outcome: anyhow::Result<usize>) -> ExitCode {
     match outcome {
         Ok(0) => ExitCode::SUCCESS,
         Ok(_) => ExitCode::from(2),
         Err(e) => {
-            eprintln!("{program}: error: {e:#}");
+            remark!("error: {e:#}");
             if e.chain().any(|c| c.is::<UnsupportedRequest>()) {
                 ExitCode::from(3)
             } else {
@@ -328,5 +372,85 @@ mod tests {
         assert_eq!(label, "org/model");
 
         assert!(coreml_source(None, None, &[], CoreMlQuantize::None, checkpoint()).is_err());
+    }
+
+    fn info(sha256: Option<&str>, source_sha256: Option<&str>) -> ModelInfo {
+        ModelInfo {
+            backend: "cpu",
+            precision: "f32",
+            sha256: sha256.map(str::to_string),
+            // `source_sha256` applies only to converted bundles.
+            bundle: source_sha256.map(|sha| crate::Bundle {
+                source: None,
+                source_sha256: Some(sha.to_string()),
+                buckets: vec![512],
+                quantization: "none".to_string(),
+                graph_version: None,
+            }),
+            pooling: "mean",
+            dim: 512,
+            max_seq_length: 512,
+            declared_max_seq_length: None,
+            output: crate::Output::Embedding { output_dim: None },
+        }
+    }
+
+    /// The whole point of the flag: a digest prefix either matches the loaded
+    /// weights or the run stops, and the summary's 12 digits are enough.
+    #[test]
+    fn an_expected_digest_is_matched_by_prefix() {
+        let loaded = info(Some("1c342581efc23d0b50b92fb11ac1eeb0"), None);
+        assert!(verify_fingerprint(Some("1c342581efc2"), &loaded).is_ok());
+        assert!(verify_fingerprint(Some("1c342581efc23d0b50b92fb11ac1eeb0"), &loaded).is_ok());
+        // Case is presentation, not identity: an uppercased paste still matches.
+        assert!(verify_fingerprint(Some("1C342581EFC2"), &loaded).is_ok());
+
+        let e = verify_fingerprint(Some("e831a463bddb"), &loaded)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("e831a463bddb") && e.contains("1c342581efc2"),
+            "the error should show both digests: {e}"
+        );
+    }
+
+    /// No flag, no expectation: nothing is enforced, even against a model
+    /// that has no digest at all.
+    #[test]
+    fn no_expectation_passes_whatever_is_loaded() {
+        assert!(verify_fingerprint(None, &info(None, None)).is_ok());
+        assert!(verify_fingerprint(None, &info(Some("1c342581efc2"), None)).is_ok());
+    }
+
+    /// A CoreML bundle is checked against the checkpoint it was converted
+    /// from, which is the digest a caller recorded; a bundle that recorded
+    /// nothing cannot be verified and must not pass.
+    #[test]
+    fn a_bundle_is_checked_by_its_recorded_source() {
+        let bundle = info(None, Some("e831a463bddb00112233445566778899"));
+        assert!(verify_fingerprint(Some("e831a463bddb"), &bundle).is_ok());
+        assert!(verify_fingerprint(Some("1c342581efc2"), &bundle).is_err());
+
+        let unknown = info(None, None);
+        let e = verify_fingerprint(Some("1c342581efc2"), &unknown)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no digest"), "unexpected error: {e}");
+    }
+
+    /// A value that cannot be a digest prefix is a pasting mistake, not a
+    /// mismatch, and the message should say so.
+    #[test]
+    fn a_non_hex_expectation_is_refused_as_such() {
+        let loaded = info(Some("1c342581efc2"), None);
+        for bad in ["", "sha256=1c342581", "1c34 2581", &"f".repeat(65)] {
+            let e = verify_fingerprint(Some(bad), &loaded)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("hex prefix"),
+                "unexpected error for {bad:?}: {e}"
+            );
+        }
     }
 }

@@ -26,6 +26,7 @@ use anyhow::Result;
 
 use crate::config::CoreMlQuantize as Quantize;
 use crate::coreml_export::{bundle_name, encoder, Checkpoint};
+use crate::program::remark;
 
 /// The emitted graph's version, which is half of this cache's key.
 ///
@@ -138,8 +139,8 @@ pub fn provision(
         Err(e) => {
             // The conversion succeeded, so run from the staging copy rather than
             // failing; the next run will try to cache it again.
-            eprintln!(
-                "kohagi: could not move the converted model into {} ({e}); \
+            remark!(
+                "could not move the converted model into {} ({e}); \
                  this run will use a temporary copy",
                 entry.display()
             );
@@ -232,8 +233,8 @@ fn convert_into(
     buckets: &[usize],
     quantize: Quantize,
 ) -> Result<()> {
-    eprintln!(
-        "kohagi: converting {} for the Neural Engine (buckets {}) — first run only ...",
+    remark!(
+        "converting {} for the Neural Engine (buckets {}) — first run only ...",
         checkpoint.source,
         buckets
             .iter()
@@ -294,6 +295,7 @@ mod tests {
             config: dir.join("config.json"),
             tokenizer: dir.join("tokenizer.json"),
             pooling: None,
+            sentence_config: None,
             source: dir.display().to_string(),
         };
         let first = revision(&checkpoint);

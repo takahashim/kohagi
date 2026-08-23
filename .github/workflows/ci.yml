@@ -103,19 +103,27 @@ jobs:
         # with newer NVIDIA architectures through driver JIT compilation.
         env:
           CUDA_COMPUTE_CAP: '80'
+      # Both binaries, because both are the protocol: empty input must exit 0
+      # without loading anything, whichever record shape is being read.
       - name: Smoke-test the protocol without a model (Unix)
         if: runner.os != 'Windows'
         run: |
-          # Empty input must exit 0 without loading anything.
           : | ./target/${{ matrix.target }}/release/kohagi --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
+          : | ./target/${{ matrix.target }}/release/kohagi-rerank --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
       # This runner has the CUDA Toolkit but no NVIDIA driver.  A CUDA-linked
       # executable therefore cannot be launched here, even with empty stdin;
       # the Windows job above deliberately validates compilation only.
+      #
+      # `kohagi` and `kohagi-rerank` ship together: retrieval and reranking are
+      # two halves of one pipeline, and a caller that has one wants the other.
+      # `coreml-convert` does not — it needs `--features coreml-export`, so only
+      # the macOS target builds it at all, and shipping it there alone would
+      # make one platform's archive hold something the others' cannot.
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           mkdir dist
-          tar -czf dist/kohagi-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release kohagi
+          tar -czf dist/kohagi-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release kohagi kohagi-rerank
           cd dist && shasum -a 256 *.tar.gz > kohagi-${{ matrix.target }}.sha256
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -123,7 +131,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist
           $archive = "kohagi-${{ matrix.target }}.zip"
-          Compress-Archive -Path ".\\target\\${{ matrix.target }}\\release\\kohagi.exe" -DestinationPath ".\\dist\\$archive"
+          $binaries = @(
+            ".\\target\\${{ matrix.target }}\\release\\kohagi.exe",
+            ".\\target\\${{ matrix.target }}\\release\\kohagi-rerank.exe"
+          )
+          Compress-Archive -Path $binaries -DestinationPath ".\\dist\\$archive"
           $hash = (Get-FileHash ".\\dist\\$archive" -Algorithm SHA256).Hash.ToLower()
           "$hash  $archive" | Set-Content ".\\dist\\kohagi-${{ matrix.target }}.sha256" -NoNewline
       - uses: actions/upload-artifact@v7

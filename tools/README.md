@@ -1,28 +1,29 @@
 # Tools
 
-For measuring and verifying Kohagi, rather than demonstrating how to call it —
-that is [`examples/`](../examples/). Outside the Cargo workspace and not part of
-the published crate.
+For measuring and verifying Kohagi, rather than demonstrating how to call it
+(that is [`examples/`](../examples/)). Outside the Cargo workspace and not part
+of the published crate.
 
-- [`parity_check.py`](parity_check.py) — verify Kohagi against the
+- [`parity_check.py`](parity_check.py) verifies Kohagi against the
   sentence-transformers / PyTorch reference.
-- [`benchmark.py`](benchmark.py) — time Kohagi against that same reference.
-- [`model_check.py`](model_check.py) — smoke-test Kohagi against any other
+- [`benchmark.py`](benchmark.py) times Kohagi against that same reference.
+- [`model_check.py`](model_check.py) smoke-tests Kohagi against any other
   ModernBERT sentence encoder on the Hub.
-- [`scaling_check.py`](scaling_check.py) — how throughput and memory move with
-  input length and batch size.
-- [`eval_retrieval.py`](eval_retrieval.py) — JaCWIR and JQaRA retrieval quality
-  for any Kohagi configuration, which is what the quantization numbers rest on.
-- [`coreml-jigs/`](coreml-jigs/) — Rust jigs for the CoreML backend: read a
-  converted bundle, check Neural Engine placement, measure per-bucket latency,
-  compare two configurations. See its own README.
+- [`scaling_check.py`](scaling_check.py) measures how throughput and memory
+  move with input length and batch size.
+- [`eval_retrieval.py`](eval_retrieval.py) measures JaCWIR and JQaRA retrieval
+  quality for any Kohagi configuration, which is what the quantization numbers
+  rest on.
+- [`coreml-jigs/`](coreml-jigs/) holds Rust jigs for the CoreML backend, which
+  read a converted bundle, check Neural Engine placement, measure per-bucket
+  latency, and compare two configurations. See its own README.
 
 The Python here needs `pip install sentence-transformers torch` (and `pyarrow`
 for `eval_retrieval.py`); Kohagi itself never does.
 
 ---
 
-## `parity_check.py` — matching PyTorch
+## Matching PyTorch (`parity_check.py`)
 
 Kohagi's f32 output *is* the sentence-transformers output, to f32 rounding.
 That is the whole premise of using it instead of a Python service, so it is
@@ -51,8 +52,8 @@ own corpus (one text per line).
 
 `--pooling` defaults to `model`, meaning each side uses the checkpoint's own
 `1_Pooling` config. Passing `mean` or `cls` forces that mode on both sides,
-which is the only way to exercise a mode the model was not published with —
-ruri-v3 ships as mean, so `--pooling cls` is what covers Kohagi's CLS path.
+which is the only way to exercise a mode the model was not published with.
+Since ruri-v3 ships as mean, `--pooling cls` is what covers Kohagi's CLS path.
 Both were checked on ruri-v3-130m over 400 mixed-length texts:
 
 | pooling | mean `1 - cosine` | worst |
@@ -81,12 +82,12 @@ Measured on ruri-v3-130m against `sentence-transformers` on CPU (Linux,
 |---|---:|---:|
 | 1200 short (~60 tokens) | 2e-13 | 9e-12 |
 | 240 long (512 tokens) | 3e-12 | 2e-11 |
-| 12 texts swept from 15 to 645 tokens | — | below f32 resolution at every length |
+| 12 texts swept from 15 to 645 tokens | n/a | below f32 resolution at every length |
 
 For scale, a `vector(512)` column in pgvector stores float4, which cannot
 represent a difference below ~1e-7 in the first place. The disagreement
 between Kohagi and PyTorch is roughly five orders of magnitude smaller than
-what the storage format can hold — it disappears the moment you save it.
+what the storage format can hold. It disappears the moment you save it.
 
 `--precision bf16` is a deliberate tradeoff and sits well above this, at
 `1 - cosine ≈ 2e-6` (worst 2e-5). Still negligible for ranking, but it is a
@@ -104,13 +105,13 @@ Nearly every reported "mismatch" is one of these, not an implementation
 difference. The script pins all three; if you compare by hand, do the same.
 
 - **prefix**, exactly, trailing space included. `"検索文書:"` instead of
-  `"検索文書: "` moves `1 - cosine` to ~`3e-3` — ten orders of magnitude above
-  the real difference, and easy to cause with an unquoted shell variable.
+  `"検索文書: "` moves `1 - cosine` to ~`3e-3`, ten orders of magnitude above
+  the real difference, and an unquoted shell variable makes the mistake easy.
 - **max_seq_length**. Kohagi defaults to 512; sentence-transformers uses
   whatever `sentence_bert_config.json` says, which is 8192 for ruri-v3. Any
   text between those limits gets truncated on one side only.
-- **pooling**, against the model's `1_Pooling/config.json` — mean for ruri-v3
-  and modernbert-embed. Note ruri-v3 sets `include_prompt: true`, meaning the
+- **pooling**, against the model's `1_Pooling/config.json` (mean for ruri-v3
+  and modernbert-embed). Note ruri-v3 sets `include_prompt: true`, meaning the
   prefix tokens participate in the mean, which is what Kohagi does by
   prepending the prefix as ordinary text.
 
@@ -129,19 +130,19 @@ scores:
 | float32 | 1.19e-07 |
 | float64 | 8.71e-12 |
 
-The float32 figure measures the accumulator, not the vectors — it is roughly
-`f32::EPSILON` and you will get it for *any* sufficiently close pair. A
+The float32 figure measures the accumulator, not the vectors. It is roughly
+`f32::EPSILON`, and you will get it for *any* sufficiently close pair. A
 comparison that reports `0.9999998` has usually hit this floor rather than
 found a discrepancy. Cast to float64 before the dot product (the script
 does).
 
-The elementwise maximum difference does not have this problem — subtracting
-two nearby floats is exact — so it is the more informative number when you
+The elementwise maximum difference does not have this problem (subtracting
+two nearby floats is exact), so it is the more informative number when you
 only have f32 tooling.
 
 ---
 
-## `benchmark.py` — how fast, and against what
+## How fast, and against what (`benchmark.py`)
 
 ```bash
 pip install sentence-transformers
@@ -154,8 +155,8 @@ kohagi            1.73s   12.00s   13.73s
 torch/mps         9.74s    7.65s   17.51s
 ```
 
-Both sides are pinned to Kohagi's defaults — mean pooling, L2 normalize,
-`max_seq_length` 512, batch size 64 — and torch runs in a fresh subprocess so
+Both sides are pinned to Kohagi's defaults (mean pooling, L2 normalize,
+`max_seq_length` 512, batch size 64), and torch runs in a fresh subprocess so
 it pays interpreter startup the same way a real batch job would. Timing it
 in-process would let Python's module cache serve the second
 `import sentence_transformers` for free and hide about 3 seconds.
@@ -184,7 +185,7 @@ and run it yourself before making a decision on it.
 
 Two things the table says:
 
-- **On CPU, compute is a wash** — Kohagi is within about 15% of torch/cpu
+- **On CPU, compute is a wash.** Kohagi is within about 15% of torch/cpu
   either way. Accelerate and PyTorch call comparable sgemm, which is the
   expected outcome, not a surprising one.
 - **The end-to-end win is startup.** torch spends several seconds loading
@@ -194,26 +195,26 @@ Two things the table says:
 
 ### Where Kohagi loses
 
-At the encode itself, torch/mps is roughly twice as fast — it runs on the
-Apple GPU while the table's `kohagi` column is the CPU. On long totals it already
+At the encode itself, torch/mps is roughly twice as fast, because it runs on
+the Apple GPU while the table's `kohagi` column is the CPU. On long totals it already
 comes out ahead (28.6 s vs 32.3 s), because at 512 tokens the compute gap
 outgrows Kohagi's startup lead. A `--features metal` build closes most of that
 (see the top-level README), but a warm, long-lived torch/mps service still
 out-throughputs a process spawned per batch once the corpus is large enough.
 
 So the honest framing is not "Kohagi is faster than PyTorch". It is that
-Kohagi has nothing to amortize. If you spawn a process per batch — a rake
-task, a cron job, a queue worker handling a few hundred records — that is the
+Kohagi has nothing to amortize. If you spawn a process per batch (a rake
+task, a cron job, a queue worker handling a few hundred records), that is the
 number that matters. If you run a long-lived Python service that loads the
 model once and embeds continuously, torch on MPS will out-throughput it.
 
 ---
 
-## `model_check.py` — does another model work?
+## Does another model work? (`model_check.py`)
 
 Kohagi runs any ModernBERT encoder that ships a fast `tokenizer.json` and a
 `1_Pooling/config.json`, not just ruri-v3. This script points it at one and
-checks the embeddings are usable — a retrieval model returns plausible floats
+checks the embeddings are usable. A retrieval model returns plausible floats
 no matter what, so "it exited 0" proves nothing.
 
 ```bash
@@ -233,7 +234,7 @@ OK: retrieval and paraphrase structure both hold
 ```
 
 It reads the checkpoint's own `1_Pooling/config.json` to report the pooling
-Kohagi will autodetect — and to flag a model that ships none, which is usually
+Kohagi will autodetect, and to flag a model that ships none, which is usually
 a reranker or a base LM rather than a sentence encoder. Requires no Python
 packages; it shells out to the binary and does the arithmetic in the standard
 library. The built-in corpus is English, so for a non-English model pass
@@ -242,7 +243,7 @@ retrieval line as a smoke test, not a benchmark.
 
 ---
 
-## `scaling_check.py` — where the CPU path stops scaling
+## Where the CPU path stops scaling (`scaling_check.py`)
 
 Kohagi fans length-bucketed batches across a rayon pool sized to physical
 cores, and on an 8-core M2 that measured only ~2× over serial. This sweeps
@@ -256,10 +257,10 @@ python tools/scaling_check.py --kohagi ./target/release/kohagi
 
 ---
 
-## `eval_retrieval.py` — does a change cost retrieval quality?
+## Does a change cost retrieval quality? (`eval_retrieval.py`)
 
-MAP@10 and HIT@10 on JaCWIR, nDCG@10 on JQaRA, for any Kohagi configuration —
-everything after `--` is passed through, so a device, a model or a quantization
+MAP@10 and HIT@10 on JaCWIR, nDCG@10 on JQaRA, for any Kohagi configuration.
+Everything after `--` is passed through, so a device, a model or a quantization
 level can be measured without editing the script. This is what the claim that
 an int8 embedding table costs nothing rests on, kept here so a later change can
 be checked against the same metric rather than against a remembered figure.
@@ -270,9 +271,9 @@ python3 tools/eval_retrieval.py --benchmark jacwir -- --device coreml --coreml-q
 ```
 
 Recorded for `cl-nagoya/ruri-v3-130m` at `--max-seq-length 512`, float32 on CPU:
-JaCWIR MAP@10 0.8584, HIT@10 0.9696; JQaRA nDCG@10 0.7106. A full run is long —
-JaCWIR's 5000 queries name about 497k distinct documents — so `--limit` takes a
-prefix of the queries, which is enough to tell the method matches.
+JaCWIR MAP@10 0.8584, HIT@10 0.9696; JQaRA nDCG@10 0.7106. A full run is long
+(JaCWIR's 5000 queries name about 497k distinct documents), so `--limit` takes
+a prefix of the queries, which is enough to tell the method matches.
 
 Needs `pip install pyarrow` and network access on the first run; the datasets
 are cached and not committed.
