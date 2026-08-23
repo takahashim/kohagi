@@ -1,33 +1,6 @@
 # Changelog
 
-## [Unreleased]
-
-### Added
-
-- **`--print-model-info` reports `declared_max_seq_length`.** The token limit
-  the checkpoint's `sentence_bert_config.json` declares, which
-  sentence-transformers obeys and Kohagi does not: `--max-seq-length` still
-  decides the run, and still defaults to 512. `ruri-v3-130m` declares 8192, so
-  the same directory embeds a long text differently under the two libraries;
-  this is where that is visible. Converted CoreML bundles carry the file too.
-
-### Changed
-
-- **Long inputs cost far less time and memory.** Peak memory is now flat from
-  512 to 8192 tokens (1.0 GB, was up to 6.8 GB), and an 8192-token document
-  takes 16 s instead of 100 s on one worker. The eight-worker default can embed
-  8192-token documents at all, in 2.4 GB.
-
-  Vectors are unchanged to f32 rounding (worst 1.8e-6 against values reaching
-  1.0), so an index built with 0.6.0 does not need rebuilding.
-
-### Fixed
-
-- **`--max-seq-length` past the model's position count is refused at load.** It
-  used to fail inside candle's rotary embedding, after the model had loaded and
-  the input had been tokenized, naming tensors rather than the flag.
-
-## [0.6.0] - 2026-08-18
+## [0.6.0] - 2026-08-23
 
 ### Added
 
@@ -43,8 +16,10 @@
   summary's 12 digits or the full 64) and either binary refuses weights whose
   digest does not start with it. The run exits 1 at load, before any output. On
   `--device coreml` the bundle's recorded `source_sha256` is checked; a bundle
-  that recorded none (converted before 0.6) is refused. Combine with
-  `--print-model-info` for a standalone check.
+  that recorded none (converted before 0.6) is refused, as is one whose weights
+  were rewritten while they loaded: an expectation that cannot be verified is
+  refused rather than assumed. Combine with `--print-model-info` for a
+  standalone check.
 
 - **`kohagi-rerank`: a cross-encoder for reordering search results.** Reads
   `{"id","query","text"}` JSONL and writes `{"id","score"}`, under the same
@@ -72,6 +47,13 @@
   exits without reading stdin, for an evaluation script to record beside its
   numbers. On both binaries.
 
+- **`--print-model-info` also reports `declared_max_seq_length`**: the token
+  limit the checkpoint's `sentence_bert_config.json` declares, which
+  sentence-transformers obeys and Kohagi does not. `--max-seq-length` decides
+  the run and still defaults to 512, so a model declaring more (`ruri-v3-130m`
+  declares 8192) embeds a long text differently under the two libraries. This
+  is where that is visible. Converted CoreML bundles carry the file too.
+
 - **A converted CoreML bundle records the checkpoint it came from**, as a Hub id
   or path and as that checkpoint's sha256, reported as `source` and
   `source_sha256`. `scripts/convert_coreml.py` records the same.
@@ -84,6 +66,13 @@
   binary, which is the prefix every stderr line carries.
 
 ### Changed
+
+- **Long inputs cost far less time and memory.** Peak memory is now flat from
+  512 to 8192 tokens (1.0 GB, was up to 6.8 GB), and an 8192-token document
+  takes 16 s instead of 100 s on one worker. The eight-worker default can embed
+  8192-token documents at all, in 2.4 GB. Vectors are unchanged to f32 rounding
+  (worst 1.8e-6 against values reaching 1.0), so an index built with 0.5.1 does
+  not need rebuilding.
 
 - **The stderr summary line has more fields, and `dim=` moved.** From
   `model=… dim=512 in=…` to
@@ -104,6 +93,10 @@
   archive name is unchanged.
 
 ### Fixed
+
+- **`--max-seq-length` past the model's position count is refused at load.** It
+  used to fail inside candle's rotary embedding, after the model had loaded and
+  the input had been tokenized, naming tensors rather than the flag.
 
 - **A head bias the config does not declare is reported rather than dropped in
   silence.** `classifier_bias` and `norm_bias` decide whether the head's biases
