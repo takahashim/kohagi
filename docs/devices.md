@@ -109,13 +109,12 @@
   Measured on an 8-core Zen 4 with `ruri-v3-130m`, best of three interleaved
   runs, wall clock:
 
-| texts | `cpu` | `cpu-burn` | |
-| --- | ---: | ---: | ---: |
-| 64 × 42 tokens | 2.17 s | **1.43 s** | 1.52× |
-| 64 × 122 tokens | 4.12 s | **2.84 s** | 1.45× |
-| 64 × 460 tokens | 11.53 s | **11.19 s** | 1.03× |
-| 8 × 2048 tokens | 7.54 s | **7.35 s** | 1.03× |
-| 4 × 8192 tokens | **31.3 s** | 34.3 s | 0.91× |
+| texts | `cpu` | `cpu-burn` | | peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 64 × 42 tokens | 2.21 s | **1.44 s** | 1.53× | 1027 / 1022 MiB |
+| 64 × 460 tokens | 11.55 s | **9.56 s** | 1.21× | 1028 / 1166 MiB |
+| 8 × 2048 tokens | 7.60 s | **7.26 s** | 1.05× | 1385 / 1135 MiB |
+| 4 × 8192 tokens | **30.2 s** | 33.5 s | 0.90× | 2005 / 1573 MiB |
 
 - Worst `1 - cosine` against `--device cpu` is 1.0e-12 at any of those lengths,
   which is float addition order and nothing else: both engines run f32.
@@ -147,8 +146,19 @@
     the handover `crate::encoder` already makes at about 724 tokens. Without it
     a long sequence materialises `[heads, seq, seq]` per layer: 4 texts of 8192
     tokens peaked at **16.8 GiB** and took 40.5 s, against 2.8 GiB and 34.3 s
-    with it. At 2048 tokens it is 2.7 GiB to 1.3 GiB, which is less than the
-    candle path's 1.4 GiB.
+    with it.
+  - **One shared window table** rather than a `[seq, seq]` one. A banded layer's
+    blocks all reach the same way, so the mask depends on the offset between a
+    block's first query and its first key and not on where the block sits; one
+    `[width, width + 2·reach]` table serves every block through a view. 20 KB
+    instead of 256 MiB at 8192 tokens, which took the peak to 1.6 GiB — below
+    the candle path's 2.0.
+  - **Measuring the window as its reach.** `crate::attention` counts a window as
+    how far either side a query sees, and this was handing it the whole
+    `local_attention`. The band came out twice as wide as it needed to be — the
+    extra keys were masked, so the answer was right and the work was not — and
+    `banding_pays` declined below 514 tokens instead of 258. Worth 11.19 s to
+    9.56 s at 460 tokens, where banding now applies at all.
   - **One mask instead of two, and the scale on the queries.** A sliding-window
     layer was adding padding and window separately, two broadcast adds over
     `[rows, heads, seq, seq]` in each of twelve layers; combining them once per

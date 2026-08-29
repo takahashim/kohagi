@@ -41,21 +41,6 @@ use burn::tensor::{activation, backend::Backend, FloatDType, Int, Tensor, Tensor
 use super::FusedOps;
 use crate::encoder::Config;
 
-/// This block's slice of an additive mask.
-///
-/// The key axis always narrows. The query axis narrows only when the mask has
-/// one: a sliding-window layer's does, because which keys are open depends on
-/// where the query sits, while padding is the same for every query and stays
-/// `[rows, 1, 1, seq]` — which is what keeps a tiled block from paying `seq^2`.
-fn block_mask<B: Backend>(mask: &Tensor<B, 4>, block: &crate::attention::Block) -> Tensor<B, 4> {
-    let m = mask.clone().narrow(3, block.k0, block.keys);
-    if m.dims()[2] == 1 {
-        m
-    } else {
-        m.narrow(2, block.q0, block.queries)
-    }
-}
-
 /// Where a position may not attend.
 ///
 /// Finite rather than `f32::MIN`, for two reasons: a fully padded query row
@@ -120,7 +105,19 @@ pub(super) struct Tables<B: Backend> {
     sin_global: Tensor<B, 4>,
     cos_local: Tensor<B, 4>,
     sin_local: Tensor<B, 4>,
-    window: Tensor<B, 4>,
+    window: WindowMask<B>,
+}
+
+impl<B: Backend> Clone for WindowMask<B> {
+    fn clone(&self) -> Self {
+        match self {
+            WindowMask::Table { table, reach } => WindowMask::Table {
+                table: table.clone(),
+                reach: *reach,
+            },
+            WindowMask::Whole(m) => WindowMask::Whole(m.clone()),
+        }
+    }
 }
 
 impl<B: Backend> Clone for Tables<B> {
@@ -151,7 +148,8 @@ impl<B: Backend> Tables<B> {
             sin_global,
             cos_local,
             sin_local,
-            window: window_mask::<B>(seq, config.local_attention, device),
+            // Half, because `crate::attention` measures a window as its reach.
+            window: WindowMask::build(seq, config.local_attention / 2, BAND_BLOCK, device),
         }
     }
 
@@ -208,21 +206,80 @@ fn rope_tables<B: Backend>(
     )
 }
 
-/// Which positions a sliding-window layer may not reach, `[1, 1, seq, seq]`.
+/// An additive sliding-window mask, `[1, 1, queries, keys]`.
 ///
-/// A constant for a given length: the window depends on the position pair
-/// alone, and only the padding part of a mask depends on the input.
-fn window_mask<B: Backend>(seq: usize, window: usize, device: &B::Device) -> Tensor<B, 4> {
-    let reach = window / 2;
-    let mut m = vec![0f32; seq * seq];
-    for q in 0..seq {
-        for k in 0..seq {
-            if (q as isize - k as isize).unsigned_abs() > reach {
-                m[q * seq + k] = BLOCKED;
+/// `offset` is how far the block's first query sits past its first key, which
+/// is what places the band inside the rectangle.
+fn window_mask<B: Backend>(
+    queries: usize,
+    offset: usize,
+    reach: usize,
+    keys: usize,
+    device: &B::Device,
+) -> Tensor<B, 4> {
+    let mut m = vec![0f32; queries * keys];
+    for i in 0..queries {
+        for j in 0..keys {
+            if (i + offset).abs_diff(j) > reach {
+                m[i * keys + j] = BLOCKED;
             }
         }
     }
-    Tensor::from_data(TensorData::new(m, [1, 1, seq, seq]), device)
+    Tensor::from_data(TensorData::new(m, [1, 1, queries, keys]), device)
+}
+
+/// Where a banded block's slice of the sliding-window mask comes from.
+///
+/// A banded layer's blocks all reach the same way — `reach` keys either side of
+/// their own queries — so the mask depends on the offset between a block's
+/// first query and its first key, not on where in the sequence the block sits.
+/// One table therefore serves every block, the ends included: they take a
+/// shifted or shortened view of it.
+///
+/// That is the difference between 20 KB and 256 MiB. Built whole, an 8192-token
+/// layer's mask is `seq * seq` floats, and the padding has to be added into a
+/// copy of it; `crate::encoder` shares one table for the same reason.
+enum WindowMask<B: Backend> {
+    /// `[1, 1, width, width + 2 * reach]`, viewed by every banded block.
+    Table { table: Tensor<B, 4>, reach: usize },
+    /// The whole `[1, 1, seq, seq]`, for a layer that is windowed but not
+    /// banded. There is one block in that case, so there is nothing to share.
+    Whole(Tensor<B, 4>),
+}
+
+impl<B: Backend> WindowMask<B> {
+    /// `reach` is how far either side a query sees — half `local_attention`,
+    /// which is the sense `crate::attention` gives the word throughout.
+    fn build(seq: usize, reach: usize, band: usize, device: &B::Device) -> Self {
+        if crate::attention::banding_pays(seq, reach) {
+            WindowMask::Table {
+                table: window_mask::<B>(band, reach, reach, band + 2 * reach, device),
+                reach,
+            }
+        } else {
+            WindowMask::Whole(window_mask::<B>(seq, 0, reach, seq, device))
+        }
+    }
+
+    /// This block's view of the mask.
+    fn of(&self, block: &crate::attention::Block) -> Tensor<B, 4> {
+        match self {
+            // Entry `(i, j)` of the block is `|i - j + offset| <= reach`, and of
+            // the table `|i - j + reach| <= reach`, so the block's row of the
+            // table starts `reach - offset` columns in.
+            WindowMask::Table { table, reach } => {
+                let offset = block.q0 - block.k0;
+                table
+                    .clone()
+                    .narrow(2, 0, block.queries)
+                    .narrow(3, reach - offset, block.keys)
+            }
+            WindowMask::Whole(m) => m
+                .clone()
+                .narrow(2, block.q0, block.queries)
+                .narrow(3, block.k0, block.keys),
+        }
+    }
 }
 
 /// The additive padding mask, `[rows, 1, 1, seq]`.
@@ -329,8 +386,7 @@ impl<B: FusedOps> ModernBert<B> {
         layer: &LayerWeights<B>,
         normed: Tensor<B, 3>,
         tables: &Tables<B>,
-        global_mask: &Tensor<B, 4>,
-        local_mask: &Tensor<B, 4>,
+        padding: &Tensor<B, 4>,
     ) -> Tensor<B, 3> {
         let cfg = &self.config;
         let hidden = cfg.hidden_size;
@@ -358,16 +414,28 @@ impl<B: FusedOps> ModernBert<B> {
         // outside the window are masked shut and contribute an exact zero. The
         // geometry is `crate::attention`'s, the same one the candle path walks,
         // so the two engines cannot disagree about which keys a block reads.
-        let window = (!layer.global).then_some(cfg.local_attention);
-        let mask = if layer.global {
-            global_mask
-        } else {
-            local_mask
-        };
+        let window = (!layer.global).then_some(cfg.local_attention / 2);
+        // Past the point where one row's scores exceed the budget, the queries
+        // are split instead — the same handover `crate::encoder` makes, and the
+        // reason a long sequence does not materialise `[heads, seq, seq]`.
         let tile = (self.budget / seq).max(1);
         let plan = crate::attention::plan(seq, window, tile, BAND_BLOCK);
+
+        // One block's additive mask, in the block's own shape: the padding for
+        // the keys it reads, plus the window where the layer has one. Building
+        // it here rather than once per forward is what keeps a banded layer from
+        // holding `[rows, seq, seq]` — the summed form has no shape to share.
+        let mask_for = |b: &crate::attention::Block| {
+            let pad = padding.clone().narrow(3, b.k0, b.keys);
+            if layer.global {
+                pad
+            } else {
+                pad + tables.window.of(b)
+            }
+        };
+
         let context = if plan.blocks.len() == 1 {
-            self.attend(q, k, v, mask)
+            self.attend(q, k, v, &mask_for(&plan.blocks[0]))
         } else {
             let parts: Vec<Tensor<B, 4>> = plan
                 .blocks
@@ -377,7 +445,7 @@ impl<B: FusedOps> ModernBert<B> {
                         q.clone().narrow(2, b.q0, b.queries),
                         k.clone().narrow(2, b.k0, b.keys),
                         v.clone().narrow(2, b.k0, b.keys),
-                        &block_mask(mask, b),
+                        &mask_for(b),
                     )
                 })
                 .collect();
@@ -447,8 +515,7 @@ impl<B: FusedOps> ModernBert<B> {
         layer: &LayerWeights<B>,
         x: Tensor<B, 3>,
         tables: &Tables<B>,
-        global_mask: &Tensor<B, 4>,
-        local_mask: &Tensor<B, 4>,
+        padding: &Tensor<B, 4>,
     ) -> Tensor<B, 3> {
         let eps = self.config.layer_norm_eps;
         let residual = x.clone();
@@ -457,7 +524,7 @@ impl<B: FusedOps> ModernBert<B> {
             Some(gamma) => layer_norm(x, gamma.clone(), eps, self.half),
             None => x,
         };
-        let attended = residual + self.attention(layer, normed, tables, global_mask, local_mask);
+        let attended = residual + self.attention(layer, normed, tables, padding);
 
         let normed = layer_norm(attended.clone(), layer.mlp_norm.clone(), eps, self.half);
         attended + self.feed_forward(layer, normed)
@@ -474,17 +541,11 @@ impl<B: FusedOps> ModernBert<B> {
         device: &B::Device,
     ) -> Tensor<B, 3> {
         let tables = self.tables(seq, device);
-        // Both masks, built once: a global layer needs only the padding, and a
-        // sliding-window one needs it plus the window. Adding them here is one
-        // pass over `[rows, 1, seq, seq]`; adding them per layer would be a
-        // second broadcast add over `[rows, heads, seq, seq]` in each of the
-        // twelve that want it.
-        let global_mask = padding_mask::<B>(mask, rows, seq, device);
-        let local_mask = global_mask.clone() + tables.window.clone();
+        let padding = padding_mask::<B>(mask, rows, seq, device);
 
         let mut x = self.embed(ids, rows, seq, device);
         for layer in &self.layers {
-            x = self.block(layer, x, &tables, &global_mask, &local_mask);
+            x = self.block(layer, x, &tables, &padding);
         }
         // Read back as f32 whatever the graph ran in: `embed_row` pools and
         // normalizes in f32, the same as every other backend.
