@@ -26,6 +26,23 @@ use serde::Deserialize;
 use core::f32;
 use std::sync::Arc;
 
+/// Which spelling of the parameter names a checkpoint uses: `""` for a bare
+/// ModernBERT save, `"model."` for one written from a task head that kept the
+/// encoder under its own field.
+///
+/// Every engine that reads a checkpoint has to answer this — candle's
+/// `VarBuilder` and the Vulkan backend's safetensors reader both do — and they
+/// have to answer it identically, so the probe key and the polarity live here
+/// rather than being written out (and inverted) at each site. `has` is the
+/// caller's own lookup, because the two hold the file open differently.
+pub(crate) fn name_prefix(has: impl Fn(&str) -> bool) -> &'static str {
+    if has("model.embeddings.tok_embeddings.weight") {
+        "model."
+    } else {
+        ""
+    }
+}
+
 /// A ModernBERT `config.json`, in the two spellings the field names come in.
 ///
 /// Deserialized through [`RawConfig`] so the LayerNorm epsilon can arrive as

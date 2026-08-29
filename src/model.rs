@@ -75,14 +75,6 @@ fn rows_per_forward(seq: usize, backend: Backend) -> usize {
     (budget / (seq * seq).max(1)).max(1)
 }
 
-/// One forward pass: rows `start .. start + rows` of `batch`. A bucketed
-/// batch is split into as many of these as the memory budget requires.
-struct Unit<'a> {
-    batch: &'a BatchInput,
-    start: usize,
-    rows: usize,
-}
-
 /// Run bucketed batches through the encoder and reduce each row's hidden
 /// states to one result, in the caller's original order.
 ///
@@ -102,37 +94,16 @@ pub(crate) fn run_batches<T: Send>(
     rows_total: usize,
     reduce: impl Fn(&[f32], &[i64], usize) -> Result<T> + Sync,
 ) -> Result<Vec<T>> {
-    // Split each bucketed batch into forwards that fit the memory budget.
+    // Split each bucketed batch into forwards that fit the memory budget, and
+    // then the bf16 path's own row limit, which is about CPU load balancing
+    // rather than memory (see `Weights::max_rows_per_forward`).
     let limit = weights.max_rows_per_forward();
-    let mut units: Vec<Unit> = Vec::new();
-    for batch in batches {
-        let cap = rows_per_forward(batch.seq, backend).min(limit);
-        let mut start = 0;
-        while start < batch.batch {
-            let rows = cap.min(batch.batch - start);
-            units.push(Unit { batch, start, rows });
-            start += rows;
-        }
-    }
+    let units = crate::batch::split_units(batches, |seq| rows_per_forward(seq, backend).min(limit));
 
-    let run = |unit: &Unit| -> Result<Vec<(usize, T)>> {
-        let (batch, seq) = (unit.batch, unit.batch.seq);
-        // This unit's slice of the batch's `[batch, seq]` layout.
-        let range = unit.start * seq..(unit.start + unit.rows) * seq;
-        let ids = &batch.ids[range.clone()];
-        let mask = &batch.mask[range];
-        let (hidden, dim) = weights.forward(device, ids, mask, unit.rows, seq)?;
-
-        let mut done = Vec::with_capacity(unit.rows);
-        for row in 0..unit.rows {
-            let reduced = reduce(
-                &hidden[row * seq * dim..(row + 1) * seq * dim],
-                &mask[row * seq..(row + 1) * seq],
-                dim,
-            )?;
-            done.push((batch.orig[unit.start + row], reduced));
-        }
-        Ok(done)
+    let run = |unit: &crate::batch::Unit| -> Result<Vec<(usize, T)>> {
+        let (hidden, dim) =
+            weights.forward(device, unit.ids(), unit.mask(), unit.rows, unit.batch.seq)?;
+        unit.reduce_rows(&hidden, dim, &reduce)
     };
 
     // The two backends want opposite shapes. On the CPU, parallelism comes
@@ -147,16 +118,7 @@ pub(crate) fn run_batches<T: Send>(
         Backend::CoreML => unreachable!("CoreML does not use the candle batch runner"),
     };
 
-    let mut out: Vec<Option<T>> = (0..rows_total).map(|_| None).collect();
-    for unit in per_unit {
-        for (orig, value) in unit? {
-            out[orig] = Some(value);
-        }
-    }
-    out.into_iter()
-        .enumerate()
-        .map(|(i, v)| v.with_context(|| format!("row {i} came back from no batch")))
-        .collect()
+    crate::batch::place_rows(per_unit, rows_total)
 }
 
 /// Numeric precision of the forward pass.
@@ -176,6 +138,7 @@ pub enum Precision {
 }
 
 /// Which device runs the forward pass.
+///
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Backend {
     /// CPU, via Apple Accelerate on macOS and candle's own gemm elsewhere.
@@ -302,6 +265,75 @@ enum Engine {
     CoreMl(crate::coreml::CoreMlEncoder),
 }
 
+/// A checkpoint resolved and checked, but not yet loaded.
+///
+/// Two engines read the same safetensors — candle's and, behind the `vulkan`
+/// feature, Burn's — and they must accept and refuse exactly the same requests.
+/// Written out at each call site that drifted the first time one of them gained
+/// a check, so it is written once here instead.
+struct Prepared {
+    files: crate::source::CheckpointFiles,
+    config: Config,
+    /// Resolved from `opts.pooling` and the checkpoint's `1_Pooling`.
+    pooling: Pooling,
+    /// The model's own `hidden_size`, before any `--dims` truncation.
+    dim: usize,
+}
+
+impl Prepared {
+    /// Resolve the source to files, read the config, and refuse anything this
+    /// combination of options cannot do — all before a weight is touched.
+    fn resolve(source: &ModelSource, opts: Options) -> Result<Self> {
+        let files = source.checkpoint_files()?;
+        let pooling = resolve_pooling_warned(opts.pooling, files.pooling);
+
+        let config_path = files
+            .weights
+            .parent()
+            .map(|d| d.join("config.json"))
+            .context("model path has no parent dir for config.json")?;
+        let config: Config = read_config(&config_path)?;
+        let dim = config.hidden_size;
+        check_dims(opts.dims, dim)?;
+        check_max_seq(opts.max_seq_length, config.max_position_embeddings)?;
+        check_precision(opts.backend, opts.precision)?;
+
+        Ok(Prepared {
+            files,
+            config,
+            pooling,
+            dim,
+        })
+    }
+
+    /// Build the engine and finish the embedder around it.
+    ///
+    /// `build` is the only part that differs between backends. It runs between
+    /// the two halves of the fingerprint on purpose: the hash is started before
+    /// the weights are read and collected after, so it reads the same file the
+    /// forward pass is about to fault in, on another thread, and half a gigabyte
+    /// of hashing stays off the path to the caller's first result.
+    fn into_embedder(
+        self,
+        opts: Options,
+        build: impl FnOnce(&crate::source::CheckpointFiles, &Config) -> Result<Engine>,
+    ) -> Result<Embedder> {
+        let fingerprint = crate::fingerprint::Fingerprint::spawn(&self.files.weights);
+        let engine = build(&self.files, &self.config)?;
+        fingerprint.confirm(&self.files.weights);
+        let tokenizer = load_tokenizer(&self.files.tokenizer, opts.max_seq_length)?;
+        Ok(Embedder {
+            engine,
+            tokenizer,
+            opts,
+            pooling: self.pooling,
+            dim: self.dim,
+            fingerprint: Some(fingerprint),
+            declared_max_seq: self.files.declared_max_seq,
+        })
+    }
+}
+
 /// A loaded ModernBERT sentence encoder. Cheap to share by reference; one
 /// instance can serve any number of `embed` calls.
 pub struct Embedder {
@@ -336,39 +368,11 @@ impl Embedder {
         }
         // The candle path serves the Hub/Files sources; a CoreMl directory has
         // no safetensors to load.
-        let files = source.checkpoint_files()?;
-
-        let pooling = resolve_pooling_warned(opts.pooling, files.pooling);
-
-        let config_path = files
-            .weights
-            .parent()
-            .map(|d| d.join("config.json"))
-            .context("model path has no parent dir for config.json")?;
-        let config: Config = read_config(&config_path)?;
-        let dim = config.hidden_size;
-        check_dims(opts.dims, dim)?;
-        check_max_seq(opts.max_seq_length, config.max_position_embeddings)?;
-
-        check_precision(opts.backend, opts.precision)?;
-
+        let prepared = Prepared::resolve(source, opts)?;
         let device = open_device(opts.backend)?;
-        // Started here and collected at the end of the run: the weights are
-        // about to be memory-mapped, so this reads the same file the forward
-        // pass will fault in, and doing it on another thread keeps half a
-        // gigabyte of hashing out of the caller's first result.
-        let fingerprint = crate::fingerprint::Fingerprint::spawn(&files.weights);
-        let weights = load_weights(&files.weights, &config, &device, opts.precision)?;
-        fingerprint.confirm(&files.weights);
-        let tokenizer = load_tokenizer(&files.tokenizer, opts.max_seq_length)?;
-        Ok(Self {
-            engine: Engine::Candle { weights, device },
-            tokenizer,
-            opts,
-            pooling,
-            dim,
-            fingerprint: Some(fingerprint),
-            declared_max_seq: files.declared_max_seq,
+        prepared.into_embedder(opts, |files, config| {
+            let weights = load_weights(&files.weights, config, &device, opts.precision)?;
+            Ok(Engine::Candle { weights, device })
         })
     }
 
@@ -833,7 +837,7 @@ pub(crate) fn load_weights(
     // modernbert-embed), which store `embeddings.*`, `layers.*` and
     // `final_norm.*` at the root. Our own bf16 loader reads them at the root.
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], DType::F32, device)? };
-    let (wrapped, encoder) = if vb.contains_tensor("model.embeddings.tok_embeddings.weight") {
+    let (wrapped, encoder) = if !crate::encoder::name_prefix(|n| vb.contains_tensor(n)).is_empty() {
         (vb.clone(), vb.pp("model"))
     } else {
         let strip = vb

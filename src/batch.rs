@@ -5,7 +5,7 @@
 //! the mean pool, and every split point is invisible in the result. That
 //! freedom is what lets `model.rs` re-split batches to fit its memory budget.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
 /// How to reduce the encoder's `[seq, dim]` output to one vector per text.
@@ -62,6 +62,99 @@ pub struct BatchInput {
     pub batch: usize,
     pub seq: usize,
     pub orig: Vec<usize>,
+}
+
+/// One forward pass: rows `start .. start + rows` of `batch`.
+///
+/// A bucketed batch is split into as many of these as a backend's memory budget
+/// requires. Every engine splits the same way and differs only in what it hands
+/// the slice to, so the arithmetic that turns a `[batch, seq]` buffer into rows
+/// lives here rather than beside each forward — it is the kind that goes wrong
+/// quietly, and there are three engines to get it wrong in.
+pub(crate) struct Unit<'a> {
+    pub(crate) batch: &'a BatchInput,
+    pub(crate) start: usize,
+    pub(crate) rows: usize,
+}
+
+impl<'a> Unit<'a> {
+    fn range(&self) -> std::ops::Range<usize> {
+        self.start * self.batch.seq..(self.start + self.rows) * self.batch.seq
+    }
+
+    /// This unit's slice of its batch's row-major `[batch, seq]` buffers.
+    pub(crate) fn ids(&self) -> &'a [i64] {
+        &self.batch.ids[self.range()]
+    }
+
+    pub(crate) fn mask(&self) -> &'a [i64] {
+        &self.batch.mask[self.range()]
+    }
+
+    /// Reduce each row of this unit's `[rows, seq, dim]` hidden states, paired
+    /// with the caller's index for that row.
+    pub(crate) fn reduce_rows<T>(
+        &self,
+        hidden: &[f32],
+        dim: usize,
+        reduce: impl Fn(&[f32], &[i64], usize) -> Result<T>,
+    ) -> Result<Vec<(usize, T)>> {
+        let seq = self.batch.seq;
+        let mask = self.mask();
+        (0..self.rows)
+            .map(|row| {
+                let value = reduce(
+                    &hidden[row * seq * dim..(row + 1) * seq * dim],
+                    &mask[row * seq..(row + 1) * seq],
+                    dim,
+                )?;
+                Ok((self.batch.orig[self.start + row], value))
+            })
+            .collect()
+    }
+}
+
+/// Split bucketed batches into forwards of at most `cap(seq)` rows each.
+///
+/// `cap` is where the engines differ: it is a memory budget divided by `seq^2`
+/// on the candle path, the same divided by a tighter budget on Vulkan, and it
+/// carries the CPU's bf16 row limit when that applies.
+pub(crate) fn split_units<'a>(
+    batches: &'a [BatchInput],
+    cap: impl Fn(usize) -> usize,
+) -> Vec<Unit<'a>> {
+    let mut units = Vec::new();
+    for batch in batches {
+        let per = cap(batch.seq).max(1);
+        let mut start = 0;
+        while start < batch.batch {
+            let rows = per.min(batch.batch - start);
+            units.push(Unit { batch, start, rows });
+            start += rows;
+        }
+    }
+    units
+}
+
+/// Put reduced rows back in the caller's order.
+///
+/// Every row must be accounted for: bucketing reorders rows and splitting cuts
+/// them, so a row that no unit produced is a bug in one of those two, not an
+/// empty result to pass on.
+pub(crate) fn place_rows<T>(
+    per_unit: impl IntoIterator<Item = Result<Vec<(usize, T)>>>,
+    rows_total: usize,
+) -> Result<Vec<T>> {
+    let mut out: Vec<Option<T>> = (0..rows_total).map(|_| None).collect();
+    for unit in per_unit {
+        for (orig, value) in unit? {
+            out[orig] = Some(value);
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, v)| v.with_context(|| format!("row {i} came back from no batch")))
+        .collect()
 }
 
 /// Load a tokenizer.json and pin truncation to `max_seq_length`.
