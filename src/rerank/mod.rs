@@ -269,6 +269,14 @@ impl Reranker {
         if opts.backend == Backend::CoreML {
             return Self::load_coreml(source, opts);
         }
+        // Refused rather than quietly served on the CPU. The Vulkan engine
+        // exists for the embedder only: a cross-encoder reduces its hidden
+        // states differently (`classifier_pooling`, not `1_Pooling`), so it
+        // needs its own head on that path rather than the same one.
+        anyhow::ensure!(
+            opts.backend != Backend::Vulkan,
+            "--device vulkan is not implemented for reranking yet; use --device cpu"
+        );
         // Cross-encoders use `classifier_pooling`, not `1_Pooling`.
         let files = source.checkpoint_files()?;
 

@@ -71,6 +71,10 @@ fn rows_per_forward(seq: usize, backend: Backend) -> usize {
         // CoreML runs its own fixed-shape, batch=1 path (see embed_coreml) and
         // never reaches the candle memory-budget splitter.
         Backend::CoreML => unreachable!("CoreML does not use the candle attention budget"),
+        // Burn has its own budget beside its own forward; see
+        // `crate::burn_engine::vulkan::VULKAN_ATTN_BUDGET`, which is smaller
+        // because throughput there is flat in the row count.
+        Backend::Vulkan => unreachable!("the Vulkan backend does not use the candle budget"),
     };
     (budget / (seq * seq).max(1)).max(1)
 }
@@ -116,6 +120,7 @@ pub(crate) fn run_batches<T: Send>(
         Backend::Metal | Backend::Cuda => units.iter().map(run).collect(),
         // The CoreML backend runs its own fixed-shape path and never arrives here.
         Backend::CoreML => unreachable!("CoreML does not use the candle batch runner"),
+        Backend::Vulkan => unreachable!("the Vulkan backend does not use the candle batch runner"),
     };
 
     crate::batch::place_rows(per_unit, rows_total)
@@ -135,10 +140,25 @@ pub enum Precision {
     /// (Zen 4, Sapphire Rapids or newer); [`Embedder::load`] fails clearly
     /// elsewhere.
     Bf16,
+    /// f16 storage and matmuls with the two reductions — LayerNorm's variance
+    /// and softmax — kept in f32. `--device vulkan` only; nothing else here has
+    /// f16 hardware worth reaching. Measured on a Radeon 780M against this
+    /// crate's own CPU f32 output on `ruri-v3-130m`: 1.9× the bf16 CPU path at
+    /// worst `1 - cosine` 8.9e-6 over 64 texts, median 3.4e-7.
+    ///
+    /// Running the reductions in f16 as well is 16% faster and lands at 3.5e-2,
+    /// which is why this is one precision and not two.
+    F16,
 }
 
 /// Which device runs the forward pass.
 ///
+/// Note for whoever adds the next one: this enum answers two questions at once
+/// — which engine runs the model, and, for the candle engines, which candle
+/// `Device` to open. The non-candle variants pay for that by needing an
+/// `unreachable!` arm in `rows_per_forward`, `run_batches` and `open_device`
+/// apiece. Two of those was tolerable; a third backend is the point to split
+/// the engine choice out from the candle device choice instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Backend {
     /// CPU, via Apple Accelerate on macOS and candle's own gemm elsewhere.
@@ -164,6 +184,12 @@ pub enum Backend {
     /// Runs batch=1 per bucket length; unsupported requests fail fast with
     /// [`UnsupportedRequest`] rather than falling back.
     CoreML,
+    /// Any Vulkan 1.2 GPU via Burn/CubeCL. Requires the `vulkan` cargo feature
+    /// and a Vulkan driver; no vendor compute runtime (ROCm, CUDA) is involved,
+    /// which is what makes AMD and Intel GPUs reachable — candle has neither a
+    /// ROCm nor a Vulkan device. Pair it with [`Precision::F16`]: f32 here is
+    /// slower than the CPU's bf16 path and is kept for verifying the other.
+    Vulkan,
 }
 
 impl Backend {
@@ -174,6 +200,7 @@ impl Backend {
             Self::Metal => "metal",
             Self::Cuda => "cuda",
             Self::CoreML => "coreml",
+            Self::Vulkan => "vulkan",
         }
     }
 }
@@ -184,6 +211,7 @@ impl Precision {
         match self {
             Self::F32 => "f32",
             Self::Bf16 => "bf16",
+            Self::F16 => "f16",
         }
     }
 }
@@ -196,8 +224,24 @@ impl Precision {
 /// combinations they accept.
 pub(crate) fn check_precision(backend: Backend, precision: Precision) -> Result<()> {
     anyhow::ensure!(
-        !matches!(backend, Backend::Metal | Backend::Cuda) || precision != Precision::Bf16,
+        !matches!(backend, Backend::Metal | Backend::Cuda | Backend::Vulkan)
+            || precision != Precision::Bf16,
         "bf16 is a CPU-only fast path and cannot run on a GPU; pick f32"
+    );
+    // f16 is not a general "GPU precision": it is the Vulkan backend's own
+    // recipe, and the CPU/Metal/CUDA paths have no implementation of it. On
+    // Vulkan through CubeCL, bf16 is emulated rather than native — it measured
+    // 12x slower than f16 and produced NaN — so this is the only half precision
+    // offered there.
+    anyhow::ensure!(
+        backend == Backend::Vulkan || precision != Precision::F16,
+        "f16 is the Vulkan backend's precision; on {} pick f32{}",
+        backend.name(),
+        if backend == Backend::Cpu {
+            " or bf16"
+        } else {
+            ""
+        }
     );
     Ok(())
 }
@@ -263,6 +307,10 @@ enum Engine {
     },
     #[cfg(feature = "coreml")]
     CoreMl(crate::coreml::CoreMlEncoder),
+    /// Boxed because it carries every weight tensor's handle inline, which would
+    /// otherwise set the size of this enum for the CPU path as well.
+    #[cfg(feature = "vulkan")]
+    Vulkan(Box<crate::burn_engine::VulkanEncoder>),
 }
 
 /// A checkpoint resolved and checked, but not yet loaded.
@@ -366,6 +414,9 @@ impl Embedder {
         if opts.backend == Backend::CoreML {
             return Self::load_coreml(source, opts);
         }
+        if opts.backend == Backend::Vulkan {
+            return Self::load_vulkan(source, opts);
+        }
         // The candle path serves the Hub/Files sources; a CoreMl directory has
         // no safetensors to load.
         let prepared = Prepared::resolve(source, opts)?;
@@ -374,6 +425,38 @@ impl Embedder {
             let weights = load_weights(&files.weights, config, &device, opts.precision)?;
             Ok(Engine::Candle { weights, device })
         })
+    }
+
+    /// Load the Vulkan backend: the same checkpoint the CPU path reads, on the
+    /// GPU through Burn.
+    ///
+    /// Everything before and after the forward is the candle path's — the same
+    /// `config.json`, the same pooling resolution, the same fingerprint over the
+    /// same safetensors, the same tokenizer. Only [`open_device`] and
+    /// [`load_weights`] are replaced, because Burn's tensors are not candle's.
+    #[cfg(feature = "vulkan")]
+    fn load_vulkan(source: &ModelSource, opts: Options) -> Result<Self> {
+        let prepared = Prepared::resolve(source, opts)?;
+        if opts.precision == Precision::F32 {
+            remark!(
+                "--device vulkan --precision f32 is the exact path and is slower than \
+                 --device cpu --precision bf16; pass --precision f16 for the fast one"
+            );
+        }
+        prepared.into_embedder(opts, |files, config| {
+            let encoder =
+                crate::burn_engine::VulkanEncoder::load(&files.weights, config, opts.precision)?;
+            Ok(Engine::Vulkan(Box::new(encoder)))
+        })
+    }
+
+    #[cfg(not(feature = "vulkan"))]
+    fn load_vulkan(_source: &ModelSource, _opts: Options) -> Result<Self> {
+        Err(UnsupportedRequest::new(
+            "this binary was built without Vulkan support; rebuild with \
+             `cargo build --release --features vulkan`",
+        )
+        .into())
     }
 
     /// Load the CoreML/ANE backend from a directory of fixed-shape models.
@@ -570,6 +653,8 @@ impl Embedder {
             Engine::Candle { weights, device } => self.embed_candle(texts, weights, device),
             #[cfg(feature = "coreml")]
             Engine::CoreMl(encoder) => self.embed_coreml(texts, encoder),
+            #[cfg(feature = "vulkan")]
+            Engine::Vulkan(encoder) => self.embed_vulkan(texts, encoder),
         }
     }
 
@@ -593,6 +678,26 @@ impl Embedder {
             texts.len(),
             |hidden, mask, dim| Ok(embed_row(hidden, mask, dim, reduce)),
         )?;
+        Ok((rows_out, info))
+    }
+
+    /// The Vulkan path: the candle path's bucketing, Burn's forward.
+    ///
+    /// `embed_row` is the same function the candle runner hands its rows to, so
+    /// pooling, `--dims` truncation and normalization cannot differ between the
+    /// two — only the arithmetic that produced the hidden states.
+    #[cfg(feature = "vulkan")]
+    fn embed_vulkan(
+        &self,
+        texts: &[&str],
+        encoder: &crate::burn_engine::VulkanEncoder,
+    ) -> Result<(Vec<Vec<f32>>, Vec<TokenInfo>)> {
+        let encodings = crate::batch::encode(&self.tokenizer, texts)?;
+        let (batches, info) = crate::batch::bucket_encodings(&encodings, self.opts.batch_size);
+        let reduce = self.reduce();
+        let rows_out = encoder.run(&batches, texts.len(), |hidden, mask, dim| {
+            Ok(embed_row(hidden, mask, dim, reduce))
+        })?;
         Ok((rows_out, info))
     }
 
@@ -720,8 +825,10 @@ pub(crate) fn open_device(backend: Backend) -> Result<Device> {
             "this binary was built without CUDA support; rebuild with \
              `cargo build --release --features cuda`"
         ),
-        // CoreML is routed to its own loader before open_device is reached.
+        // CoreML and Vulkan are routed to their own loaders before open_device
+        // is reached: neither runs on candle, so neither has a Device to open.
         Backend::CoreML => unreachable!("CoreML backend does not use a candle Device"),
+        Backend::Vulkan => unreachable!("the Vulkan backend does not use a candle Device"),
     }
 }
 
@@ -847,6 +954,10 @@ pub(crate) fn load_weights(
     };
 
     match precision {
+        // f16 belongs to the Vulkan engine, which loads its own weights and
+        // never reaches here; `check_precision` refused it for every backend
+        // this function serves.
+        Precision::F16 => unreachable!("f16 is not a candle precision"),
         Precision::F32 => {
             let model = ModernBert::load(wrapped, config).context("loading ModernBERT weights")?;
             Ok(Weights::F32(Arc::new(model)))

@@ -11,6 +11,8 @@
 | `metal` | `--features metal` | ~1.8× on an M2 | f32, unchanged (worst `1 - cosine` 9e-13) |
 | `cuda` | `--features cuda` | GPU-dependent | f32 |
 | `coreml` | `--features coreml` | ~4× Metal at 512 tokens | fp16 encoder, cosine ≈ 0.99999 |
+| `vulkan --precision f16` | `--features vulkan` | ~1.9× the bf16 CPU path | f16 encoder, cosine ≈ 0.99999 |
+| `vulkan` (f32) | `--features vulkan` | slower than bf16 on CPU | f32, matches the CPU (worst `1 - cosine` 1.2e-12) |
 
 - An unsupported request is refused at startup rather than falling back
   silently. A run that quietly landed on the CPU would look like a Metal
@@ -54,6 +56,46 @@
   it.
 - It needs a compatible NVIDIA driver and CUDA runtime at run time.
 - AMD and Intel GPUs are not supported.
+
+## `--device vulkan` on AMD, Intel and NVIDIA GPUs
+
+- Build with `--features vulkan`, and pass `--precision f16`: the f32 path here
+  is slower than `--device cpu --precision bf16` and exists to verify the other.
+- Needs a Vulkan 1.2 driver and **nothing else** — no ROCm, no CUDA, no
+  `HSA_OVERRIDE_GFX_VERSION`. Burn/CubeCL compiles the same kernels to SPIR-V, so
+  a GPU that is not on a vendor's compute support list still runs. This is what
+  makes AMD and Intel reachable at all: candle has neither a ROCm nor a Vulkan
+  device, and `Device` is a closed enum, so no backend can be added from outside it.
+- Measured on a Radeon 780M (gfx1103, Mesa RADV) with `ruri-v3-130m`, 64 texts of
+  about 430 tokens, best of three interleaved runs, wall clock including load:
+
+| | wall | rows/s (encode) |
+| --- | ---: | ---: |
+| `cpu` | 11.1 s | 6.4 |
+| `cpu --precision bf16` | 6.7 s | 10.6 |
+| `vulkan --precision f16` | **5.0 s** | **18.6** |
+
+- **Startup costs about 0.8 s more than the CPU path**, so it pays from roughly
+  **20 rows of that length**; below that `--device cpu --precision bf16` wins.
+  CubeCL autotunes its kernels on first use — about 12 s once, then ~0.4 s per
+  run from a 60 KB cache under `~/.cache/kohagi/autotune`.
+- Accuracy against this crate's own CPU f32 output, over those 64 texts: median
+  `1 - cosine` 3.4e-7, worst 8.9e-6 — the same order the CoreML path publishes.
+- `--precision f16` is not a plain f16 forward. LayerNorm's variance and softmax
+  run in f32 while everything else stays f16; lowering those two as well is 16%
+  faster and lands at `1 - cosine` 3.5e-2, which is not an embedding worth
+  indexing.
+- `--precision bf16` is refused here. CubeCL emulates it rather than reaching the
+  hardware: measured 12× slower than f16, and it produced NaN.
+- **One precision per process.** CubeCL binds one float element type per device,
+  so a second `Embedder` asking for the other precision is refused at load rather
+  than silently served in the first one's arithmetic.
+- Memory stays bounded by the same kind of budget the candle GPU path uses, and a
+  tighter one: throughput here is flat in the row count (19.3 rows/s at one row
+  against 20.5 at sixty-four), so bounding memory harder costs nothing. 512 rows
+  of 430 tokens peaked at 1.1 GiB of GPU memory.
+- Reranking is not implemented on this device yet and is refused rather than
+  quietly served on the CPU.
 
 ## `--device coreml` on the Apple Neural Engine
 

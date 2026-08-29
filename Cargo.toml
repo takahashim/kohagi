@@ -54,6 +54,22 @@ candle-nn = "0.11"
 # dispatches through candle's Metal wrappers and needs MTLSize from objc2-metal.
 # Kept semver-aligned with candle-core's pins so cargo unifies to one instance.
 candle-metal-kernels = { version = "0.11", optional = true }
+
+# Only for the `vulkan` feature: Burn is the tensor framework the Vulkan backend
+# runs on, since candle has no Vulkan device (`Device` is a closed enum, so a
+# backend cannot be added from outside candle-core). `cubecl` is enabled for one
+# thing only — pointing the autotune cache at the user's cache directory instead
+# of whatever `target/` CubeCL finds above the working directory. See
+# src/vulkan/mod.rs.
+burn = { version = "0.21", optional = true, features = [
+    "vulkan", "autotune", "fusion", "cubecl",
+] }
+
+# Only for the `vulkan` feature: the platform's cache directory, for CubeCL's
+# autotune results. Not hand-rolled from `XDG_CACHE_HOME`, because that answer
+# is wrong on macOS; and no new entry in the lock file, since cubecl-runtime
+# already depends on this exact crate for the same purpose.
+dirs = { version = "6", optional = true }
 objc2-metal = { version = "0.3", optional = true }
 
 # Only for the `coreml` feature: drives the Apple Neural Engine through CoreML
@@ -103,6 +119,14 @@ metal = [
 # Writing CoreML models from Rust instead of scripts/convert_coreml.py, behind
 # its own feature because it is under development and pulls in prost.
 coreml-export = ["dep:prost"]
+
+# Any Vulkan 1.2 GPU via Burn/CubeCL, which compiles the same kernels to SPIR-V:
+# `cargo build --release --features vulkan`, then `kohagi --device vulkan
+# --precision f16`. Unlike `cuda` it needs no vendor runtime installed — a Mesa
+# or vendor driver is enough — which is what makes AMD and Intel GPUs reachable
+# at all (candle has no ROCm or Vulkan backend). Off by default: it is a second
+# tensor framework beside candle, and the default build must not pay for it.
+vulkan = ["dep:burn", "dep:dirs"]
 
 # Apple Neural Engine via CoreML: `cargo build --release --features coreml`,
 # then `kohagi --device coreml`. macOS-only. Runs fixed-shape ModernBERT models

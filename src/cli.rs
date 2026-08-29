@@ -41,6 +41,8 @@ pub enum PrecisionArg {
     F32,
     /// ~2x faster on x86_64 CPUs with AVX512-BF16; not bit-identical to f32.
     Bf16,
+    /// `--device vulkan` only: ~2x the bf16 CPU path; not bit-identical to f32.
+    F16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -54,6 +56,10 @@ pub enum BackendArg {
     /// Apple Neural Engine. Needs `--features coreml`; converts --model-id
     /// itself unless given a converted bundle.
     Coreml,
+    /// Any Vulkan GPU (AMD, Intel, NVIDIA) via Burn. Needs `--features vulkan`
+    /// and a Vulkan driver — no ROCm or CUDA install. Pair with
+    /// `--precision f16`.
+    Vulkan,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -86,6 +92,7 @@ impl From<PrecisionArg> for Precision {
         match p {
             PrecisionArg::F32 => Precision::F32,
             PrecisionArg::Bf16 => Precision::Bf16,
+            PrecisionArg::F16 => Precision::F16,
         }
     }
 }
@@ -97,6 +104,7 @@ impl From<BackendArg> for Backend {
             BackendArg::Metal => Backend::Metal,
             BackendArg::Cuda => Backend::Cuda,
             BackendArg::Coreml => Backend::CoreML,
+            BackendArg::Vulkan => Backend::Vulkan,
         }
     }
 }
