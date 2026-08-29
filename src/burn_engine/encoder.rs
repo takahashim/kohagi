@@ -478,9 +478,12 @@ impl<B: FusedOps> ModernBert<B> {
         // Under `half` the softmax and the mask it consumes run in f32; see the
         // module's precision note for why this reduction in particular.
         let scores = if self.half {
-            scores.cast(FloatDType::F32) + mask.clone().cast(FloatDType::F32)
+            B::add_mask(
+                scores.cast(FloatDType::F32),
+                mask.clone().cast(FloatDType::F32),
+            )
         } else {
-            scores + mask.clone()
+            B::add_mask(scores, mask.clone())
         };
         let probs = activation::softmax(scores, 3);
         let probs = if self.half { probs.cast(dtype) } else { probs };

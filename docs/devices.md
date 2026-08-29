@@ -13,7 +13,7 @@
 | `coreml` | `--features coreml` | ~4× Metal at 512 tokens | fp16 encoder, cosine ≈ 0.99999 |
 | `vulkan --precision f16` | `--features vulkan` | ~1.9× the bf16 CPU path | f16 encoder, cosine ≈ 0.99999 |
 | `vulkan` (f32) | `--features vulkan` | slower than bf16 on CPU | f32, matches the CPU (worst `1 - cosine` 1.2e-12) |
-| `cpu-burn` | `--features cpu-burn` | 1.5× `cpu` short, 0.85× long | f32, matches it (worst `1 - cosine` 1.0e-12) |
+| `cpu-burn` | `--features cpu-burn` | 1.5× `cpu` short and 0.85× long on x86_64; 0.7-0.9× throughout on aarch64 | f32, matches it (worst `1 - cosine` 1.0e-12) |
 
 - An unsupported request is refused at startup rather than falling back
   silently. A run that quietly landed on the CPU would look like a Metal
@@ -170,6 +170,54 @@
   work is. The GEMM is not it: at the shape a fanned-out forward actually runs,
   burn-flex measured 138 GFLOP/s against candle's 133 single-threaded, and 627
   against 325 across all cores.
+
+### On aarch64 the GEMM *is* it
+
+Everything above was measured on x86_64, where both engines put their sgemm
+through the same `gemm` crate. macOS is not that comparison: `Cargo.toml` gives
+candle the `accelerate` feature there, so `--device cpu` runs on Apple's AMX
+coprocessor while burn-flex runs NEON. At `2048x512x2048` on an M1 Pro that is
+2072 GFLOP/s against 395 — and candle without `accelerate` measures 521, which
+is what says the gap is Accelerate and not burn-flex.
+
+Measured on a 6+2-core M1 Pro with `ruri-v3-130m`, best of interleaved runs,
+wall clock, at worst `1 - cosine` 6.5e-11 against `--device cpu`:
+
+| texts | `cpu` | `cpu-burn` before | after |
+| --- | ---: | ---: | ---: |
+| 64 × 42 tokens | **0.81 s** | 1.15 s | 0.87 s |
+| 64 × 460 tokens | **2.73 s** | 8.12 s | 3.68 s |
+| 8 × 2048 tokens | **2.11 s** | 5.73 s | 2.81 s |
+| 4 × 8192 tokens | **8.92 s** | 19.12 s | 12.83 s |
+
+Three changes account for the "after" column:
+
+- **`gemm`'s AMX kernels**, which burn-flex offers as `apple-amx` and
+  `Cargo.toml` now asks for alongside `x86-v4`. 395 GFLOP/s to 1240, and 8.24 s
+  to 4.64 at 460 tokens. It is the same kind of knob as `x86-v4` and was simply
+  missing for the other architecture.
+- **The mask add on contiguous planes** (`FusedOps::add_mask`), 4.64 s to 3.73.
+  burn-flex accelerates two broadcast shapes, both over the innermost axis, and
+  the attention mask broadcasts over the *head* axis; everything else walks a
+  scalar `StridedIter` over the widest tensor in the model.
+- **RoPE reading its input where it lies**, 3.73 s to 3.52. It writes a fresh
+  contiguous buffer anyway, so the `to_contiguous` that preceded it bought
+  nothing.
+
+What remains is largely not Kohagi's to fix, which is the finding that matters
+for retiring `--device cpu`:
+
+- `gemm`'s AMX kernel reaches about 60% of Accelerate and packs its operands
+  with scalar code. burn-flex has no BLAS feature to reach Accelerate through
+  the way `burn-ndarray` does (`blas-accelerate`), so there is no knob here.
+- The scalar `erf` under `gelu` is the next item in the profile, and it is a
+  floor under **both** engines on aarch64 rather than a gap between them:
+  candle's `gelu_erf` is the largest single entry in its own profile after
+  BLAS. Vectorising it lifts both and closes nothing.
+
+So on aarch64 `--device cpu-burn` is 1.1× to 1.4× the wall clock of
+`--device cpu`, and the shortfall is Accelerate. On x86_64 it is ahead at every
+length below 8192. Retiring the candle CPU path is a decision about macOS.
 
 ## `--device coreml` on the Apple Neural Engine
 

@@ -57,6 +57,17 @@ pub(crate) trait FusedOps: Backend {
         rope_composed(x, cos, sin)
     }
 
+    /// `scores + mask`, where `mask` is `[rows, 1, queries | 1, keys]` against
+    /// scores of `[rows, heads, queries, keys]` — a broadcast over the head
+    /// axis, and over the query axis too where the mask is padding alone.
+    ///
+    /// Here rather than written inline because a backend may not have a fast
+    /// path for this particular broadcast, and it is over the widest tensor in
+    /// the model. See the override in [`flex`], which is exactly that case.
+    fn add_mask(scores: Tensor<Self, 4>, mask: Tensor<Self, 4>) -> Tensor<Self, 4> {
+        scores + mask
+    }
+
     /// The gated feed-forward's elementwise half: `act(gate) * up`.
     fn geglu(gate: Tensor<Self, 3>, up: Tensor<Self, 3>, act: Activation) -> Tensor<Self, 3> {
         geglu_composed(gate, up, act)
