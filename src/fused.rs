@@ -37,11 +37,135 @@ pub fn gated(wide: &Tensor, inter: usize, act: Activation) -> Result<Tensor> {
         out_shape.push(inter);
         return out.reshape(out_shape);
     }
+    // The CPU kernel reads the interleaved `[.., 2 * inter]` layout directly,
+    // which is the whole reason `crate::bf16::geglu` carries two entry points.
+    // Narrowing first would hand it two strided views and force a copy to undo.
+    if act == Activation::Gelu && cpu::takes(wide) {
+        return wide.apply_op1_no_bwd(&cpu::GegluWide { inter });
+    }
     let gate = wide.narrow(candle_core::D::Minus1, 0, inter)?;
     let up = wide.narrow(candle_core::D::Minus1, inter, inter)?;
+    gated_split(&gate, &up, act)
+}
+
+/// `act(gate) * up` from two separate tensors, which is the shape the CPU's
+/// pre-split `Wi` leaves them in.
+///
+/// On a CPU where [`crate::bf16::geglu`] reaches a vector kernel this takes it,
+/// and elsewhere it is candle's `gelu_erf` and a multiply. The kernel is worth
+/// the detour for the same reason on both architectures and by very different
+/// amounts: candle evaluates `erf` one element at a time, and the MLP's
+/// intermediate is four times the hidden width, so this is the widest
+/// elementwise op in the model. Measured at ruri-v3-130m's shape on an M2, 19
+/// calls over `[460, 2048]`: 0.0600 s through `gelu_erf` against 0.0176 s
+/// through the kernel.
+///
+/// Silu is left to candle. It has no hand-written kernel here, and inventing
+/// one to match would be a second approximation to keep honest for a
+/// nonlinearity none of Kohagi's models use.
+pub fn gated_split(gate: &Tensor, up: &Tensor, act: Activation) -> Result<Tensor> {
+    if act == Activation::Gelu && cpu::takes(gate) && cpu::takes(up) {
+        return gate.apply_op2_no_bwd(up, &cpu::Geglu);
+    }
     match act {
         Activation::Gelu => gate.gelu_erf()? * up,
         Activation::Silu => gate.silu()? * up,
+    }
+}
+
+mod cpu {
+    use candle_core::backend::BackendStorage;
+    use candle_core::{CpuStorage, CustomOp1, CustomOp2, Layout, Result, Shape, Tensor};
+
+    /// Whether the kernel can read this tensor as it stands.
+    ///
+    /// Contiguity is checked here rather than only inside the op so that a
+    /// strided view takes candle's path instead of failing: [`super::gated`]
+    /// narrows a wide projection into two views, and those are a legitimate way
+    /// to arrive. The check inside each op stays as the invariant it is.
+    pub fn takes(t: &Tensor) -> bool {
+        crate::bf16::geglu::vectorised()
+            && t.device().is_cpu()
+            && t.dtype() == candle_core::DType::F32
+            && t.is_contiguous()
+    }
+
+    /// `gelu(gate) * up` over one wide `[.., 2 * inter]` f32 CPU tensor, gate
+    /// half first.
+    pub struct GegluWide {
+        pub inter: usize,
+    }
+
+    impl CustomOp1 for GegluWide {
+        fn name(&self) -> &'static str {
+            "kohagi-geglu-wide"
+        }
+
+        fn cpu_fwd(&self, s: &CpuStorage, l: &Layout) -> Result<(CpuStorage, Shape)> {
+            let CpuStorage::F32(v) = s else {
+                candle_core::bail!("kohagi-geglu-wide takes f32, got {:?}", s.dtype());
+            };
+            let Some((from, to)) = l.contiguous_offsets() else {
+                candle_core::bail!("kohagi-geglu-wide needs a contiguous input");
+            };
+            let dims = l.shape().dims();
+            let (lead, cols) = dims.split_at(dims.len() - 1);
+            if cols[0] != 2 * self.inter {
+                candle_core::bail!(
+                    "kohagi-geglu-wide wants {} columns, got {}",
+                    2 * self.inter,
+                    cols[0]
+                );
+            }
+            let rows: usize = lead.iter().product();
+            let out = crate::bf16::geglu::geglu(&v[from..to], rows, self.inter);
+            let mut shape = lead.to_vec();
+            shape.push(self.inter);
+            Ok((CpuStorage::F32(out), shape.into()))
+        }
+    }
+
+    /// `gelu(gate) * up` over two f32 CPU tensors of the same shape.
+    ///
+    /// A [`CustomOp2`] rather than slicing the tensors from outside, because
+    /// candle exposes a storage buffer no other way: `to_vec1` copies, and the
+    /// copy is the cost this exists to remove.
+    pub struct Geglu;
+
+    impl CustomOp2 for Geglu {
+        fn name(&self) -> &'static str {
+            "kohagi-geglu"
+        }
+
+        fn cpu_fwd(
+            &self,
+            s1: &CpuStorage,
+            l1: &Layout,
+            s2: &CpuStorage,
+            l2: &Layout,
+        ) -> Result<(CpuStorage, Shape)> {
+            let (CpuStorage::F32(a), CpuStorage::F32(b)) = (s1, s2) else {
+                candle_core::bail!("kohagi-geglu takes f32, got {:?}", s1.dtype());
+            };
+            // The caller hands this two freshly projected tensors, so both are
+            // contiguous. Saying so rather than assuming it: a strided view
+            // would silently gate the wrong elements.
+            let (Some(g), Some(u)) = (l1.contiguous_offsets(), l2.contiguous_offsets()) else {
+                candle_core::bail!("kohagi-geglu needs contiguous inputs");
+            };
+            let (gate, up) = (&a[g.0..g.1], &b[u.0..u.1]);
+            if gate.len() != up.len() {
+                candle_core::bail!(
+                    "kohagi-geglu operands differ: {} against {}",
+                    gate.len(),
+                    up.len()
+                );
+            }
+            // One row of the full width: the kernel walks a flat pair of
+            // buffers, and the shape it came from only decides what is returned.
+            let out = crate::bf16::geglu::geglu_split(gate, up, 1, gate.len());
+            Ok((CpuStorage::F32(out), l1.shape().clone()))
+        }
     }
 }
 

@@ -782,12 +782,7 @@ impl Module for ModernBertMLP {
         let gated = match &self.wi {
             Wi::Wide(wi) => crate::fused::gated(&xs.apply(wi)?, self.inter, self.act)?,
             Wi::Split { gate, up } => {
-                let g = xs.apply(gate)?;
-                let g = match self.act {
-                    Activation::Gelu => g.gelu_erf()?,
-                    Activation::Silu => g.silu()?,
-                };
-                (g * xs.apply(up)?)?
+                crate::fused::gated_split(&xs.apply(gate)?, &xs.apply(up)?, self.act)?
             }
         };
         gated.apply(&self.wo)
