@@ -332,16 +332,6 @@ fn layer_norm<B: Backend>(
     }
 }
 
-/// `[b, s, in] @ [in, out]` as one 2-D matmul, which is the shape the GEMM
-/// wants; the weights were transposed once at load for the same reason.
-fn linear<B: Backend>(x: Tensor<B, 3>, w: Tensor<B, 2>) -> Tensor<B, 3> {
-    let [batch, seq, input] = x.dims();
-    let output = w.dims()[1];
-    x.reshape([batch * seq, input])
-        .matmul(w)
-        .reshape([batch, seq, output])
-}
-
 impl<B: FusedOps> ModernBert<B> {
     /// This padded length's tables, built if the last forward used another one.
     fn tables(&self, seq: usize, device: &B::Device) -> Tables<B> {
@@ -392,18 +382,13 @@ impl<B: FusedOps> ModernBert<B> {
         let hidden = cfg.hidden_size;
         let heads = cfg.num_attention_heads;
         let head_dim = hidden / heads;
-        let [rows, seq, _] = normed.dims();
+        let seq = normed.dims()[1];
 
-        let qkv = linear(normed, layer.wqkv.clone());
+        let qkv = B::project(normed, layer.wqkv.clone());
         // Linear weights are [out, in] and the fused Wqkv concatenates q, k and
         // v along that output axis, so after the transpose at load the three
         // live at column offsets 0, h and 2h.
-        let part = |i: usize| {
-            qkv.clone()
-                .narrow(2, i * hidden, hidden)
-                .reshape([rows, seq, heads, head_dim])
-                .swap_dims(1, 2)
-        };
+        let part = |i: usize| B::split_heads(qkv.clone(), i, heads);
         let (cos, sin) = tables.rope(layer.global);
         let scale = 1.0 / (head_dim as f64).sqrt();
         let q = rope(part(0), cos.clone(), sin.clone()) * scale;
@@ -421,73 +406,72 @@ impl<B: FusedOps> ModernBert<B> {
         let tile = (self.budget / seq).max(1);
         let plan = crate::attention::plan(seq, window, tile, BAND_BLOCK);
 
-        // One block's additive mask, in the block's own shape: the padding for
-        // the keys it reads, plus the window where the layer has one. Building
-        // it here rather than once per forward is what keeps a banded layer from
-        // holding `[rows, seq, seq]` — the summed form has no shape to share.
+        // One block's additive masks, in the block's own shape: the padding
+        // for the keys it reads, plus the window where the layer has one. Taken
+        // here rather than once per forward is what keeps a banded layer from
+        // holding `[rows, seq, seq]` — a per-block view has a table to share.
         let mask_for = |b: &crate::attention::Block| {
             let pad = padding.clone().narrow(3, b.k0, b.keys);
-            if layer.global {
-                pad
-            } else {
-                pad + tables.window.of(b)
-            }
+            let window = (!layer.global).then(|| tables.window.of(b));
+            (pad, window)
         };
 
         let context = if plan.blocks.len() == 1 {
-            self.attend(q, k, v, &mask_for(&plan.blocks[0]))
+            let (pad, window) = mask_for(&plan.blocks[0]);
+            self.attend(q, k, v, pad, window)
         } else {
             let parts: Vec<Tensor<B, 4>> = plan
                 .blocks
                 .iter()
                 .map(|b| {
+                    let (pad, window) = mask_for(b);
                     self.attend(
                         q.clone().narrow(2, b.q0, b.queries),
                         k.clone().narrow(2, b.k0, b.keys),
                         v.clone().narrow(2, b.k0, b.keys),
-                        &mask_for(b),
+                        pad,
+                        window,
                     )
                 })
                 .collect();
             Tensor::cat(parts, 2)
         };
-        let context = context.swap_dims(1, 2).reshape([rows, seq, hidden]);
-        linear(context, layer.wo.clone())
+        B::project(B::merge_heads(context), layer.wo.clone())
     }
 
     /// One block of queries against the keys it may reach.
     ///
-    /// `mask` is additive and already carries everything that masks this block:
-    /// padding, and the window where there is one. Combining them costs one pass
-    /// over `[rows, 1, seq, seq]` per forward instead of a second broadcast add
-    /// over `[rows, heads, seq, seq]` in each of the twelve sliding-window
-    /// layers.
+    /// `pad` and `window` are additive, and between them carry everything that
+    /// masks this block. How they are combined with the scores is the backend's
+    /// — see [`FusedOps::add_mask`].
     fn attend(
         &self,
         q: Tensor<B, 4>,
         k: Tensor<B, 4>,
         v: Tensor<B, 4>,
-        mask: &Tensor<B, 4>,
+        pad: Tensor<B, 4>,
+        window: Option<Tensor<B, 4>>,
     ) -> Tensor<B, 4> {
         // Scaling the queries rather than the scores: `q` is
         // `[rows, heads, seq, head_dim]` and the scores are
         // `[rows, heads, seq, seq]`, so at 460 tokens this is one pass over a
         // seventh of the elements.
-        let scores = q.matmul(k.swap_dims(2, 3));
+        let scores = B::scores(q, k);
         let dtype = scores.dtype();
-        // Under `half` the softmax and the mask it consumes run in f32; see the
-        // module's precision note for why this reduction in particular.
+        // Under `half` the softmax and the masks it consumes run in f32; see
+        // the module's precision note for why this reduction in particular.
         let scores = if self.half {
             B::add_mask(
                 scores.cast(FloatDType::F32),
-                mask.clone().cast(FloatDType::F32),
+                pad.cast(FloatDType::F32),
+                window.map(|w| w.cast(FloatDType::F32)),
             )
         } else {
-            B::add_mask(scores, mask.clone())
+            B::add_mask(scores, pad, window)
         };
         let probs = activation::softmax(scores, 3);
         let probs = if self.half { probs.cast(dtype) } else { probs };
-        probs.matmul(v)
+        B::context(probs, v)
     }
 
     /// Operations 17-23: the gated feed-forward. `Wi` concatenates gate and up
@@ -496,11 +480,11 @@ impl<B: FusedOps> ModernBert<B> {
         let inter = self.config.intermediate_size;
         let (gate, up) = match &layer.wi {
             Wi::Split { gate, up } => (
-                linear(normed.clone(), gate.clone()),
-                linear(normed, up.clone()),
+                B::project(normed.clone(), gate.clone()),
+                B::project(normed, up.clone()),
             ),
             Wi::Wide(wi) => {
-                let wide = linear(normed, wi.clone());
+                let wide = B::project(normed, wi.clone());
                 (
                     wide.clone().narrow(2, 0, inter),
                     wide.narrow(2, inter, inter),
@@ -508,7 +492,7 @@ impl<B: FusedOps> ModernBert<B> {
             }
         };
         let gated = B::geglu(gate, up, self.config.activation);
-        linear(gated, layer.mlp_wo.clone())
+        B::project(gated, layer.mlp_wo.clone())
     }
 
     /// One transformer block: pre-norm, attention, residual, pre-norm, gated

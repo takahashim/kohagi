@@ -161,16 +161,13 @@ vulkan = [
 # `__m512` types, and those were nightly-only until Rust 1.89. The default is
 # the age of the feature rather than a judgement about it.
 #
-# `apple-amx` is the same knob for the other architecture, and it matters more
-# there: on macOS the `accelerate` dependency above puts candle's sgemm on
-# Apple's AMX coprocessor, and burn-flex has no BLAS to reach it through, so
-# without this the comparison is AMX against NEON rather than one `gemm` build
-# against another. Measured on an M1 Pro at 2048x512x2048: candle 2072 GFLOP/s,
-# burn-flex 395, and 1240 with this on. End to end at 64 texts of 460 tokens it
-# is 8.24 s to 4.64 s, and it takes 64 x 42 tokens from 1.22 s to 0.87 s —
-# level with `--device cpu`'s 0.81 s. Like
-# `x86-v4` it is dispatched at run time and inert on the other architecture.
-cpu-burn = ["burn-engine", "burn/flex", "burn/simd", "burn/x86-v4", "burn/apple-amx"]
+# There is no `apple-amx` beside it, though burn-flex offers one and it was
+# measured: 395 GFLOP/s to 1240 at 2048x512x2048 on an M1 Pro, and 8.24 s to
+# 4.64 at 64 texts of 460 tokens. It is not here because on macOS the GEMMs do
+# not go through `gemm` at all any more — `src/burn_engine/flex.rs` sends them
+# to Accelerate, which is where candle's already were and which measured 2072
+# GFLOP/s at that shape — so the kernels would be built and never run.
+cpu-burn = ["burn-engine", "burn/flex", "burn/simd", "burn/x86-v4"]
 
 # Apple Neural Engine via CoreML: `cargo build --release --features coreml`,
 # then `kohagi --device coreml`. macOS-only. Runs fixed-shape ModernBERT models

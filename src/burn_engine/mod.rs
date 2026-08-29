@@ -35,13 +35,16 @@ pub use vulkan::load as load_vulkan;
 /// The Burn Book's "backend extension" pattern: a trait with a generic default
 /// so every backend works, overridden where a device can do better.
 ///
-/// Only two operations are here, and that is the measured answer rather than a
-/// starting point. burn-flex already implements softmax, gelu and layer_norm as
-/// SIMD backend ops, so routing through `ActivationOps` / `ModuleOps` beats
-/// anything written here. `burn_nn`'s RoPE is the one composed from primitives
-/// (`matmul` against a sign matrix, then `cat`), where candle-nn has a fused
-/// kernel — so that is the gap. GeGLU is here because this crate already owns a
-/// vectorised one.
+/// Each operation here is a measured answer rather than a starting point.
+/// burn-flex already implements softmax, gelu and layer_norm as SIMD backend
+/// ops, so routing through `ActivationOps` / `ModuleOps` beats anything written
+/// here; what is listed is what that did *not* cover. RoPE, because `burn_nn`
+/// composes it from primitives (`matmul` against a sign matrix, then `cat`)
+/// where candle-nn has a kernel. GeGLU, because this crate already owns a
+/// vectorised one. The GEMMs, the head split and merge, and the mask add,
+/// because on macOS burn-flex has no way to reach Accelerate, and copies —
+/// one element at a time — any view its `reshape` cannot re-label. See
+/// [`flex`] for each.
 pub(crate) trait FusedOps: Backend {
     /// Whether to load `Wi` as two contiguous matrices rather than one wide one.
     ///
@@ -52,20 +55,73 @@ pub(crate) trait FusedOps: Backend {
     /// split for the same reason on the candle CPU path.
     const SPLIT_WI: bool = false;
 
+    /// `[b, s, in] @ [in, out]`, the projection every layer makes six times.
+    ///
+    /// Here because the GEMM is the one place a backend's own choice of kernel
+    /// decides the whole comparison: on macOS, candle's sgemm is Apple's AMX
+    /// coprocessor through Accelerate, and burn-flex has no way to reach it. See
+    /// the override in [`flex`].
+    fn project(x: Tensor<Self, 3>, w: Tensor<Self, 2>) -> Tensor<Self, 3> {
+        linear_composed(x, w)
+    }
+
+    /// One of q, k, v out of the fused `[rows, seq, 3 * hidden]` projection, as
+    /// `[rows, heads, seq, head_dim]`.
+    ///
+    /// Composed, this is a narrow, a reshape and a transpose, and whether the
+    /// reshape costs a copy is the backend's business: it does on burn-flex,
+    /// whose `reshape` copies anything that is not contiguous from offset zero,
+    /// and the copy is a scalar one. See the override in [`flex`], which builds
+    /// the view directly.
+    fn split_heads(qkv: Tensor<Self, 3>, part: usize, heads: usize) -> Tensor<Self, 4> {
+        split_heads_composed(qkv, part, heads)
+    }
+
+    /// The attention output `[rows, heads, seq, head_dim]` back as
+    /// `[rows, seq, hidden]`, for the output projection.
+    ///
+    /// This one is a real transpose — the head axis moves inside the sequence
+    /// axis — so a copy is owed; the override in [`flex`] is about how that copy
+    /// is made rather than whether.
+    fn merge_heads(context: Tensor<Self, 4>) -> Tensor<Self, 3> {
+        merge_heads_composed(context)
+    }
+
     /// `x * cos + rotate_half(x) * sin`, over `[rows, heads, seq, head_dim]`.
     fn rope(x: Tensor<Self, 4>, cos: Tensor<Self, 4>, sin: Tensor<Self, 4>) -> Tensor<Self, 4> {
         rope_composed(x, cos, sin)
     }
 
-    /// `scores + mask`, where `mask` is `[rows, 1, queries | 1, keys]` against
-    /// scores of `[rows, heads, queries, keys]` — a broadcast over the head
-    /// axis, and over the query axis too where the mask is padding alone.
+    /// `q @ k^T`: `[rows, heads, queries, head_dim]` against
+    /// `[rows, heads, keys, head_dim]`, to `[rows, heads, queries, keys]`.
     ///
-    /// Here rather than written inline because a backend may not have a fast
-    /// path for this particular broadcast, and it is over the widest tensor in
-    /// the model. See the override in [`flex`], which is exactly that case.
-    fn add_mask(scores: Tensor<Self, 4>, mask: Tensor<Self, 4>) -> Tensor<Self, 4> {
-        scores + mask
+    /// Batched over `rows * heads` with a 64-wide contraction, which is a shape
+    /// a backend's general matmul may handle badly — see [`flex`], where it goes
+    /// to Accelerate along with [`Self::project`].
+    fn scores(q: Tensor<Self, 4>, k: Tensor<Self, 4>) -> Tensor<Self, 4> {
+        scores_composed(q, k)
+    }
+
+    /// `probs @ v`: `[rows, heads, queries, keys]` against
+    /// `[rows, heads, keys, head_dim]`, to `[rows, heads, queries, head_dim]`.
+    fn context(probs: Tensor<Self, 4>, v: Tensor<Self, 4>) -> Tensor<Self, 4> {
+        context_composed(probs, v)
+    }
+
+    /// `scores + pad + window`, over scores of `[rows, heads, queries, keys]`.
+    ///
+    /// `pad` is `[rows, 1, 1, keys]` — whether a key is padding is the key's
+    /// property alone — and `window` is `[1, 1, queries, keys]` where the layer
+    /// slides one, `None` where it attends globally. Both broadcast over the
+    /// head axis, which a backend may have no fast path for; and summing them
+    /// first would materialise `[rows, 1, queries, keys]` for nothing. See the
+    /// override in [`flex`], which is both of those cases.
+    fn add_mask(
+        scores: Tensor<Self, 4>,
+        pad: Tensor<Self, 4>,
+        window: Option<Tensor<Self, 4>>,
+    ) -> Tensor<Self, 4> {
+        add_mask_composed(scores, pad, window)
     }
 
     /// The gated feed-forward's elementwise half: `act(gate) * up`.
@@ -75,6 +131,58 @@ pub(crate) trait FusedOps: Backend {
 }
 
 /// The generic defaults, as free functions so an override can fall back to them.
+///
+/// One 2-D matmul rather than a batched 3-D one, which is the shape the GEMM
+/// wants; the weights were transposed once at load for the same reason.
+pub(crate) fn linear_composed<B: Backend>(x: Tensor<B, 3>, w: Tensor<B, 2>) -> Tensor<B, 3> {
+    let [batch, seq, input] = x.dims();
+    let output = w.dims()[1];
+    x.reshape([batch * seq, input])
+        .matmul(w)
+        .reshape([batch, seq, output])
+}
+
+pub(crate) fn split_heads_composed<B: Backend>(
+    qkv: Tensor<B, 3>,
+    part: usize,
+    heads: usize,
+) -> Tensor<B, 4> {
+    let [rows, seq, width] = qkv.dims();
+    let hidden = width / 3;
+    qkv.narrow(2, part * hidden, hidden)
+        .reshape([rows, seq, heads, hidden / heads])
+        .swap_dims(1, 2)
+}
+
+pub(crate) fn merge_heads_composed<B: Backend>(context: Tensor<B, 4>) -> Tensor<B, 3> {
+    let [rows, heads, seq, head_dim] = context.dims();
+    context
+        .swap_dims(1, 2)
+        .reshape([rows, seq, heads * head_dim])
+}
+
+pub(crate) fn scores_composed<B: Backend>(q: Tensor<B, 4>, k: Tensor<B, 4>) -> Tensor<B, 4> {
+    q.matmul(k.swap_dims(2, 3))
+}
+
+pub(crate) fn context_composed<B: Backend>(probs: Tensor<B, 4>, v: Tensor<B, 4>) -> Tensor<B, 4> {
+    probs.matmul(v)
+}
+
+pub(crate) fn add_mask_composed<B: Backend>(
+    scores: Tensor<B, 4>,
+    pad: Tensor<B, 4>,
+    window: Option<Tensor<B, 4>>,
+) -> Tensor<B, 4> {
+    // The two masks summed first, so the wide tensor is touched once; a
+    // backend that would rather not materialise the sum overrides `add_mask`.
+    let mask = match window {
+        Some(window) => pad + window,
+        None => pad,
+    };
+    scores + mask
+}
+
 pub(crate) fn rope_composed<B: Backend>(
     x: Tensor<B, 4>,
     cos: Tensor<B, 4>,
