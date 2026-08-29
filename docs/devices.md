@@ -10,7 +10,7 @@
 | `cpu --precision bf16` | x86_64 with AVX512-BF16 | ~2× | cosine ≈ 0.99999 vs f32 |
 | `metal` | `--features metal` | ~1.8× on an M2 | f32, unchanged (worst `1 - cosine` 9e-13) |
 | `cuda` | `--features cuda` | GPU-dependent | f32 |
-| `coreml` | `--features coreml` | ~4× Metal at 512 tokens | fp16 encoder, cosine ≈ 0.99999 |
+| `coreml` | `--features coreml` | one text per forward, padded to a fixed bucket; see below | fp16 encoder, cosine ≈ 0.99999 |
 | `vulkan --precision f16` | `--features vulkan` | ~1.9× the bf16 CPU path | f16 encoder, cosine ≈ 0.99999 |
 | `vulkan` (f32) | `--features vulkan` | slower than bf16 on CPU | f32, matches the CPU (worst `1 - cosine` 1.2e-12) |
 | `cpu-burn` | `--features cpu-burn` | 1.5× `cpu` short and 0.85× long on x86_64; 1.1× short and 0.9× long on aarch64 | f32, matches it (worst `1 - cosine` 1.0e-12) |
@@ -266,27 +266,16 @@ at every length below 8192.
 
 ## `--device coreml` on the Apple Neural Engine
 
-- Build with `--features coreml`.
-- About 4× faster than Metal at 512 tokens, with cosine ≈ 0.99999 against the
-  CPU output.
-- For short inputs the multicore CPU backend may still be faster, because what
-  the ANE gains per token it gives back padding each row to a fixed bucket
-  length.
-- Measured against PyTorch on the same machine (M2, `ruri-v3-130m`, the default
-  buckets, median of three runs), from
-  [`tools/benchmark.py`](../tools/benchmark.py):
-
-| Input | kohagi (CPU) | kohagi (`--device coreml`) | torch (MPS) |
-| --- | ---: | ---: | ---: |
-| 1200 short (~30 tokens) | 7.1 s / 7.4 s | **4.0 s / 4.7 s** | 4.3 s / 13.7 s |
-| 240 long (512 tokens) | 30.8 s / 31.5 s | **5.9 s / 6.6 s** | 15.2 s / 24.9 s |
-
-- Encode / total, where total adds startup and model load.
-- At 512 tokens the ANE encodes 2.6× faster than torch/MPS and 5.2× faster than
-  Kohagi's own CPU path.
-- The totals go further: torch spends 9 to 10 s importing and loading per process
-  against Kohagi's under a second, so a rake task or a per-batch subprocess sees
-  2.9× (short) and 3.8× (long).
+- Build with `--features coreml`. Cosine ≈ 0.99999 against the CPU output.
+- How it compares to the CPU and GPU paths depends on the chip generation, the
+  text lengths and the machine's cooling more than on anything Kohagi does,
+  so no ratio is published here; measure on your own machine with
+  [`tools/benchmark.py`](../tools/benchmark.py). Two things hold across
+  machines: the Neural Engine is most efficient per token in the middle
+  buckets and least in the largest, where attention's quadratic share grows;
+  and for short inputs the multicore CPU backend may still be faster, because
+  what the ANE gains per token it gives back padding each row to a fixed bucket
+  length and running one text per forward.
 - The ANE needs fixed input shapes, so this device runs a converted bundle
   rather than the safetensors the others read. See
   [CoreML bundles](coreml.md).
@@ -294,7 +283,6 @@ at every length below 8192.
 ## Reranking
 
 - `kohagi-rerank` takes the same `--device`.
-- On the Neural Engine it is 3.4× the fastest PyTorch path.
 - **A score threshold does not carry unchanged from `cpu` to `coreml`**. See
   [Retrieval and reranking](reranking.md).
 
