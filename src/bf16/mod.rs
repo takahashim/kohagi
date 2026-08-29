@@ -27,11 +27,22 @@
 //! time, and both elementwise kernels fall back to scalar rows when AVX-512
 //! is absent.
 
+// [`geglu`] and [`simd`] build everywhere; the rest is x86_64 only. The split
+// is not tidiness: [`geglu`] is f32 in and f32 out and changes no precision, so
+// it is useful to any CPU engine, and it now carries a NEON kernel beside the
+// AVX-512 one. What keeps it here is that it shares [`simd`]'s vector `exp`
+// with [`softmax`], which is x86 only. See the note in [`geglu`] on why the
+// name of this module undersells what is in it.
 pub mod geglu;
+#[cfg(target_arch = "x86_64")]
 pub mod gemm;
+#[cfg(target_arch = "x86_64")]
 pub mod modernbert;
 pub mod simd;
+#[cfg(target_arch = "x86_64")]
 pub mod softmax;
 
+#[cfg(target_arch = "x86_64")]
 pub use gemm::supported;
+#[cfg(target_arch = "x86_64")]
 pub use modernbert::Bf16ModernBert;

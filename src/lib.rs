@@ -28,7 +28,6 @@
 
 mod attention;
 mod batch;
-#[cfg(target_arch = "x86_64")]
 pub mod bf16;
 pub mod cli;
 mod config;
