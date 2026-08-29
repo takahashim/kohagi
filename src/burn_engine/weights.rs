@@ -16,6 +16,8 @@
 //!   element type, so a weight arrives in whatever precision the run selected
 //!   without this module knowing which.
 
+use std::borrow::Cow;
+
 use anyhow::{Context, Result};
 use burn::tensor::{backend::Backend, Tensor, TensorData};
 use candle_core::safetensors::MmapedSafetensors;
@@ -43,18 +45,39 @@ impl Checkpoint {
         Ok(Checkpoint { tensors, prefix })
     }
 
-    fn raw(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>)> {
+    /// One tensor's values as f32, borrowed straight out of the mapping when
+    /// the file already holds f32 and the bytes land on an alignment `f32` can
+    /// be read at.
+    ///
+    /// That is the common case and it is worth taking: going through
+    /// `MmapedSafetensors::load` builds a candle tensor and `to_vec1` copies it
+    /// again, so a checkpoint got walked three times before anything was
+    /// transposed. Anything else — f16, bf16, a mapping that starts a tensor
+    /// off-alignment — falls back to candle, which knows how to convert.
+    fn raw(&self, name: &str) -> Result<(Vec<usize>, Cow<'_, [f32]>)> {
         let full = format!("{}{name}", self.prefix);
-        let tensor = self
+        let view = self
             .tensors
-            .load(&full, &candle_core::Device::Cpu)
+            .get(&full)
             .with_context(|| format!("{full} missing from the checkpoint"))?;
-        let shape = tensor.dims().to_vec();
+        let shape = view.shape().to_vec();
+
+        if view.dtype() == safetensors::Dtype::F32 {
+            // SAFETY: every bit pattern is a valid `f32`, and `align_to` only
+            // hands back the aligned middle — a mapping that starts this tensor
+            // off-alignment leaves a non-empty head and takes the branch below.
+            let (head, body, tail) = unsafe { view.data().align_to::<f32>() };
+            if head.is_empty() && tail.is_empty() {
+                return Ok((shape, Cow::Borrowed(body)));
+            }
+        }
+
+        let tensor = self.tensors.load(&full, &candle_core::Device::Cpu)?;
         let values = tensor
             .to_dtype(candle_core::DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        Ok((shape, values))
+        Ok((shape, Cow::Owned(values)))
     }
 
     fn has(&self, name: &str) -> bool {
@@ -95,7 +118,7 @@ impl Checkpoint {
     fn vector<B: Backend>(&self, name: &str, device: &B::Device) -> Result<Tensor<B, 1>> {
         let (shape, values) = self.raw(name)?;
         Ok(Tensor::from_data(
-            TensorData::new(values, [shape[0]]),
+            TensorData::new(values.into_owned(), [shape[0]]),
             device,
         ))
     }
@@ -104,7 +127,7 @@ impl Checkpoint {
         let (shape, values) = self.raw(name)?;
         anyhow::ensure!(shape.len() == 2, "{name} is not a matrix: {shape:?}");
         Ok(Tensor::from_data(
-            TensorData::new(values, [shape[0], shape[1]]),
+            TensorData::new(values.into_owned(), [shape[0], shape[1]]),
             device,
         ))
     }

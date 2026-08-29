@@ -118,6 +118,8 @@ struct Shape {
     budget: usize,
     /// Run the units across a thread pool rather than back to back.
     fan_out: bool,
+    /// Rows a forward may hold whatever the budget allows.
+    max_rows: usize,
 }
 
 /// A loaded model plus the shape its device wants its work in.
@@ -147,7 +149,9 @@ impl BurnEncoder {
         F: Fn(&[f32], &[i64], usize) -> Result<T> + Sync,
     {
         let units = crate::batch::split_units(batches, |seq| {
-            (self.shape.budget / (seq * seq).max(1)).max(1)
+            (self.shape.budget / (seq * seq).max(1))
+                .max(1)
+                .min(self.shape.max_rows)
         });
         let run = |unit: &crate::batch::Unit| -> Result<Vec<(usize, T)>> {
             let hidden = self.model.hidden(unit)?;

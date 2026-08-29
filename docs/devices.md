@@ -13,7 +13,7 @@
 | `coreml` | `--features coreml` | ~4× Metal at 512 tokens | fp16 encoder, cosine ≈ 0.99999 |
 | `vulkan --precision f16` | `--features vulkan` | ~1.9× the bf16 CPU path | f16 encoder, cosine ≈ 0.99999 |
 | `vulkan` (f32) | `--features vulkan` | slower than bf16 on CPU | f32, matches the CPU (worst `1 - cosine` 1.2e-12) |
-| `cpu-burn` | `--features cpu-burn` | 0.86× `cpu` | f32, matches it (worst `1 - cosine` 1.0e-12) |
+| `cpu-burn` | `--features cpu-burn` | 1.5× `cpu` short, 0.85× long | f32, matches it (worst `1 - cosine` 1.0e-12) |
 
 - An unsupported request is refused at startup rather than falling back
   silently. A run that quietly landed on the CPU would look like a Metal
@@ -105,27 +105,44 @@
   floor can invert a result. It goes away when one of them wins.
 - Build with `--features cpu-burn`. f32 only: `bf16` is the hand-written candle
   kernel in `src/bf16`, and `f16` is the Vulkan device's recipe.
-- Measured on an 8-core Zen 4 with `ruri-v3-130m`, 16 texts of ~450 tokens, best
-  of three interleaved runs:
+- **Which is faster depends on the length**, which is the interesting part.
+  Measured on an 8-core Zen 4 with `ruri-v3-130m`, best of three interleaved
+  runs, wall clock:
 
-| | wall | encode | rows/s |
+| texts | `cpu` | `cpu-burn` | |
 | --- | ---: | ---: | ---: |
-| `cpu` | 2.94 s | 2.40 s | 6.7 |
-| `cpu-burn` | 3.76 s | 2.76 s | 5.8 |
+| 64 × 42 tokens | 2.18 s | **1.47 s** | 1.48× |
+| 64 × 122 tokens | 4.35 s | **3.06 s** | 1.42× |
+| 16 × 460 tokens | **2.93 s** | 3.55 s | 0.83× |
+| 64 × 460 tokens | **11.00 s** | 12.67 s | 0.87× |
+| 8 × 2048 tokens | **7.48 s** | 8.79 s | 0.85× |
 
-- Worst `1 - cosine` against `--device cpu` over 64 texts is 1.0e-12, which is
-  float addition order and nothing else: both engines run f32.
-- Loading costs about 0.46 s more (1.00 s against 0.54 s). candle memory-maps
-  and builds its tensors lazily; this reads each weight through, transposes it
-  so the GEMM's right-hand side is contiguous, and hands it to Burn.
-- Three things got it from 0.13× to 0.86×, in order of size: running one row per
-  forward across the pool rather than one wide forward (Burn parallelises inside
-  an operation, and that does not substitute for it), two contiguous `Wi`
-  matmuls instead of one wide one and a strided split, and a fused RoPE, which
-  `burn_nn` composes from a matmul against a sign matrix. The vectorised GeGLU
-  this crate already owned is worth a further 2.6%.
-- What is left is spread thin: after those, no single operation accounts for the
-  remaining 14%.
+- Worst `1 - cosine` against `--device cpu` is 1.0e-12 at any of those lengths,
+  which is float addition order and nothing else: both engines run f32.
+- Loading costs about 0.29 s more (0.82 s against 0.53 s). candle memory-maps
+  and builds its tensors lazily; this borrows f32 out of the same mapping and
+  transposes it once so the GEMM's right-hand side is contiguous.
+- What got it there, in order of what each was worth:
+  - **Fanning out** one forward at a time across the pool rather than one wide
+    forward: 0.9 rows/s to 5.7. Burn parallelises inside an operation, and that
+    does not substitute for running independent forwards at once.
+  - **A row cap** of 4 on top of the budget, which is what keeps short inputs
+    fanned out at all — uncapped, a whole batch of 42-token texts lands in one
+    forward and the pool sits idle. Worth 2.89 s to 1.48 s on its own, and it is
+    the reason the short rows above come out ahead.
+  - **Two contiguous `Wi` matmuls** rather than one wide one and a strided
+    split, +9% — the same choice `crate::encoder` records for the candle CPU
+    path, and the opposite of what Vulkan wants.
+  - **A fused RoPE**, +10%. `burn_nn` composes it from a matmul against a sign
+    matrix; candle-nn has a kernel. It is the only operation where Burn composes
+    what candle fuses.
+  - **Banding the sliding-window layers**, which is 1.9× at 2048 tokens (8.57 s
+    against 16.26 s) and nothing at all below ~514, where
+    `crate::attention::banding_pays` correctly declines to try.
+  - The vectorised GeGLU this crate already owned, worth a further 2.6%.
+- What is left is at the long end and spread thin. The GEMM is not it: at the
+  shape a fanned-out forward actually runs, burn-flex measured 138 GFLOP/s
+  against candle's 133 single-threaded, and 627 against 325 across all cores.
 
 ## `--device coreml` on the Apple Neural Engine
 

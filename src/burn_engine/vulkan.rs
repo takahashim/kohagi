@@ -134,6 +134,7 @@ pub fn load(
             // One GPU: fanning out would only make threads contend over command
             // submission and multiply scratch memory.
             fan_out: false,
+            max_rows: usize::MAX,
         },
     })
 }

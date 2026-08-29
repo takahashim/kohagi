@@ -38,8 +38,23 @@ type Cpu = burn::backend::Flex;
 /// Same reasoning — a forward holds `rows * heads * seq^2` scores, and narrow
 /// units load-balance across the pool better than wide ones — but measured
 /// again here, because the two engines do not agree on where the optimum is:
-/// one row per unit reached 5.7 rows/s against 4.8 at two and 3.0 at four.
+/// at 64 rows of ~460 tokens, one row per unit measured 12.5 s against 13.8 at
+/// two, 13.4 at four and 16.4 at eight — and 59 s not fanned out at all.
 const CPU_ATTN_BUDGET: usize = 512 * 512;
+
+/// Rows a forward may hold whatever the budget allows.
+///
+/// The budget only bites on long inputs; on short ones it would let a whole
+/// batch into one forward, and then nothing is fanned out and the pool sits
+/// idle. This is what keeps the units coming. Measured on 64 texts of 42
+/// tokens: 2.89 s uncapped, 1.92 at one row, 1.88 at two, **1.48 at four**,
+/// 1.50 at eight — against 2.15 s for `--device cpu`.
+///
+/// `Weights::max_rows_per_forward` reaches the same 4 for the bf16 path, from
+/// its own measurements against its own kernels. Two engines agreeing on a
+/// constant neither derived from the other is worth noting, and worth not
+/// reading too much into.
+const MAX_ROWS_PER_FORWARD: usize = 4;
 
 impl FusedOps for Cpu {
     /// Splitting `Wi` is worth +9% here: the wide form leaves gate and up as
@@ -140,6 +155,7 @@ pub fn load(weights: &std::path::Path, config: &Config) -> Result<BurnEncoder> {
         shape: Shape {
             budget: CPU_ATTN_BUDGET,
             fan_out: true,
+            max_rows: MAX_ROWS_PER_FORWARD,
         },
     })
 }

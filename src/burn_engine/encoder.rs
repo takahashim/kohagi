@@ -50,6 +50,21 @@ use crate::encoder::Config;
 /// arithmetic stays finite while it gets there.
 const BLOCKED: f32 = -1.0e4;
 
+/// Queries per block when a sliding-window layer walks its band.
+///
+/// A block reads `BAND_BLOCK + 2·(window/2)` keys to serve `BAND_BLOCK`
+/// queries, so narrow blocks read fewer keys per query and pay more per-call
+/// overhead. Burn's operations are coarser than the candle path's hand-written
+/// kernels, so this was measured again rather than assumed — and landed on the
+/// same 32. At 2048 tokens, 8 rows: 8.57 s at 32, 8.66 at 64, 8.96 at 128, and
+/// 16.26 s with no banding at all.
+///
+/// `crate::attention::banding_pays` decides whether any of this applies, and
+/// below about 514 tokens it does not — the window already spans too much of
+/// the row for narrowing to pay. The default `--max-seq-length 512` therefore
+/// never reaches this constant.
+const BAND_BLOCK: usize = 32;
+
 /// How `Wi` is stored, which differs by device — see [`FusedOps::SPLIT_WI`].
 ///
 /// The same choice `crate::encoder` makes for the candle backends, made for the
@@ -320,6 +335,56 @@ impl<B: FusedOps> ModernBert<B> {
         let k = rope(part(1), cos, sin);
         let v = part(2);
 
+        // A sliding-window layer scores far less than the whole matrix: the keys
+        // outside the window are masked shut and contribute an exact zero. The
+        // geometry is `crate::attention`'s, the same one the candle path walks,
+        // so the two engines cannot disagree about which keys a block reads.
+        let window = (!layer.global).then_some(cfg.local_attention);
+        let plan = crate::attention::plan(seq, window, seq, BAND_BLOCK);
+        let context = if plan.blocks.len() == 1 {
+            self.attend(q, k, v, padding, &tables.window, layer.global, head_dim)
+        } else {
+            let parts: Vec<Tensor<B, 4>> = plan
+                .blocks
+                .iter()
+                .map(|b| {
+                    self.attend(
+                        q.clone().narrow(2, b.q0, b.queries),
+                        k.clone().narrow(2, b.k0, b.keys),
+                        v.clone().narrow(2, b.k0, b.keys),
+                        &padding.clone().narrow(3, b.k0, b.keys),
+                        &tables
+                            .window
+                            .clone()
+                            .narrow(2, b.q0, b.queries)
+                            .narrow(3, b.k0, b.keys),
+                        false,
+                        head_dim,
+                    )
+                })
+                .collect();
+            Tensor::cat(parts, 2)
+        };
+        let context = context.swap_dims(1, 2).reshape([rows, seq, hidden]);
+        linear(context, layer.wo.clone())
+    }
+
+    /// One block of queries against the keys it may reach.
+    ///
+    /// `global` says the window mask does not apply — a banded block has already
+    /// had it sliced into `win`, so it passes `false` and gets the same masking
+    /// either way.
+    #[allow(clippy::too_many_arguments)]
+    fn attend(
+        &self,
+        q: Tensor<B, 4>,
+        k: Tensor<B, 4>,
+        v: Tensor<B, 4>,
+        padding: &Tensor<B, 4>,
+        win: &Tensor<B, 4>,
+        global: bool,
+        head_dim: usize,
+    ) -> Tensor<B, 4> {
         let scores = q.matmul(k.swap_dims(2, 3));
         let dtype = scores.dtype();
         let scale = 1.0 / (head_dim as f64).sqrt();
@@ -329,20 +394,18 @@ impl<B: FusedOps> ModernBert<B> {
             (
                 scores.cast(FloatDType::F32) * scale,
                 padding.clone().cast(FloatDType::F32),
-                tables.window.clone().cast(FloatDType::F32),
+                win.clone().cast(FloatDType::F32),
             )
         } else {
-            (scores * scale, padding.clone(), tables.window.clone())
+            (scores * scale, padding.clone(), win.clone())
         };
         let mut scores = scores + pad;
-        if !layer.global {
+        if !global {
             scores = scores + win;
         }
         let probs = activation::softmax(scores, 3);
         let probs = if self.half { probs.cast(dtype) } else { probs };
-
-        let context = probs.matmul(v).swap_dims(1, 2).reshape([rows, seq, hidden]);
-        linear(context, layer.wo.clone())
+        probs.matmul(v)
     }
 
     /// Operations 17-23: the gated feed-forward. `Wi` concatenates gate and up
