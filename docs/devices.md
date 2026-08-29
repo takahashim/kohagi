@@ -111,11 +111,11 @@
 
 | texts | `cpu` | `cpu-burn` | |
 | --- | ---: | ---: | ---: |
-| 64 × 42 tokens | 2.18 s | **1.47 s** | 1.48× |
-| 64 × 122 tokens | 4.35 s | **3.06 s** | 1.42× |
-| 16 × 460 tokens | **2.93 s** | 3.55 s | 0.83× |
-| 64 × 460 tokens | **11.00 s** | 12.67 s | 0.87× |
-| 8 × 2048 tokens | **7.48 s** | 8.79 s | 0.85× |
+| 64 × 42 tokens | 2.17 s | **1.43 s** | 1.52× |
+| 64 × 122 tokens | 4.12 s | **2.84 s** | 1.45× |
+| 16 × 460 tokens | **3.04 s** | 3.34 s | 0.91× |
+| 64 × 460 tokens | **10.98 s** | 11.70 s | 0.94× |
+| 8 × 2048 tokens | **7.57 s** | 8.01 s | 0.95× |
 
 - Worst `1 - cosine` against `--device cpu` is 1.0e-12 at any of those lengths,
   which is float addition order and nothing else: both engines run f32.
@@ -139,10 +139,15 @@
   - **Banding the sliding-window layers**, which is 1.9× at 2048 tokens (8.57 s
     against 16.26 s) and nothing at all below ~514, where
     `crate::attention::banding_pays` correctly declines to try.
+  - **`gemm`'s AVX-512 kernels**, which burn-flex offers as `x86-v4` and candle
+    does not enable for its own copy of the same crate. Dispatched at run time,
+    so a CPU without the instructions takes the path it always took; worth 3% on
+    short texts and 9% at 460 tokens for 330 KB of binary.
   - The vectorised GeGLU this crate already owned, worth a further 2.6%.
-- What is left is at the long end and spread thin. The GEMM is not it: at the
-  shape a fanned-out forward actually runs, burn-flex measured 138 GFLOP/s
-  against candle's 133 single-threaded, and 627 against 325 across all cores.
+- What is left is at the long end, and it is 5–9% spread thin. The GEMM is not
+  it: at the shape a fanned-out forward actually runs, burn-flex measured
+  138 GFLOP/s against candle's 133 single-threaded, and 627 against 325 across
+  all cores.
 
 ## `--device coreml` on the Apple Neural Engine
 

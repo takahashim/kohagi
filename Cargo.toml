@@ -143,7 +143,13 @@ vulkan = [
 # The CPU through Burn's own backend rather than candle: `--device cpu-burn`.
 # Transitional — it exists so the two CPU engines can be compared in one binary,
 # and goes away when one of them wins.
-cpu-burn = ["burn-engine", "burn/flex", "burn/simd"]
+#
+# `x86-v4` builds the `gemm` crate's AVX-512 kernels alongside its AVX2 ones and
+# is dispatched at run time, so a CPU without the instructions takes the path it
+# always took. Measured worth 3% on short texts and 9% at 460 tokens, for 330 KB
+# of binary. candle does not enable it for its own copy of `gemm`, which is why
+# the two engines can differ here at all.
+cpu-burn = ["burn-engine", "burn/flex", "burn/simd", "burn/x86-v4"]
 
 # Apple Neural Engine via CoreML: `cargo build --release --features coreml`,
 # then `kohagi --device coreml`. macOS-only. Runs fixed-shape ModernBERT models
