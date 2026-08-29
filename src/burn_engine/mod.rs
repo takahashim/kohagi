@@ -10,16 +10,20 @@
 //! hidden states.
 //!
 //! [`encoder`] and [`weights`] are generic over [`FusedOps`] and name no device.
-//! A device module — [`vulkan`], [`flex`] — supplies the element type, the
+//! A device module — [`vulkan`], [`metal`], [`flex`] — supplies the element type, the
 //! memory budget, whether to fan out across cores, and any kernel it wants
 //! instead of the generic one.
 
 mod encoder;
 #[cfg(feature = "cpu-burn")]
 pub mod flex;
+#[cfg(feature = "metal-burn")]
+pub mod metal;
 #[cfg(feature = "vulkan")]
 pub mod vulkan;
 mod weights;
+#[cfg(any(feature = "vulkan", feature = "metal-burn"))]
+mod wgpu;
 
 use anyhow::Result;
 use burn::tensor::{backend::Backend, Tensor};
@@ -29,6 +33,8 @@ use crate::encoder::Activation;
 
 #[cfg(feature = "cpu-burn")]
 pub use flex::load as load_flex;
+#[cfg(feature = "metal-burn")]
+pub use metal::load as load_metal;
 #[cfg(feature = "vulkan")]
 pub use vulkan::load as load_vulkan;
 

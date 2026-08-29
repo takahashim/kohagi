@@ -74,7 +74,7 @@ fn rows_per_forward(seq: usize, backend: Backend) -> usize {
         // Burn has its own budget beside its own forward; see
         // `crate::burn_engine::vulkan::VULKAN_ATTN_BUDGET`, which is smaller
         // because throughput there is flat in the row count.
-        Backend::Vulkan | Backend::CpuBurn => {
+        Backend::Vulkan | Backend::MetalBurn | Backend::CpuBurn => {
             unreachable!("the Burn engine does not use the candle budget")
         }
     };
@@ -122,7 +122,7 @@ pub(crate) fn run_batches<T: Send>(
         Backend::Metal | Backend::Cuda => units.iter().map(run).collect(),
         // The CoreML backend runs its own fixed-shape path and never arrives here.
         Backend::CoreML => unreachable!("CoreML does not use the candle batch runner"),
-        Backend::Vulkan | Backend::CpuBurn => {
+        Backend::Vulkan | Backend::MetalBurn | Backend::CpuBurn => {
             unreachable!("the Burn engine does not use the candle batch runner")
         }
     };
@@ -194,6 +194,13 @@ pub enum Backend {
     /// ROCm nor a Vulkan device. Pair it with [`Precision::F16`]: f32 here is
     /// slower than the CPU's bf16 path and is kept for verifying the other.
     Vulkan,
+    /// The Apple GPU through Burn/CubeCL instead of candle's Metal backend.
+    /// Requires the `metal-burn` cargo feature. Pair it with
+    /// [`Precision::F16`], as with [`Backend::Vulkan`].
+    ///
+    /// Transitional, like [`Backend::CpuBurn`]: the two Metal paths compared
+    /// in one binary.
+    MetalBurn,
     /// The CPU, through Burn's own backend instead of candle. Requires the
     /// `cpu-burn` cargo feature.
     ///
@@ -212,6 +219,7 @@ impl Backend {
             Self::Cuda => "cuda",
             Self::CoreML => "coreml",
             Self::Vulkan => "vulkan",
+            Self::MetalBurn => "metal-burn",
             Self::CpuBurn => "cpu-burn",
         }
     }
@@ -238,18 +246,22 @@ pub(crate) fn check_precision(backend: Backend, precision: Precision) -> Result<
     anyhow::ensure!(
         !matches!(
             backend,
-            Backend::Metal | Backend::Cuda | Backend::Vulkan | Backend::CpuBurn
+            Backend::Metal
+                | Backend::Cuda
+                | Backend::Vulkan
+                | Backend::MetalBurn
+                | Backend::CpuBurn
         ) || precision != Precision::Bf16,
         "bf16 is the hand-written candle kernel and no other engine has it; pick f32"
     );
-    // f16 is not a general "GPU precision": it is the Vulkan backend's own
-    // recipe, and the CPU/Metal/CUDA paths have no implementation of it. On
-    // Vulkan through CubeCL, bf16 is emulated rather than native — it measured
-    // 12x slower than f16 and produced NaN — so this is the only half precision
+    // f16 is not a general "GPU precision": it is the Burn GPU devices' own
+    // recipe, and the CPU/Metal/CUDA candle paths have no implementation of
+    // it. On CubeCL, bf16 is emulated rather than native — it measured 12x
+    // slower than f16 and produced NaN — so this is the only half precision
     // offered there.
     anyhow::ensure!(
-        backend == Backend::Vulkan || precision != Precision::F16,
-        "f16 is the Vulkan backend's precision; on {} pick f32{}",
+        matches!(backend, Backend::Vulkan | Backend::MetalBurn) || precision != Precision::F16,
+        "f16 is the Burn GPU devices' precision (vulkan, metal-burn); on {} pick f32{}",
         backend.name(),
         if backend == Backend::Cpu {
             " or bf16"
@@ -428,7 +440,10 @@ impl Embedder {
         if opts.backend == Backend::CoreML {
             return Self::load_coreml(source, opts);
         }
-        if matches!(opts.backend, Backend::Vulkan | Backend::CpuBurn) {
+        if matches!(
+            opts.backend,
+            Backend::Vulkan | Backend::MetalBurn | Backend::CpuBurn
+        ) {
             return Self::load_burn(source, opts);
         }
         // The candle path serves the Hub/Files sources; a CoreMl directory has
@@ -451,10 +466,13 @@ impl Embedder {
     #[cfg(feature = "burn-engine")]
     fn load_burn(source: &ModelSource, opts: Options) -> Result<Self> {
         let prepared = Prepared::resolve(source, opts)?;
-        if opts.backend == Backend::Vulkan && opts.precision == Precision::F32 {
+        if matches!(opts.backend, Backend::Vulkan | Backend::MetalBurn)
+            && opts.precision == Precision::F32
+        {
             remark!(
-                "--device vulkan --precision f32 is the exact path and is slower than \
-                 --device cpu --precision bf16; pass --precision f16 for the fast one"
+                "--device {} --precision f32 is the exact path and is slower than \
+                 --precision f16; pass --precision f16 for the fast one",
+                opts.backend.name()
             );
         }
         prepared.into_embedder(opts, |files, config| {
@@ -463,20 +481,21 @@ impl Embedder {
                 Backend::Vulkan => {
                     crate::burn_engine::load_vulkan(&files.weights, config, opts.precision)?
                 }
+                #[cfg(feature = "metal-burn")]
+                Backend::MetalBurn => {
+                    crate::burn_engine::load_metal(&files.weights, config, opts.precision)?
+                }
                 #[cfg(feature = "cpu-burn")]
                 Backend::CpuBurn => crate::burn_engine::load_flex(&files.weights, config)?,
                 other => {
+                    // The feature is named after the device, for every Burn device.
                     return Err(UnsupportedRequest::new(format!(
                         "this binary was built without --device {}; rebuild with \
                          `cargo build --release --features {}`",
                         other.name(),
-                        if other == Backend::Vulkan {
-                            "vulkan"
-                        } else {
-                            "cpu-burn"
-                        }
+                        other.name()
                     ))
-                    .into())
+                    .into());
                 }
             };
             Ok(Engine::Burn(Box::new(encoder)))
@@ -862,7 +881,7 @@ pub(crate) fn open_device(backend: Backend) -> Result<Device> {
         // CoreML and Vulkan are routed to their own loaders before open_device
         // is reached: neither runs on candle, so neither has a Device to open.
         Backend::CoreML => unreachable!("CoreML backend does not use a candle Device"),
-        Backend::Vulkan | Backend::CpuBurn => {
+        Backend::Vulkan | Backend::MetalBurn | Backend::CpuBurn => {
             unreachable!("the Burn engine does not use a candle Device")
         }
     }

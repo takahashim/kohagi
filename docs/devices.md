@@ -14,6 +14,7 @@
 | `vulkan --precision f16` | `--features vulkan` | ~1.9× the bf16 CPU path | f16 encoder, cosine ≈ 0.99999 |
 | `vulkan` (f32) | `--features vulkan` | slower than bf16 on CPU | f32, matches the CPU (worst `1 - cosine` 1.2e-12) |
 | `cpu-burn` | `--features cpu-burn` | 1.5× `cpu` short and 0.85× long on x86_64; 1.1× short and 0.9× long on aarch64 | f32, matches it (worst `1 - cosine` 1.0e-12) |
+| `metal-burn --precision f16` | `--features metal-burn` | level with `metal` in steady state; 0.5–0.8 s more per process | f16 encoder, cosine ≈ 0.9999997 |
 
 - An unsupported request is refused at startup rather than falling back
   silently. A run that quietly landed on the CPU would look like a Metal
@@ -227,6 +228,41 @@ and measured within noise.
 So on aarch64 `--device cpu-burn` is ahead of `--device cpu` at the default
 `--max-seq-length` and 4% to 13% behind on long inputs; on x86_64 it is ahead
 at every length below 8192.
+
+## `--device metal-burn`: the Apple GPU, on Burn instead of candle
+
+- **Transitional**, like `cpu-burn`: the two Metal paths compared in one
+  binary. Build with `--features metal-burn` (and `metal` beside it to compare)
+  and pair with `--precision f16`; `f32` is the exact path and 10–20% slower.
+- The same engine as `vulkan` on the other GPU API — CubeCL emits Metal Shading
+  Language for it directly — so the same precision recipe: f16 storage and
+  matmuls, f32 reductions. Worst `1 - cosine` against `--device cpu` is 2.6e-7
+  for f16 over 256 mixed-length texts and 2.3e-13 for f32.
+- Measured on an M1 Pro, best of interleaved runs, wall clock:
+
+| texts | `cpu` | `metal` (candle) | `metal-burn f16` | in-process, steady |
+| --- | ---: | ---: | ---: | ---: |
+| 64 × 42 tokens | 0.81 s | **0.51 s** | 1.3 s | 0.124 s vs 0.135 |
+| 64 × 460 tokens | 2.71 s | **2.04 s** | 2.72 s | 1.57 s vs 1.67 |
+| 256 × 460 tokens | 9.32 s | 7.07 s | **7.30 s** | — |
+| 256 × mixed lengths | 6.0 s | **4.4 s** | 5.0 s | 4.23 s vs 4.30 |
+| 8 × 2048 tokens | 2.14 s | **1.72 s** | 3.13 s | — |
+
+- The last column is the library called twice in one process on the same
+  texts, and it is the finding: **in steady state the Burn path is level with
+  candle's or slightly ahead**, without the hand-fused GeGLU kernel candle's
+  Metal path carries. Everything the CLI loses is per-process: about 0.45 s
+  more to load, and about half a second per distinct padded length while
+  CubeCL generates and compiles that shape's kernels. Apple caches compiled
+  Metal per executable, so a freshly built binary's first run is seconds
+  slower again, for candle too (4.5 s to load, 7.7 s for its first forward).
+- The first time a shape is ever seen it is also autotuned — 17 s for the 256
+  mixed-length texts — and the result is cached under the user's cache
+  directory (`~/Library/Caches/kohagi` on macOS), so that is paid once per
+  machine, not per run.
+- `burn/fusion` is off here, unlike on Vulkan: measured, it changed nothing in
+  steady state and added per-shape compile time.
+- One precision per process, as on Vulkan; see `src/burn_engine/wgpu.rs`.
 
 ## `--device coreml` on the Apple Neural Engine
 

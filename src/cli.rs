@@ -41,7 +41,8 @@ pub enum PrecisionArg {
     F32,
     /// ~2x faster on x86_64 CPUs with AVX512-BF16; not bit-identical to f32.
     Bf16,
-    /// `--device vulkan` only: ~2x the bf16 CPU path; not bit-identical to f32.
+    /// `--device vulkan` and `metal-burn` only: ~2x the bf16 CPU path on
+    /// Vulkan; not bit-identical to f32.
     F16,
 }
 
@@ -60,6 +61,10 @@ pub enum BackendArg {
     /// and a Vulkan driver — no ROCm or CUDA install. Pair with
     /// `--precision f16`.
     Vulkan,
+    /// Apple GPU through Burn instead of candle. Needs `--features metal-burn`.
+    /// Pair with `--precision f16`. Transitional, for comparing the two Metal
+    /// paths.
+    MetalBurn,
     /// The CPU through Burn instead of candle. Needs `--features cpu-burn`.
     /// Transitional, for comparing the two CPU engines.
     CpuBurn,
@@ -108,6 +113,7 @@ impl From<BackendArg> for Backend {
             BackendArg::Cuda => Backend::Cuda,
             BackendArg::Coreml => Backend::CoreML,
             BackendArg::Vulkan => Backend::Vulkan,
+            BackendArg::MetalBurn => Backend::MetalBurn,
             BackendArg::CpuBurn => Backend::CpuBurn,
         }
     }

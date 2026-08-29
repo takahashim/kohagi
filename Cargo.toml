@@ -147,6 +147,21 @@ vulkan = [
     "burn/vulkan", "burn/autotune", "burn/fusion", "burn/cubecl",
 ]
 
+# Apple GPU through Burn/CubeCL rather than candle's Metal backend: `--device
+# metal-burn --precision f16`. CubeCL emits Metal Shading Language directly
+# (`burn/metal` is the wgpu runtime with the MSL compiler), so this is the same
+# engine as `vulkan` on the other GPU API. Transitional like `cpu-burn`: it is
+# here so the two Metal paths can be compared in one binary.
+#
+# No `burn/fusion`, unlike `vulkan`: measured on an M1 Pro it changed nothing
+# in steady state (64 x 460 tokens: 1.565 s against 1.567) and cost more per
+# process, since a fused kernel is generated and compiled per new shape — 256
+# mixed-length texts through the CLI took 5.3 s with it and 5.0 without.
+metal-burn = [
+    "burn-engine", "dep:dirs",
+    "burn/metal", "burn/autotune", "burn/cubecl",
+]
+
 # The CPU through Burn's own backend rather than candle: `--device cpu-burn`.
 # Transitional — it exists so the two CPU engines can be compared in one binary,
 # and goes away when one of them wins.
