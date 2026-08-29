@@ -45,24 +45,49 @@ pub fn geglu(wide: &[f32], rows: usize, inter: usize) -> Vec<f32> {
     let simd = Avx512::detect();
     for r in 0..rows {
         let base = r * 2 * inter;
-        let gate = &wide[base..base + inter];
-        let up = &wide[base + inter..base + 2 * inter];
-        let dst = &mut out[r * inter..(r + 1) * inter];
-
-        #[cfg(target_arch = "x86_64")]
-        if simd.is_some() {
-            // SAFETY: the `Avx512` token exists only where detection found the
-            // instructions; all three slices are `inter` long, which is what the
-            // kernel reads and writes.
-            unsafe { row_avx512(gate.as_ptr(), up.as_ptr(), dst.as_mut_ptr(), inter) };
-            continue;
-        }
-        let _ = simd;
-        for ((d, g), u) in dst.iter_mut().zip(gate).zip(up) {
-            *d = gelu_scalar(*g) * *u;
-        }
+        row(
+            &wide[base..base + inter],
+            &wide[base + inter..base + 2 * inter],
+            &mut out[r * inter..(r + 1) * inter],
+            simd,
+        );
     }
     out
+}
+
+/// The same reduction from two `[rows, inter]` buffers rather than one
+/// interleaved `[rows, 2·inter]`.
+///
+/// Which shape the halves arrive in is the caller's `Wi` layout, and both exist:
+/// one wide projection leaves them interleaved, two projections leave them
+/// apart. The row kernel never cared — it has taken two pointers all along — so
+/// this spares the caller a copy to fabricate a layout it does not have.
+pub fn geglu_split(gate: &[f32], up: &[f32], rows: usize, inter: usize) -> Vec<f32> {
+    debug_assert_eq!(gate.len(), rows * inter);
+    debug_assert_eq!(up.len(), gate.len());
+    let mut out = vec![0.0f32; rows * inter];
+    let simd = Avx512::detect();
+    for r in 0..rows {
+        let span = r * inter..(r + 1) * inter;
+        row(&gate[span.clone()], &up[span.clone()], &mut out[span], simd);
+    }
+    out
+}
+
+/// One row, vectorised where the instructions exist.
+fn row(gate: &[f32], up: &[f32], dst: &mut [f32], simd: Option<Avx512>) {
+    #[cfg(target_arch = "x86_64")]
+    if simd.is_some() {
+        // SAFETY: the `Avx512` token exists only where detection found the
+        // instructions; all three slices are the same length, which is what the
+        // kernel reads and writes.
+        unsafe { row_avx512(gate.as_ptr(), up.as_ptr(), dst.as_mut_ptr(), dst.len()) };
+        return;
+    }
+    let _ = simd;
+    for ((d, g), u) in dst.iter_mut().zip(gate).zip(up) {
+        *d = gelu_scalar(*g) * *u;
+    }
 }
 
 /// Reference implementation, and what runs without AVX-512. Uses the same
