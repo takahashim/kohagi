@@ -113,9 +113,8 @@
 | --- | ---: | ---: | ---: |
 | 64 × 42 tokens | 2.17 s | **1.43 s** | 1.52× |
 | 64 × 122 tokens | 4.12 s | **2.84 s** | 1.45× |
-| 16 × 460 tokens | **3.04 s** | 3.34 s | 0.91× |
-| 64 × 460 tokens | **10.98 s** | 11.70 s | 0.94× |
-| 8 × 2048 tokens | **7.57 s** | 8.01 s | 0.95× |
+| 64 × 460 tokens | 10.97 s | 11.39 s | 0.96× |
+| 8 × 2048 tokens | **7.53 s** | 7.88 s | 0.96× |
 
 - Worst `1 - cosine` against `--device cpu` is 1.0e-12 at any of those lengths,
   which is float addition order and nothing else: both engines run f32.
@@ -143,9 +142,15 @@
     does not enable for its own copy of the same crate. Dispatched at run time,
     so a CPU without the instructions takes the path it always took; worth 3% on
     short texts and 9% at 460 tokens for 330 KB of binary.
+  - **One mask instead of two, and the scale on the queries.** A sliding-window
+    layer was adding padding and window separately, two broadcast adds over
+    `[rows, heads, seq, seq]` in each of twelve layers; combining them once per
+    forward leaves one. Scaling `q` rather than the scores touches a seventh of
+    the elements at 460 tokens. Together they were the last 6% at 460 tokens.
   - The vectorised GeGLU this crate already owned, worth a further 2.6%.
-- What is left is at the long end, and it is 5–9% spread thin. The GEMM is not
-  it: at the shape a fanned-out forward actually runs, burn-flex measured
+- What is left is about 4% at 2048 tokens, and it is spread thin: the band width
+  no longer matters (7.82 s at 32 against 7.80 at 64), and the GEMM is not it —
+  at the shape a fanned-out forward actually runs, burn-flex measured
   138 GFLOP/s against candle's 133 single-threaded, and 627 against 325 across
   all cores.
 

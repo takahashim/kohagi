@@ -56,8 +56,9 @@ const BLOCKED: f32 = -1.0e4;
 /// queries, so narrow blocks read fewer keys per query and pay more per-call
 /// overhead. Burn's operations are coarser than the candle path's hand-written
 /// kernels, so this was measured again rather than assumed — and landed on the
-/// same 32. At 2048 tokens, 8 rows: 8.57 s at 32, 8.66 at 64, 8.96 at 128, and
-/// 16.26 s with no banding at all.
+/// same 32. At 2048 tokens, 8 rows: 7.82 s at 32, 7.80 at 64, 8.06 at 128, and
+/// 16.26 s with no banding at all. The first two are a tie within the spread,
+/// which is why this takes the one the candle path already uses.
 ///
 /// `crate::attention::banding_pays` decides whether any of this applies, and
 /// below about 514 tokens it does not — the window already spans too much of
@@ -312,7 +313,8 @@ impl<B: FusedOps> ModernBert<B> {
         layer: &LayerWeights<B>,
         normed: Tensor<B, 3>,
         tables: &Tables<B>,
-        padding: &Tensor<B, 4>,
+        global_mask: &Tensor<B, 4>,
+        local_mask: &Tensor<B, 4>,
     ) -> Tensor<B, 3> {
         let cfg = &self.config;
         let hidden = cfg.hidden_size;
@@ -331,7 +333,8 @@ impl<B: FusedOps> ModernBert<B> {
                 .swap_dims(1, 2)
         };
         let (cos, sin) = tables.rope(layer.global);
-        let q = rope(part(0), cos.clone(), sin.clone());
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let q = rope(part(0), cos.clone(), sin.clone()) * scale;
         let k = rope(part(1), cos, sin);
         let v = part(2);
 
@@ -340,9 +343,14 @@ impl<B: FusedOps> ModernBert<B> {
         // geometry is `crate::attention`'s, the same one the candle path walks,
         // so the two engines cannot disagree about which keys a block reads.
         let window = (!layer.global).then_some(cfg.local_attention);
+        let mask = if layer.global {
+            global_mask
+        } else {
+            local_mask
+        };
         let plan = crate::attention::plan(seq, window, seq, BAND_BLOCK);
         let context = if plan.blocks.len() == 1 {
-            self.attend(q, k, v, padding, &tables.window, layer.global, head_dim)
+            self.attend(q, k, v, mask)
         } else {
             let parts: Vec<Tensor<B, 4>> = plan
                 .blocks
@@ -352,14 +360,12 @@ impl<B: FusedOps> ModernBert<B> {
                         q.clone().narrow(2, b.q0, b.queries),
                         k.clone().narrow(2, b.k0, b.keys),
                         v.clone().narrow(2, b.k0, b.keys),
-                        &padding.clone().narrow(3, b.k0, b.keys),
-                        &tables
-                            .window
+                        // Only a sliding-window layer bands, and its mask is
+                        // `[rows, 1, seq, seq]`, so both axes narrow.
+                        &mask
                             .clone()
                             .narrow(2, b.q0, b.queries)
                             .narrow(3, b.k0, b.keys),
-                        false,
-                        head_dim,
                     )
                 })
                 .collect();
@@ -371,38 +377,31 @@ impl<B: FusedOps> ModernBert<B> {
 
     /// One block of queries against the keys it may reach.
     ///
-    /// `global` says the window mask does not apply — a banded block has already
-    /// had it sliced into `win`, so it passes `false` and gets the same masking
-    /// either way.
-    #[allow(clippy::too_many_arguments)]
+    /// `mask` is additive and already carries everything that masks this block:
+    /// padding, and the window where there is one. Combining them costs one pass
+    /// over `[rows, 1, seq, seq]` per forward instead of a second broadcast add
+    /// over `[rows, heads, seq, seq]` in each of the twelve sliding-window
+    /// layers.
     fn attend(
         &self,
         q: Tensor<B, 4>,
         k: Tensor<B, 4>,
         v: Tensor<B, 4>,
-        padding: &Tensor<B, 4>,
-        win: &Tensor<B, 4>,
-        global: bool,
-        head_dim: usize,
+        mask: &Tensor<B, 4>,
     ) -> Tensor<B, 4> {
+        // Scaling the queries rather than the scores: `q` is
+        // `[rows, heads, seq, head_dim]` and the scores are
+        // `[rows, heads, seq, seq]`, so at 460 tokens this is one pass over a
+        // seventh of the elements.
         let scores = q.matmul(k.swap_dims(2, 3));
         let dtype = scores.dtype();
-        let scale = 1.0 / (head_dim as f64).sqrt();
         // Under `half` the softmax and the mask it consumes run in f32; see the
         // module's precision note for why this reduction in particular.
-        let (scores, pad, win) = if self.half {
-            (
-                scores.cast(FloatDType::F32) * scale,
-                padding.clone().cast(FloatDType::F32),
-                win.clone().cast(FloatDType::F32),
-            )
+        let scores = if self.half {
+            scores.cast(FloatDType::F32) + mask.clone().cast(FloatDType::F32)
         } else {
-            (scores * scale, padding.clone(), win.clone())
+            scores + mask.clone()
         };
-        let mut scores = scores + pad;
-        if !global {
-            scores = scores + win;
-        }
         let probs = activation::softmax(scores, 3);
         let probs = if self.half { probs.cast(dtype) } else { probs };
         probs.matmul(v)
@@ -436,7 +435,8 @@ impl<B: FusedOps> ModernBert<B> {
         layer: &LayerWeights<B>,
         x: Tensor<B, 3>,
         tables: &Tables<B>,
-        padding: &Tensor<B, 4>,
+        global_mask: &Tensor<B, 4>,
+        local_mask: &Tensor<B, 4>,
     ) -> Tensor<B, 3> {
         let eps = self.config.layer_norm_eps;
         let residual = x.clone();
@@ -445,7 +445,7 @@ impl<B: FusedOps> ModernBert<B> {
             Some(gamma) => layer_norm(x, gamma.clone(), eps, self.half),
             None => x,
         };
-        let attended = residual + self.attention(layer, normed, tables, padding);
+        let attended = residual + self.attention(layer, normed, tables, global_mask, local_mask);
 
         let normed = layer_norm(attended.clone(), layer.mlp_norm.clone(), eps, self.half);
         attended + self.feed_forward(layer, normed)
@@ -462,11 +462,17 @@ impl<B: FusedOps> ModernBert<B> {
         device: &B::Device,
     ) -> Tensor<B, 3> {
         let tables = self.tables(seq, device);
-        let padding = padding_mask::<B>(mask, rows, seq, device);
+        // Both masks, built once: a global layer needs only the padding, and a
+        // sliding-window one needs it plus the window. Adding them here is one
+        // pass over `[rows, 1, seq, seq]`; adding them per layer would be a
+        // second broadcast add over `[rows, heads, seq, seq]` in each of the
+        // twelve that want it.
+        let global_mask = padding_mask::<B>(mask, rows, seq, device);
+        let local_mask = global_mask.clone() + tables.window.clone();
 
         let mut x = self.embed(ids, rows, seq, device);
         for layer in &self.layers {
-            x = self.block(layer, x, &tables, &padding);
+            x = self.block(layer, x, &tables, &global_mask, &local_mask);
         }
         // Read back as f32 whatever the graph ran in: `embed_row` pools and
         // normalizes in f32, the same as every other backend.
