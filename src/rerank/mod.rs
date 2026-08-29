@@ -246,6 +246,10 @@ enum Engine {
     },
     #[cfg(feature = "coreml")]
     CoreMl(crate::coreml::CoreMlEncoder),
+    /// Boxed for the same reason the embedder's is: it carries every weight
+    /// tensor's handle inline.
+    #[cfg(feature = "burn-engine")]
+    Burn(Box<crate::burn_engine::BurnEncoder>),
 }
 
 /// A loaded cross-encoder. One instance can score any number of pairs.
@@ -269,14 +273,9 @@ impl Reranker {
         if opts.backend == Backend::CoreML {
             return Self::load_coreml(source, opts);
         }
-        // Refused rather than quietly served on the CPU. The Vulkan engine
-        // exists for the embedder only: a cross-encoder reduces its hidden
-        // states differently (`classifier_pooling`, not `1_Pooling`), so it
-        // needs its own head on that path rather than the same one.
-        anyhow::ensure!(
-            opts.backend != Backend::Vulkan,
-            "--device vulkan is not implemented for reranking yet; use --device cpu"
-        );
+        if matches!(opts.backend, Backend::Vulkan | Backend::CpuBurn) {
+            return Self::load_burn(source, opts);
+        }
         // Cross-encoders use `classifier_pooling`, not `1_Pooling`.
         let files = source.checkpoint_files()?;
 
@@ -309,6 +308,67 @@ impl Reranker {
             fingerprint: Some(fingerprint),
             declared_max_seq: files.declared_max_seq,
         })
+    }
+
+    /// A Burn device for the encoder, with the head where it always is.
+    ///
+    /// The same split the CoreML path makes, and for the same reason: the head
+    /// is four small tensors whose output is the number being thresholded, so it
+    /// stays in f32 on the CPU running the same code every other backend runs.
+    /// Only the 19 or 25 layers in front of it move.
+    #[cfg(feature = "burn-engine")]
+    fn load_burn(source: &ModelSource, opts: Options) -> Result<Self> {
+        let files = source.checkpoint_files()?;
+        let config_path = files
+            .weights
+            .parent()
+            .map(|d| d.join("config.json"))
+            .context("model path has no parent dir for config.json")?;
+        let config = resolve_config(&config_path)?;
+
+        check_max_seq(opts.max_seq_length, config.encoder.max_position_embeddings)?;
+        check_precision(opts.backend, opts.precision)?;
+
+        let fingerprint = Fingerprint::spawn(&files.weights);
+        let encoder = match opts.backend {
+            #[cfg(feature = "vulkan")]
+            Backend::Vulkan => {
+                crate::burn_engine::load_vulkan(&files.weights, &config.encoder, opts.precision)?
+            }
+            #[cfg(feature = "cpu-burn")]
+            Backend::CpuBurn => crate::burn_engine::load_flex(&files.weights, &config.encoder)?,
+            other => {
+                return Err(crate::UnsupportedRequest::new(format!(
+                    "this binary was built without --device {}",
+                    other.name()
+                ))
+                .into())
+            }
+        };
+        fingerprint.confirm(&files.weights);
+        let head = Head::load(&cpu_weights(&files.weights)?, &config.encoder, &config.head)?;
+        let tokenizer = load_tokenizer(&files.tokenizer, opts.max_seq_length)?;
+
+        Ok(Self {
+            engine: Engine::Burn(Box::new(encoder)),
+            head,
+            tokenizer,
+            opts,
+            pooling: config.pooling,
+            dim: config.encoder.hidden_size,
+            fingerprint: Some(fingerprint),
+            declared_max_seq: files.declared_max_seq,
+        })
+    }
+
+    #[cfg(not(feature = "burn-engine"))]
+    fn load_burn(_source: &ModelSource, opts: Options) -> Result<Self> {
+        Err(crate::UnsupportedRequest::new(format!(
+            "this binary was built without the Burn engine; rebuild with \
+             `cargo build --release --features {}`",
+            opts.backend.name()
+        ))
+        .into())
     }
 
     /// The Neural Engine path: a converted bundle for the encoder, and the head
@@ -420,6 +480,8 @@ impl Reranker {
             Engine::Candle { weights, device } => self.logits_candle(pairs, weights, device)?,
             #[cfg(feature = "coreml")]
             Engine::CoreMl(encoder) => self.logits_coreml(pairs, encoder)?,
+            #[cfg(feature = "burn-engine")]
+            Engine::Burn(encoder) => self.logits_burn(pairs, encoder)?,
         };
         // Convert logits after backend work so workers only compute logits.
         let scores = if self.opts.sigmoid {
@@ -447,6 +509,23 @@ impl Reranker {
             pairs.len(),
             |hidden, mask, dim| head.logit(&pool_row(hidden, mask, dim, pooling)),
         )?;
+        Ok((logits, info))
+    }
+
+    /// A Burn device: the candle path's bucketing, Burn's forward, the same
+    /// head on the same pooled row.
+    #[cfg(feature = "burn-engine")]
+    fn logits_burn(
+        &self,
+        pairs: &[(&str, &str)],
+        encoder: &crate::burn_engine::BurnEncoder,
+    ) -> Result<(Vec<f32>, Vec<TokenInfo>)> {
+        let encodings = encode_pairs(&self.tokenizer, pairs)?;
+        let (batches, info) = bucket_encodings(&encodings, self.opts.batch_size);
+        let (head, pooling) = (&self.head, self.pooling);
+        let logits = encoder.run(&batches, pairs.len(), |hidden, mask, dim| {
+            head.logit(&pool_row(hidden, mask, dim, pooling))
+        })?;
         Ok((logits, info))
     }
 
