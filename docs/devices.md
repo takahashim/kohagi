@@ -118,7 +118,7 @@
 
 - Worst `1 - cosine` against `--device cpu` is 1.0e-12 at any of those lengths,
   which is float addition order and nothing else: both engines run f32.
-- Loading costs about 0.29 s more (0.82 s against 0.53 s). candle memory-maps
+- Loading costs about 0.26 s more (0.82 s against 0.56 s). candle memory-maps
   and builds its tensors lazily; this borrows f32 out of the same mapping and
   transposes it once so the GEMM's right-hand side is contiguous.
 - What got it there, in order of what each was worth:
@@ -136,8 +136,8 @@
     matrix; candle-nn has a kernel. It is the only operation where Burn composes
     what candle fuses.
   - **Banding the sliding-window layers**, which is 1.9× at 2048 tokens (8.57 s
-    against 16.26 s) and nothing at all below ~514, where
-    `crate::attention::banding_pays` correctly declines to try.
+    against 16.26 s) and nothing below about 258, where
+    `crate::attention::banding_pays` declines to try.
   - **`gemm`'s AVX-512 kernels**, which burn-flex offers as `x86-v4` and candle
     does not enable for its own copy of the same crate. Dispatched at run time,
     so a CPU without the instructions takes the path it always took; worth 3% on
@@ -161,15 +161,15 @@
     9.56 s at 460 tokens, where banding now applies at all.
   - **One mask instead of two, and the scale on the queries.** A sliding-window
     layer was adding padding and window separately, two broadcast adds over
-    `[rows, heads, seq, seq]` in each of twelve layers; combining them once per
-    forward leaves one. Scaling `q` rather than the scores touches a seventh of
-    the elements at 460 tokens. Together they were the last 6% at 460 tokens.
+    `[rows, heads, seq, seq]` in each of twelve layers; they are summed into the
+    block's own shape first, which is one. Scaling `q` rather than the scores
+    touches a seventh of the elements at 460 tokens.
   - The vectorised GeGLU this crate already owned, worth a further 2.6%.
-- Past 2048 tokens the candle path pulls ahead again — 31.3 s against 34.3 s at
-  8192, on 2.1 GiB against 2.8 — and that is where the remaining work is. The
-  GEMM is not it: at the shape a fanned-out forward actually runs, burn-flex
-  measured 138 GFLOP/s against candle's 133 single-threaded, and 627 against 325
-  across all cores.
+- Past 2048 tokens the candle path pulls ahead again — 30.2 s against 33.5 s at
+  8192, though on less memory rather than more — and that is where the remaining
+  work is. The GEMM is not it: at the shape a fanned-out forward actually runs,
+  burn-flex measured 138 GFLOP/s against candle's 133 single-threaded, and 627
+  against 325 across all cores.
 
 ## `--device coreml` on the Apple Neural Engine
 
