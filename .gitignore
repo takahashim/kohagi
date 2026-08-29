@@ -3,6 +3,7 @@
 # The development jigs build separately (tools/ is outside the workspace)
 /tools/coreml-jigs/target
 /tools/burnprobe/target
+/tools/amxprobe/target
 
 # Python bytecode from the example scripts
 __pycache__/

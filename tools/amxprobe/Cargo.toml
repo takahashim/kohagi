@@ -1,0 +1,19 @@
+[package]
+name = "amxprobe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "amxprobe"
+path = "src/main.rs"
+
+[[bin]]
+name = "amxdiag"
+path = "src/diag.rs"
+
+[profile.release]
+opt-level = 3
+
+[[bin]]
+name = "smeprobe"
+path = "src/sme.rs"

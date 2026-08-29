@@ -14,6 +14,10 @@ of the published crate.
 - [`eval_retrieval.py`](eval_retrieval.py) measures JaCWIR and JQaRA retrieval
   quality for any Kohagi configuration, which is what the quantization numbers
   rest on.
+- [`amxprobe/`](amxprobe/) is the GEMM jig behind "can Rust reach Apple's
+  matrix unit the way Accelerate does?": an f32 GEMM on M1–M3 AMX from
+  `asm!`, bit-exact with Accelerate, and the same kernel on M4's SME,
+  assembled but not yet run. Its README carries what each measured.
 - [`coreml-jigs/`](coreml-jigs/) holds Rust jigs for the CoreML backend, which
   read a converted bundle, check Neural Engine placement, measure per-bucket
   latency, and compare two configurations. See its own README.
