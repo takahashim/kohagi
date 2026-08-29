@@ -13,9 +13,15 @@
 
 use anyhow::Result;
 
-use super::{weights, Forward};
+use super::{weights, BurnEncoder, Forward, FusedOps, Shape};
 use crate::encoder::Config;
 use crate::model::Precision;
+
+// Both precisions take the generic kernels. Fusing RoPE by hand here is the
+// wrong shape for a GPU — CubeCL already fuses across the graph — and splitting
+// `Wi` measured 7% slower than one wider matmul.
+impl FusedOps for Exact {}
+impl FusedOps for Half {}
 
 /// f32 throughout: the same vectors as the CPU path (worst `1 - cosine` 8.5e-13
 /// measured against it), and slower than the CPU's bf16 path. Kept because it is
@@ -37,10 +43,6 @@ type Half = burn::backend::Vulkan<burn::tensor::f16, i32>;
 /// 20.5 at sixty-four, because a single 473-token row already saturates the
 /// device — so a tighter bound on memory costs nothing to buy.
 const VULKAN_ATTN_BUDGET: usize = 8 * 512 * 512;
-
-fn rows_per_forward(seq: usize) -> usize {
-    (VULKAN_ATTN_BUDGET / (seq * seq).max(1)).max(1)
-}
 
 /// Where CubeCL should keep its autotune results.
 ///
@@ -101,61 +103,37 @@ fn claim_precision(want: Precision) -> Result<()> {
     Ok(())
 }
 
-pub struct VulkanEncoder {
-    model: Box<dyn Forward + Send + Sync>,
-    dim: usize,
-}
-
-impl VulkanEncoder {
-    /// Load a checkpoint onto the GPU.
-    pub fn load(weights: &std::path::Path, config: &Config, precision: Precision) -> Result<Self> {
-        configure_tune_cache();
-        let checkpoint = weights::Checkpoint::open(weights)?;
-        // Claimed here rather than on entry: `Checkpoint::open` reads the file on
-        // the CPU and can fail without the device ever being touched, and a claim
-        // made before that would refuse a later, legitimate load in the other
-        // precision. The next line is what actually binds the element type.
-        claim_precision(precision)?;
-        let model: Box<dyn Forward + Send + Sync> = match precision {
-            Precision::F16 => {
-                let device = Default::default();
-                Box::new(weights::load::<Half>(&checkpoint, config, true, &device)?)
-            }
-            _ => {
-                let device = Default::default();
-                Box::new(weights::load::<Exact>(&checkpoint, config, false, &device)?)
-            }
-        };
-        Ok(VulkanEncoder {
-            model,
-            dim: config.hidden_size,
-        })
-    }
-
-    /// Run bucketed batches and reduce each row, in the caller's original order.
-    ///
-    /// Splitting and placement are [`crate::batch`]'s, the same ones
-    /// [`crate::model::run_batches`] uses; what differs is the budget and that
-    /// the units run back to back rather than across a thread pool. There is one
-    /// GPU, so fanning out would only make threads contend over command
-    /// submission and multiply scratch memory.
-    pub fn run<T, F>(
-        &self,
-        batches: &[crate::batch::BatchInput],
-        rows_total: usize,
-        reduce: F,
-    ) -> Result<Vec<T>>
-    where
-        F: Fn(&[f32], &[i64], usize) -> Result<T>,
-    {
-        let units = crate::batch::split_units(batches, rows_per_forward);
-        let per_unit: Vec<Result<Vec<(usize, T)>>> = units
-            .iter()
-            .map(|unit| {
-                let hidden = self.model.hidden(unit)?;
-                unit.reduce_rows(&hidden, self.dim, &reduce)
-            })
-            .collect();
-        crate::batch::place_rows(per_unit, rows_total)
-    }
+/// Load a checkpoint onto a Vulkan device.
+pub fn load(
+    weights: &std::path::Path,
+    config: &Config,
+    precision: Precision,
+) -> Result<BurnEncoder> {
+    configure_tune_cache();
+    let checkpoint = weights::Checkpoint::open(weights)?;
+    // Claimed here rather than on entry: `Checkpoint::open` reads the file on
+    // the CPU and can fail without the device ever being touched, and a claim
+    // made before that would refuse a later, legitimate load in the other
+    // precision. The next line is what actually binds the element type.
+    claim_precision(precision)?;
+    let model: Box<dyn Forward + Send + Sync> = match precision {
+        Precision::F16 => {
+            let device = Default::default();
+            Box::new(weights::load::<Half>(&checkpoint, config, true, &device)?)
+        }
+        _ => {
+            let device = Default::default();
+            Box::new(weights::load::<Exact>(&checkpoint, config, false, &device)?)
+        }
+    };
+    Ok(BurnEncoder {
+        model,
+        dim: config.hidden_size,
+        shape: Shape {
+            budget: VULKAN_ATTN_BUDGET,
+            // One GPU: fanning out would only make threads contend over command
+            // submission and multiply scratch memory.
+            fan_out: false,
+        },
+    })
 }

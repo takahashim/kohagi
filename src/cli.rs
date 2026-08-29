@@ -60,6 +60,9 @@ pub enum BackendArg {
     /// and a Vulkan driver — no ROCm or CUDA install. Pair with
     /// `--precision f16`.
     Vulkan,
+    /// The CPU through Burn instead of candle. Needs `--features cpu-burn`.
+    /// Transitional, for comparing the two CPU engines.
+    CpuBurn,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -105,6 +108,7 @@ impl From<BackendArg> for Backend {
             BackendArg::Cuda => Backend::Cuda,
             BackendArg::Coreml => Backend::CoreML,
             BackendArg::Vulkan => Backend::Vulkan,
+            BackendArg::CpuBurn => Backend::CpuBurn,
         }
     }
 }

@@ -13,6 +13,7 @@
 | `coreml` | `--features coreml` | ~4× Metal at 512 tokens | fp16 encoder, cosine ≈ 0.99999 |
 | `vulkan --precision f16` | `--features vulkan` | ~1.9× the bf16 CPU path | f16 encoder, cosine ≈ 0.99999 |
 | `vulkan` (f32) | `--features vulkan` | slower than bf16 on CPU | f32, matches the CPU (worst `1 - cosine` 1.2e-12) |
+| `cpu-burn` | `--features cpu-burn` | 0.86× `cpu` | f32, matches it (worst `1 - cosine` 1.0e-12) |
 
 - An unsupported request is refused at startup rather than falling back
   silently. A run that quietly landed on the CPU would look like a Metal
@@ -94,8 +95,37 @@
   tighter one: throughput here is flat in the row count (19.3 rows/s at one row
   against 20.5 at sixty-four), so bounding memory harder costs nothing. 512 rows
   of 430 tokens peaked at 1.1 GiB of GPU memory.
-- Reranking is not implemented on this device yet and is refused rather than
-  quietly served on the CPU.
+- Reranking runs here too: the encoder moves and the classifier head stays in
+  f32 on the CPU, the same split the CoreML path makes.
+
+## `--device cpu-burn`: the CPU, on Burn instead of candle
+
+- **Transitional.** It exists so the two CPU engines can be compared in one
+  process, which is the only way to compare anything on a machine whose noise
+  floor can invert a result. It goes away when one of them wins.
+- Build with `--features cpu-burn`. f32 only: `bf16` is the hand-written candle
+  kernel in `src/bf16`, and `f16` is the Vulkan device's recipe.
+- Measured on an 8-core Zen 4 with `ruri-v3-130m`, 16 texts of ~450 tokens, best
+  of three interleaved runs:
+
+| | wall | encode | rows/s |
+| --- | ---: | ---: | ---: |
+| `cpu` | 2.94 s | 2.40 s | 6.7 |
+| `cpu-burn` | 3.76 s | 2.76 s | 5.8 |
+
+- Worst `1 - cosine` against `--device cpu` over 64 texts is 1.0e-12, which is
+  float addition order and nothing else: both engines run f32.
+- Loading costs about 0.46 s more (1.00 s against 0.54 s). candle memory-maps
+  and builds its tensors lazily; this reads each weight through, transposes it
+  so the GEMM's right-hand side is contiguous, and hands it to Burn.
+- Three things got it from 0.13× to 0.86×, in order of size: running one row per
+  forward across the pool rather than one wide forward (Burn parallelises inside
+  an operation, and that does not substitute for it), two contiguous `Wi`
+  matmuls instead of one wide one and a strided split, and a fused RoPE, which
+  `burn_nn` composes from a matmul against a sign matrix. The vectorised GeGLU
+  this crate already owned is worth a further 2.6%.
+- What is left is spread thin: after those, no single operation accounts for the
+  remaining 14%.
 
 ## `--device coreml` on the Apple Neural Engine
 

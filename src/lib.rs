@@ -42,7 +42,7 @@ mod encoder;
 mod errors;
 mod fingerprint;
 // Only the CoreML caches and the emitter's golden test need a stable hash.
-#[cfg(feature = "vulkan")]
+#[cfg(feature = "burn-engine")]
 mod burn_engine;
 #[cfg(any(feature = "coreml", test))]
 mod fnv;

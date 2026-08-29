@@ -38,7 +38,8 @@
 
 use burn::tensor::{activation, backend::Backend, FloatDType, Int, Tensor, TensorData};
 
-use crate::encoder::{Activation, Config};
+use super::FusedOps;
+use crate::encoder::Config;
 
 /// Where a position may not attend.
 ///
@@ -49,6 +50,20 @@ use crate::encoder::{Activation, Config};
 /// arithmetic stays finite while it gets there.
 const BLOCKED: f32 = -1.0e4;
 
+/// How `Wi` is stored, which differs by device — see [`FusedOps::SPLIT_WI`].
+///
+/// The same choice `crate::encoder` makes for the candle backends, made for the
+/// same reason and measured again here.
+pub(super) enum Wi<B: Backend> {
+    /// One `[hidden, 2 * inter]` matrix; the halves come out as views.
+    Wide(Tensor<B, 2>),
+    /// Two `[hidden, inter]` matrices, so both halves are contiguous.
+    Split {
+        gate: Tensor<B, 2>,
+        up: Tensor<B, 2>,
+    },
+}
+
 /// One layer's parameters, already on the device.
 pub(super) struct LayerWeights<B: Backend> {
     /// `None` for layer 0, which the reference model leaves as identity.
@@ -56,7 +71,7 @@ pub(super) struct LayerWeights<B: Backend> {
     pub wqkv: Tensor<B, 2>,
     pub wo: Tensor<B, 2>,
     pub mlp_norm: Tensor<B, 1>,
-    pub wi: Tensor<B, 2>,
+    pub wi: Wi<B>,
     pub mlp_wo: Tensor<B, 2>,
     pub global: bool,
 }
@@ -137,7 +152,7 @@ pub(super) struct ModernBert<B: Backend> {
 
 /// RoPE's cosine and sine tables, `[1, 1, seq, head_dim]`, with the angles
 /// duplicated across the two halves of the last axis — the layout
-/// [`rotate_half`]'s `x1`/`x2` split expects.
+/// [`super::rope_composed`]'s `x1`/`x2` split expects.
 fn rope_tables<B: Backend>(
     seq: usize,
     head_dim: usize,
@@ -196,15 +211,8 @@ fn padding_mask<B: Backend>(
     Tensor::from_data(TensorData::new(values, [rows, 1, 1, seq]), device)
 }
 
-fn rotate_half<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
-    let half = x.dims()[3] / 2;
-    let x1 = x.clone().narrow(3, 0, half);
-    let x2 = x.narrow(3, half, half);
-    Tensor::cat(vec![-x2, x1], 3)
-}
-
-fn rope<B: Backend>(x: Tensor<B, 4>, cos: Tensor<B, 4>, sin: Tensor<B, 4>) -> Tensor<B, 4> {
-    x.clone() * cos + rotate_half(x) * sin
+fn rope<B: FusedOps>(x: Tensor<B, 4>, cos: Tensor<B, 4>, sin: Tensor<B, 4>) -> Tensor<B, 4> {
+    B::rope(x, cos, sin)
 }
 
 /// Weight-only LayerNorm over the last axis.
@@ -245,14 +253,7 @@ fn linear<B: Backend>(x: Tensor<B, 3>, w: Tensor<B, 2>) -> Tensor<B, 3> {
         .reshape([batch, seq, output])
 }
 
-fn gelu_or_silu<B: Backend>(x: Tensor<B, 3>, act: Activation) -> Tensor<B, 3> {
-    match act {
-        Activation::Gelu => activation::gelu(x),
-        Activation::Silu => activation::silu(x),
-    }
-}
-
-impl<B: Backend> ModernBert<B> {
+impl<B: FusedOps> ModernBert<B> {
     /// This padded length's tables, built if the last forward used another one.
     fn tables(&self, seq: usize, device: &B::Device) -> Tables<B> {
         let mut slot = self.tables.lock().expect("tables mutex poisoned");
@@ -348,10 +349,20 @@ impl<B: Backend> ModernBert<B> {
     /// along the output axis, and the activation applies to the *first* half.
     fn feed_forward(&self, layer: &LayerWeights<B>, normed: Tensor<B, 3>) -> Tensor<B, 3> {
         let inter = self.config.intermediate_size;
-        let wide = linear(normed, layer.wi.clone());
-        let gate = wide.clone().narrow(2, 0, inter);
-        let up = wide.narrow(2, inter, inter);
-        let gated = gelu_or_silu(gate, self.config.activation) * up;
+        let (gate, up) = match &layer.wi {
+            Wi::Split { gate, up } => (
+                linear(normed.clone(), gate.clone()),
+                linear(normed, up.clone()),
+            ),
+            Wi::Wide(wi) => {
+                let wide = linear(normed, wi.clone());
+                (
+                    wide.clone().narrow(2, 0, inter),
+                    wide.narrow(2, inter, inter),
+                )
+            }
+        };
+        let gated = B::geglu(gate, up, self.config.activation);
         linear(gated, layer.mlp_wo.clone())
     }
 

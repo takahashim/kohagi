@@ -22,7 +22,8 @@ use candle_core::safetensors::MmapedSafetensors;
 
 use crate::encoder::Config;
 
-use super::encoder::{LayerWeights, ModernBert};
+use super::encoder::{LayerWeights, ModernBert, Wi};
+use super::FusedOps;
 
 /// A memory-mapped checkpoint, with the name prefix it turned out to use.
 pub(super) struct Checkpoint {
@@ -62,17 +63,31 @@ impl Checkpoint {
 
     /// An `[out, in]` Linear weight, transposed to `[in, out]`.
     fn linear<B: Backend>(&self, name: &str, device: &B::Device) -> Result<Tensor<B, 2>> {
+        self.linear_rows(name, 0, usize::MAX, device)
+    }
+
+    /// Rows `start .. start + len` of an `[out, in]` weight, transposed to
+    /// `[in, len]`. `len` past the end takes the rest, which is how
+    /// [`Self::linear`] asks for the whole thing.
+    fn linear_rows<B: Backend>(
+        &self,
+        name: &str,
+        start: usize,
+        len: usize,
+        device: &B::Device,
+    ) -> Result<Tensor<B, 2>> {
         let (shape, values) = self.raw(name)?;
         anyhow::ensure!(shape.len() == 2, "{name} is not a matrix: {shape:?}");
         let (out, input) = (shape[0], shape[1]);
-        let mut transposed = vec![0f32; values.len()];
-        for r in 0..out {
+        let len = len.min(out - start);
+        let mut transposed = vec![0f32; len * input];
+        for r in 0..len {
             for c in 0..input {
-                transposed[c * out + r] = values[r * input + c];
+                transposed[c * len + r] = values[(start + r) * input + c];
             }
         }
         Ok(Tensor::from_data(
-            TensorData::new(transposed, [input, out]),
+            TensorData::new(transposed, [input, len]),
             device,
         ))
     }
@@ -96,7 +111,7 @@ impl Checkpoint {
 }
 
 /// Load every parameter onto the device.
-pub(super) fn load<B: Backend>(
+pub(super) fn load<B: FusedOps>(
     checkpoint: &Checkpoint,
     config: &Config,
     half: bool,
@@ -116,7 +131,28 @@ pub(super) fn load<B: Backend>(
                 wqkv: checkpoint.linear::<B>(&at("attn.Wqkv.weight"), device)?,
                 wo: checkpoint.linear::<B>(&at("attn.Wo.weight"), device)?,
                 mlp_norm: checkpoint.vector::<B>(&at("mlp_norm.weight"), device)?,
-                wi: checkpoint.linear::<B>(&at("mlp.Wi.weight"), device)?,
+                // `Wi` concatenates gate and up along the output axis, so the
+                // split is by rows. Which form this device wants is measured;
+                // see `FusedOps::SPLIT_WI`.
+                wi: if B::SPLIT_WI {
+                    let n = &at("mlp.Wi.weight");
+                    Wi::Split {
+                        gate: checkpoint.linear_rows::<B>(
+                            n,
+                            0,
+                            config.intermediate_size,
+                            device,
+                        )?,
+                        up: checkpoint.linear_rows::<B>(
+                            n,
+                            config.intermediate_size,
+                            config.intermediate_size,
+                            device,
+                        )?,
+                    }
+                } else {
+                    Wi::Wide(checkpoint.linear::<B>(&at("mlp.Wi.weight"), device)?)
+                },
                 mlp_wo: checkpoint.linear::<B>(&at("mlp.Wo.weight"), device)?,
                 global: i % config.global_attn_every_n_layers == 0,
             })
