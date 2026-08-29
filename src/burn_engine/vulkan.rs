@@ -119,11 +119,23 @@ pub fn load(
     let model: Box<dyn Forward + Send + Sync> = match precision {
         Precision::F16 => {
             let device = Default::default();
-            Box::new(weights::load::<Half>(&checkpoint, config, true, &device)?)
+            Box::new(weights::load::<Half>(
+                &checkpoint,
+                config,
+                true,
+                VULKAN_ATTN_BUDGET,
+                &device,
+            )?)
         }
         _ => {
             let device = Default::default();
-            Box::new(weights::load::<Exact>(&checkpoint, config, false, &device)?)
+            Box::new(weights::load::<Exact>(
+                &checkpoint,
+                config,
+                false,
+                VULKAN_ATTN_BUDGET,
+                &device,
+            )?)
         }
     };
     Ok(BurnEncoder {

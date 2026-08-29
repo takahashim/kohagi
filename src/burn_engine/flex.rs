@@ -147,8 +147,13 @@ fn rebuild<const D: usize>(values: Vec<f32>, shape: [usize; D]) -> Tensor<Cpu, D
 pub fn load(weights: &std::path::Path, config: &Config) -> Result<BurnEncoder> {
     let checkpoint = weights::Checkpoint::open(weights)?;
     let device = Default::default();
-    let model: Box<dyn Forward + Send + Sync> =
-        Box::new(weights::load::<Cpu>(&checkpoint, config, false, &device)?);
+    let model: Box<dyn Forward + Send + Sync> = Box::new(weights::load::<Cpu>(
+        &checkpoint,
+        config,
+        false,
+        CPU_ATTN_BUDGET,
+        &device,
+    )?);
     Ok(BurnEncoder {
         model,
         dim: config.hidden_size,

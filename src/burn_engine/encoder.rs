@@ -41,6 +41,21 @@ use burn::tensor::{activation, backend::Backend, FloatDType, Int, Tensor, Tensor
 use super::FusedOps;
 use crate::encoder::Config;
 
+/// This block's slice of an additive mask.
+///
+/// The key axis always narrows. The query axis narrows only when the mask has
+/// one: a sliding-window layer's does, because which keys are open depends on
+/// where the query sits, while padding is the same for every query and stays
+/// `[rows, 1, 1, seq]` — which is what keeps a tiled block from paying `seq^2`.
+fn block_mask<B: Backend>(mask: &Tensor<B, 4>, block: &crate::attention::Block) -> Tensor<B, 4> {
+    let m = mask.clone().narrow(3, block.k0, block.keys);
+    if m.dims()[2] == 1 {
+        m
+    } else {
+        m.narrow(2, block.q0, block.queries)
+    }
+}
+
 /// Where a position may not attend.
 ///
 /// Finite rather than `f32::MIN`, for two reasons: a fully padded query row
@@ -159,6 +174,7 @@ pub(super) struct ModernBert<B: Backend> {
     pub final_norm: Tensor<B, 1>,
     pub config: Config,
     pub half: bool,
+    pub budget: usize,
     /// Rebuilt only when the padded length changes; see [`Tables`]. A mutex
     /// rather than a `RefCell` because the loaded model is shared behind `&`
     /// and must stay `Sync`, not because anything here runs concurrently.
@@ -348,7 +364,8 @@ impl<B: FusedOps> ModernBert<B> {
         } else {
             local_mask
         };
-        let plan = crate::attention::plan(seq, window, seq, BAND_BLOCK);
+        let tile = (self.budget / seq).max(1);
+        let plan = crate::attention::plan(seq, window, tile, BAND_BLOCK);
         let context = if plan.blocks.len() == 1 {
             self.attend(q, k, v, mask)
         } else {
@@ -360,12 +377,7 @@ impl<B: FusedOps> ModernBert<B> {
                         q.clone().narrow(2, b.q0, b.queries),
                         k.clone().narrow(2, b.k0, b.keys),
                         v.clone().narrow(2, b.k0, b.keys),
-                        // Only a sliding-window layer bands, and its mask is
-                        // `[rows, 1, seq, seq]`, so both axes narrow.
-                        &mask
-                            .clone()
-                            .narrow(2, b.q0, b.queries)
-                            .narrow(3, b.k0, b.keys),
+                        &block_mask(mask, b),
                     )
                 })
                 .collect();

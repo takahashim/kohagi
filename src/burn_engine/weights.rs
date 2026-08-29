@@ -138,6 +138,7 @@ pub(super) fn load<B: FusedOps>(
     checkpoint: &Checkpoint,
     config: &Config,
     half: bool,
+    budget: usize,
     device: &B::Device,
 ) -> Result<ModernBert<B>> {
     let layers = (0..config.num_hidden_layers)
@@ -191,6 +192,7 @@ pub(super) fn load<B: FusedOps>(
         final_norm: checkpoint.vector::<B>("final_norm.weight", device)?,
         config: config.clone(),
         half,
+        budget,
         // Filled by the first forward, which is what knows the padded length.
         tables: Default::default(),
     })
