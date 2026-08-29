@@ -127,6 +127,13 @@ coreml-export = ["dep:prost"]
 # The Burn engine's shared machinery. Not selected directly — a device feature
 # below implies it. `src/burn_engine/{encoder,weights}.rs` name no device, so
 # they build for whichever devices are on.
+#
+# **These features need rustc 1.92**, not the 1.89 above: burn 0.21 and
+# cubecl-zspace 0.10 both declare it. Cargo has one `rust-version` per package
+# and no way to say "this feature needs more", so it is written here instead.
+# The default build and `coreml-export` are still 1.89 — checked, not assumed.
+# `cuda` could not be checked here for want of a CUDA toolkit, and `coreml` for
+# want of a Mac.
 burn-engine = ["dep:burn"]
 
 # Any Vulkan 1.2 GPU via Burn/CubeCL, which compiles the same kernels to SPIR-V:
@@ -146,9 +153,13 @@ vulkan = [
 #
 # `x86-v4` builds the `gemm` crate's AVX-512 kernels alongside its AVX2 ones and
 # is dispatched at run time, so a CPU without the instructions takes the path it
-# always took. Measured worth 3% on short texts and 9% at 460 tokens, for 330 KB
-# of binary. candle does not enable it for its own copy of `gemm`, which is why
-# the two engines can differ here at all.
+# always took. Measured worth 2% on 42-token texts, 7% at 460 and 9% at 8192,
+# for 0.4 MB of binary.
+#
+# Neither `gemm` nor candle enables it, which looks like a warning until you
+# follow it: it turns on `bytemuck/avx512_simd`, which implements `Pod` for the
+# `__m512` types, and those were nightly-only until Rust 1.89. The default is
+# the age of the feature rather than a judgement about it.
 cpu-burn = ["burn-engine", "burn/flex", "burn/simd", "burn/x86-v4"]
 
 # Apple Neural Engine via CoreML: `cargo build --release --features coreml`,
