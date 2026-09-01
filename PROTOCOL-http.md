@@ -120,7 +120,10 @@ vec = np.frombuffer(base64.b64decode(item["embedding"]), dtype="<f4")  # Python
 Answered only when the server was started with `--rerank-model-id` (or
 `--rerank-model-path`); otherwise 404, with the flag named. The reranker runs
 on the same `--device` at the same `--precision` as the embedder, on a thread
-of its own, so embedding and reranking do not wait for each other.
+of its own, so embedding and reranking do not wait for each other. On
+`--device coreml` that means two models driving the Neural Engine from two
+threads, which has not been measured; the CPU and the GPUs are where this
+server is expected to run.
 
 ```json
 {"query": "Rubyで配列を並べ替えるには",
