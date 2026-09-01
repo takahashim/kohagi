@@ -130,23 +130,23 @@ impl From<CoreMlQuantizeArg> for CoreMlQuantize {
 pub struct ModelArgs {
     /// Hugging Face model repo to download (ignored with --model-path).
     #[arg(long, default_value = "cl-nagoya/ruri-v3-130m")]
-    model_id: String,
+    pub model_id: String,
     /// Local safetensors weights (offline mode; config.json must sit next to
     /// it). Requires --tokenizer-path.
     #[arg(long, requires = "tokenizer_path")]
-    model_path: Option<PathBuf>,
+    pub model_path: Option<PathBuf>,
     /// Local tokenizer.json (offline mode).
     #[arg(long, requires = "model_path")]
-    tokenizer_path: Option<PathBuf>,
+    pub tokenizer_path: Option<PathBuf>,
     /// How to reduce token embeddings to one vector per text. Omit to take the
     /// model's own choice from its 1_Pooling/config.json (mean if it ships
     /// none); pass this only to override that.
     #[arg(long, value_enum)]
-    pooling: Option<PoolingArg>,
+    pub pooling: Option<PoolingArg>,
     /// Numeric precision of the forward pass. f32 is identical everywhere;
     /// bf16 is faster but not bit-identical.
     #[arg(long, value_enum, default_value_t = PrecisionArg::F32)]
-    precision: PrecisionArg,
+    pub precision: PrecisionArg,
     /// Device for the forward pass. cuda requires an NVIDIA GPU and a binary
     /// built with `--features cuda`. metal requires a binary built with
     /// `--features metal`, and runs ~1.2x faster than cpu on Apple Silicon.
@@ -154,18 +154,18 @@ pub struct ModelArgs {
     /// --coreml-dir or --coreml-model-id it converts --model-id itself and
     /// caches the result.
     #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
-    device: BackendArg,
+    pub device: BackendArg,
     /// Directory of pre-converted CoreML models for `--device coreml`: one
     /// `seq-<N>.mlpackage` per bucket length, plus tokenizer.json and
     /// config.json. Produce one with the coreml-convert binary or
     /// scripts/convert_coreml.py. Omit it to convert --model-id on first use.
     #[arg(long)]
-    coreml_dir: Option<PathBuf>,
+    pub coreml_dir: Option<PathBuf>,
     /// Hugging Face repo holding the CoreML models (same layout as
     /// --coreml-dir), downloaded and cached on first use. Alternative to
     /// --coreml-dir for `--device coreml`; --coreml-dir wins if both are set.
     #[arg(long)]
-    coreml_model_id: Option<String>,
+    pub coreml_model_id: Option<String>,
     /// Fixed sequence lengths to emit when `--device coreml` converts a
     /// checkpoint itself (that is, when neither --coreml-dir nor
     /// --coreml-model-id is given). Each becomes one CoreML function over a
@@ -173,29 +173,29 @@ pub struct ModelArgs {
     /// costs is one model to open per length. Match it to the lengths your
     /// texts actually are: a bucket nothing lands in is pure overhead.
     #[arg(long, value_delimiter = ',', default_values_t = [64usize, 128, 256, 512])]
-    coreml_buckets: Vec<usize>,
+    pub coreml_buckets: Vec<usize>,
     /// Quantize the model when `--device coreml` converts it. `embeddings`
     /// halves a large-vocabulary bundle at no measured retrieval cost;
     /// `all` roughly halves it again for a small one. Omit for fp16; a
     /// quantized bundle's vectors are not interchangeable with an fp16 one's.
     #[arg(long, value_enum)]
-    coreml_quantize: Option<CoreMlQuantizeArg>,
+    pub coreml_quantize: Option<CoreMlQuantizeArg>,
     /// When a --coreml-model-id repo ships both forms of a bucket, which to
     /// download: `compiled` (.mlmodelc, faster) or `package` (.mlpackage,
     /// portable). Only the chosen form is fetched.
     #[arg(long, value_enum, default_value_t = CoreMlFormArg::Compiled)]
-    coreml_prefer: CoreMlFormArg,
+    pub coreml_prefer: CoreMlFormArg,
     /// Skip L2 normalization (normalized output is the default; unit vectors
     /// make dot product = cosine).
     #[arg(long)]
-    no_normalize: bool,
+    pub no_normalize: bool,
     /// Keep only the first N dimensions of each embedding and re-normalize
     /// (Matryoshka truncation, meaningful for models trained for it). dot =
     /// cosine still holds on the shorter vectors, and they must not share an
     /// index with full-dimension ones. Refused if N is 0 or exceeds the model
     /// dimension, or combined with --no-normalize.
     #[arg(long, value_name = "N")]
-    dims: Option<usize>,
+    pub dims: Option<usize>,
     /// Refuse to embed anything unless the loaded weights' sha256 starts with
     /// this hex prefix: paste the 12 digits from a summary line, or the full
     /// digest from --print-model-info or /v1/models. A mismatch exits 1 before
@@ -206,10 +206,10 @@ pub struct ModelArgs {
     expect_sha256: Option<String>,
     /// Token-level truncation length.
     #[arg(long, default_value_t = 512)]
-    max_seq_length: usize,
+    pub max_seq_length: usize,
     /// Bucketing granularity; memory stays bounded regardless (see model.rs).
     #[arg(long, default_value_t = 64)]
-    batch_size: usize,
+    pub batch_size: usize,
 }
 
 impl ModelArgs {

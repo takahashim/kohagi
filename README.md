@@ -157,6 +157,7 @@ host, behind OpenAI's `/v1/embeddings`.
 ```bash
 kohagi-serve --prefix "検索クエリ: "                            # http://127.0.0.1:8080
 kohagi-serve --listen unix:///run/kohagi.sock --device metal
+kohagi-serve --rerank-model-id cl-nagoya/ruri-v3-reranker-310m   # /v1/rerank as well
 ```
 
 ```python
@@ -174,7 +175,10 @@ names it. The server loads before it listens, so a missing checkpoint is a
 failed start rather than an open port; it binds to loopback, having no
 authentication (keep it off the open network as you would a database); it
 answers `GET /v1/models` and `GET /health`; and it prints one summary line on
-SIGTERM. See [PROTOCOL-http.md](PROTOCOL-http.md).
+SIGTERM. With `--rerank-model-id` it loads the cross-encoder beside the
+embedder and answers `POST /v1/rerank` in the shape Cohere and Jina gave it,
+with the same scores `kohagi-rerank` writes. See
+[PROTOCOL-http.md](PROTOCOL-http.md).
 
 ### Ruby
 
@@ -264,7 +268,7 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
 - 入出力の契約・exit code(0/1/2/3)は [PROTOCOL.md](PROTOCOL.md) を参照してください。
   Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) にあります。
-- `kohagi-serve` は同じモデルを OpenAI 互換の `/v1/embeddings` で提供するサーバです。バッチはパイプのままで、検索時のクエリ埋め込みのようにホストあたり 1 モデルを複数プロセスで共有したいときに使います(`kohagi-serve --prefix "検索クエリ: "` で `http://127.0.0.1:8080`、`--listen unix:///run/kohagi.sock` で Unix socket)。ruby-openai や langchainrb から `base_url` を向けるだけで使えます。契約は [PROTOCOL-http.md](PROTOCOL-http.md) を参照してください。
+- `kohagi-serve` は同じモデルを OpenAI 互換の `/v1/embeddings` で提供するサーバです。バッチはパイプのままで、検索時のクエリ埋め込みのようにホストあたり 1 モデルを複数プロセスで共有したいときに使います(`kohagi-serve --prefix "検索クエリ: "` で `http://127.0.0.1:8080`、`--listen unix:///run/kohagi.sock` で Unix socket)。ruby-openai や langchainrb から `base_url` を向けるだけで使えます。`--rerank-model-id cl-nagoya/ruri-v3-reranker-310m` を付けると reranker も同時にロードし、Cohere / Jina 形の `/v1/rerank` に `kohagi-rerank` と同じスコアで答えます。契約は [PROTOCOL-http.md](PROTOCOL-http.md) を参照してください。
 
 また、Ruby では Kohagi 専用の gem である [kohagi-ruby](https://github.com/takahashim/kohagi-ruby)が使えます。
 

@@ -17,42 +17,53 @@ use tokio::sync::watch;
 
 use super::listen::Io;
 use super::openai::{self, Refusal};
-use super::worker::{Batch, EmbedError, Handle};
-use super::Config;
+use super::worker::{Loaded, WorkerError};
+use super::{Batch, Config, Pairs, Scores};
 use crate::program::remark;
 use crate::ModelInfo;
 
-/// Everything a handler reads: the model's facts and its queue, the limits,
-/// and the counters the summary is written from.
+/// Everything a handler reads: the models, the limits, and the counters the
+/// summary is written from.
 pub(crate) struct State {
-    label: String,
+    embedder: Loaded<Vec<String>, Batch>,
+    reranker: Option<Loaded<Pairs, Scores>>,
     prefix: String,
-    info: ModelInfo,
     max_inputs: usize,
     max_body_bytes: usize,
-    worker: Handle,
     counts: Counts,
 }
 
 impl State {
-    pub(crate) fn new(config: &Config, info: ModelInfo, worker: Handle) -> Self {
+    pub(crate) fn new(
+        config: &Config,
+        embedder: Loaded<Vec<String>, Batch>,
+        reranker: Option<Loaded<Pairs, Scores>>,
+    ) -> Self {
         Self {
-            label: config.label.clone(),
+            embedder,
+            reranker,
             prefix: config.prefix.clone(),
-            info,
             max_inputs: config.max_inputs,
             max_body_bytes: config.max_body_bytes,
-            worker,
             counts: Counts::default(),
         }
     }
 
-    pub(crate) fn label(&self) -> &str {
-        &self.label
+    pub(crate) fn embedder(&self) -> &Loaded<Vec<String>, Batch> {
+        &self.embedder
     }
 
-    pub(crate) fn info(&self) -> &ModelInfo {
-        &self.info
+    pub(crate) fn reranker(&self) -> Option<&Loaded<Pairs, Scores>> {
+        self.reranker.as_ref()
+    }
+
+    /// Every loaded model, as `/v1/models` lists them.
+    fn models(&self) -> Vec<(&str, &ModelInfo)> {
+        let mut models = vec![(self.embedder.label.as_str(), &self.embedder.info)];
+        if let Some(reranker) = &self.reranker {
+            models.push((reranker.label.as_str(), &reranker.info));
+        }
+        models
     }
 
     /// The run's one summary line, on stderr at shutdown, reading like the
@@ -60,12 +71,13 @@ impl State {
     pub(crate) fn summarize(&self) {
         let c = &self.counts;
         remark!(
-            "model={} {} requests={} in={} truncated={} rejected={} failed={}",
-            self.label,
-            self.info.summary_facts(),
+            "model={} {} requests={} in={} truncated={} scored={} rejected={} failed={}",
+            self.embedder.label,
+            self.embedder.info.summary_facts(),
             c.requests.load(Relaxed),
             c.inputs.load(Relaxed),
             c.truncated.load(Relaxed),
+            c.scored.load(Relaxed),
             c.rejected.load(Relaxed),
             c.failed.load(Relaxed)
         );
@@ -75,8 +87,10 @@ impl State {
 /// The summary's numbers. `requests` counts everything that arrived;
 /// `rejected` the 4xx among them (the client's mistake) and `failed` the 5xx
 /// (this side's). `inputs` and `truncated` are the stdio summary's `in` and
-/// `truncated`, over the requests that were answered; a request is answered
-/// whole or not at all, so there is no separate `out`.
+/// `truncated`, over the requests that were answered: texts embedded, and
+/// texts or pairs that ran past a model's length. `scored` is the documents
+/// reranked. A request is answered whole or not at all, so there is no
+/// separate `out`.
 #[derive(Default)]
 struct Counts {
     requests: AtomicUsize,
@@ -84,6 +98,7 @@ struct Counts {
     failed: AtomicUsize,
     inputs: AtomicUsize,
     truncated: AtomicUsize,
+    scored: AtomicUsize,
 }
 
 impl Counts {
@@ -96,10 +111,18 @@ impl Counts {
         }
     }
 
-    fn answered(&self, batch: &Batch) {
+    fn embedded(&self, batch: &Batch) {
         self.inputs.fetch_add(batch.vectors.len(), Relaxed);
         self.truncated
             .fetch_add(batch.tokens.iter().filter(|t| t.truncated).count(), Relaxed);
+    }
+
+    fn reranked(&self, scores: &Scores) {
+        self.scored.fetch_add(scores.scores.len(), Relaxed);
+        self.truncated.fetch_add(
+            scores.tokens.iter().filter(|t| t.truncated).count(),
+            Relaxed,
+        );
     }
 }
 
@@ -198,14 +221,14 @@ impl From<Refusal> for ApiError {
     }
 }
 
-impl From<EmbedError> for ApiError {
-    fn from(e: EmbedError) -> Self {
+impl From<WorkerError> for ApiError {
+    fn from(e: WorkerError) -> Self {
         match e {
-            EmbedError::Busy => Self::busy(),
-            EmbedError::Gone => {
-                Self::internal("the model thread is gone; this server is shutting down")
+            WorkerError::Busy => Self::busy(),
+            WorkerError::Gone => {
+                Self::internal("the model's thread is gone; this server is shutting down")
             }
-            EmbedError::Failed(e) => Self::internal(format!("embedding failed: {e:#}")),
+            WorkerError::Failed(e) => Self::internal(format!("the model failed: {e:#}")),
         }
     }
 }
@@ -235,28 +258,32 @@ where
 
     if let Some(id) = path.strip_prefix("/v1/models/") {
         return match method {
-            Method::GET | Method::HEAD if id == state.label => Ok(json(
-                StatusCode::OK,
-                openai::model_body(&state.label, &state.info),
-            )),
-            Method::GET | Method::HEAD => Err(ApiError::not_found(format!(
-                "model `{id}` is not loaded; this server runs `{}`",
-                state.label
-            ))),
+            Method::GET | Method::HEAD => {
+                match state.models().into_iter().find(|(label, _)| *label == id) {
+                    Some((label, info)) => {
+                        Ok(json(StatusCode::OK, openai::model_body(label, info)))
+                    }
+                    None => Err(ApiError::not_found(format!(
+                        "model `{id}` is not loaded; this server runs `{}`",
+                        state.embedder.label
+                    ))),
+                }
+            }
             _ => Err(ApiError::method_not_allowed("GET, HEAD")),
         };
     }
 
     match (method, path.as_str()) {
         (Method::POST, "/v1/embeddings") => embeddings(req, state).await,
-        (Method::GET | Method::HEAD, "/v1/models") => Ok(json(
-            StatusCode::OK,
-            openai::models_body(&state.label, &state.info),
-        )),
-        (Method::GET | Method::HEAD, "/health") => {
-            Ok(json(StatusCode::OK, openai::health_body(&state.label)))
+        (Method::POST, "/v1/rerank") => rerank(req, state).await,
+        (Method::GET | Method::HEAD, "/v1/models") => {
+            Ok(json(StatusCode::OK, openai::models_body(&state.models())))
         }
-        (_, "/v1/embeddings") => Err(ApiError::method_not_allowed("POST")),
+        (Method::GET | Method::HEAD, "/health") => Ok(json(
+            StatusCode::OK,
+            openai::health_body(&state.embedder.label),
+        )),
+        (_, "/v1/embeddings" | "/v1/rerank") => Err(ApiError::method_not_allowed("POST")),
         (_, "/v1/models" | "/health") => Err(ApiError::method_not_allowed("GET, HEAD")),
         (method, path) => Err(ApiError::not_found(format!("no route for {method} {path}"))),
     }
@@ -271,21 +298,61 @@ where
     let request: openai::EmbeddingsRequest = serde_json::from_slice(&body).map_err(|e| {
         ApiError::invalid(None, format!("the body is not an embeddings request: {e}"))
     })?;
-    let request = openai::validate(request, state.max_inputs, &state.info)?.prefixed(&state.prefix);
+    let request =
+        openai::validate(request, state.max_inputs, &state.embedder.info)?.prefixed(&state.prefix);
 
-    let mut batch = state.worker.embed(request.texts).await?;
+    let mut batch = state.embedder.handle.ask(request.texts).await?;
     if let Some(dims) = request.dimensions {
         openai::truncate(&mut batch.vectors, dims);
     }
-    state.counts.answered(&batch);
+    state.counts.embedded(&batch);
 
     Ok(json(
         StatusCode::OK,
         openai::embeddings_body(
-            &state.label,
+            &state.embedder.label,
             &batch.vectors,
             &batch.tokens,
             request.encoding,
+        ),
+    ))
+}
+
+async fn rerank<B>(req: Request<B>, state: &State) -> Result<Reply, ApiError>
+where
+    B: Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let Some(reranker) = &state.reranker else {
+        return Err(ApiError::not_found(
+            "this server has no reranker; start kohagi-serve with --rerank-model-id \
+             (or --rerank-model-path) to answer /v1/rerank",
+        ));
+    };
+    let body = read_body(req, state.max_body_bytes).await?;
+    let request: openai::RerankRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::invalid(None, format!("the body is not a rerank request: {e}")))?;
+    let request = openai::validate_rerank(request, state.max_inputs)?;
+
+    // The reply carries the documents back only when asked to; the model
+    // needs them either way, so they are cloned rather than kept.
+    let documents = request.return_documents.then(|| request.documents.clone());
+    let scores = reranker
+        .handle
+        .ask(Pairs {
+            query: request.query,
+            documents: request.documents,
+        })
+        .await?;
+    state.counts.reranked(&scores);
+
+    Ok(json(
+        StatusCode::OK,
+        openai::rerank_body(
+            &reranker.label,
+            &scores,
+            request.top_n,
+            documents.as_deref(),
         ),
     ))
 }
@@ -380,9 +447,23 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::super::worker;
-    use super::super::{Engine, Listen};
+    use super::super::{Engine, Listen, Load};
     use super::*;
     use crate::{Output, TokenInfo};
+
+    fn info(dim: usize, output: Output) -> ModelInfo {
+        ModelInfo {
+            backend: "cpu",
+            precision: "f32",
+            sha256: Some("ab".repeat(32)),
+            bundle: None,
+            pooling: "mean",
+            dim,
+            max_seq_length: 8,
+            declared_max_seq_length: None,
+            output,
+        }
+    }
 
     /// Four dimensions, one-hot on the text's position, and a token count of
     /// the text's characters, so a test can see what the model was handed.
@@ -395,37 +476,27 @@ mod tests {
     }
 
     impl Engine for Stub {
+        type Input = Vec<String>;
+        type Output = Batch;
+
         fn info(&self) -> ModelInfo {
-            ModelInfo {
-                backend: "cpu",
-                precision: "f32",
-                sha256: Some("ab".repeat(32)),
-                bundle: None,
-                pooling: "mean",
-                dim: 4,
-                max_seq_length: 8,
-                declared_max_seq_length: None,
-                output: Output::Embedding {
+            info(
+                4,
+                Output::Embedding {
                     output_dim: None,
                     normalized: true,
                 },
-            }
+            )
         }
 
-        fn embed_with_tokens(
-            &self,
-            texts: &[&str],
-        ) -> anyhow::Result<(Vec<Vec<f32>>, Vec<TokenInfo>)> {
+        fn answer(&self, texts: Vec<String>) -> anyhow::Result<Batch> {
             if let Some(started) = &self.started {
                 let _ = started.send(());
             }
             if let Some(gate) = &self.gate {
                 gate.recv().expect("the test releases the gate");
             }
-            self.seen
-                .lock()
-                .unwrap()
-                .extend(texts.iter().map(|t| t.to_string()));
+            self.seen.lock().unwrap().extend(texts.iter().cloned());
             let vectors = texts
                 .iter()
                 .enumerate()
@@ -442,14 +513,42 @@ mod tests {
                     truncated: t.chars().count() > 8,
                 })
                 .collect();
-            Ok((vectors, tokens))
+            Ok(Batch { vectors, tokens })
+        }
+    }
+
+    /// Scores a document by its length, so the order is decided by the test.
+    struct RerankStub;
+
+    impl Engine for RerankStub {
+        type Input = Pairs;
+        type Output = Scores;
+
+        fn info(&self) -> ModelInfo {
+            info(768, Output::Score { score: "sigmoid" })
+        }
+
+        fn answer(&self, pairs: Pairs) -> anyhow::Result<Scores> {
+            let scores = pairs
+                .documents
+                .iter()
+                .map(|d| d.chars().count() as f32 / 10.0)
+                .collect();
+            let tokens = pairs
+                .documents
+                .iter()
+                .map(|d| TokenInfo {
+                    n_tokens: pairs.query.chars().count() + d.chars().count(),
+                    truncated: d.chars().count() > 8,
+                })
+                .collect();
+            Ok(Scores { scores, tokens })
         }
     }
 
     fn config() -> Config {
         Config {
             listen: Listen::default(),
-            label: "stub/model".to_string(),
             prefix: String::new(),
             max_inputs: 4,
             max_body_bytes: 1024,
@@ -458,20 +557,36 @@ mod tests {
         }
     }
 
-    fn state_with(config: Config, stub: Stub) -> Arc<State> {
-        let (handle, info, _alive) = worker::spawn(move || Ok(stub), config.max_queue).unwrap();
-        Arc::new(State::new(&config, info, handle))
+    fn state_with(config: Config, stub: Stub, reranker: bool) -> Arc<State> {
+        let embedder = Load {
+            label: "stub/model".to_string(),
+            load: move || Ok(stub),
+        };
+        let embedder = worker::spawn("test-model", embedder, config.max_queue)
+            .unwrap()
+            .loaded;
+        let reranker = reranker.then(|| {
+            let reranker = Load {
+                label: "stub/reranker".to_string(),
+                load: || Ok(RerankStub),
+            };
+            worker::spawn("test-reranker", reranker, config.max_queue)
+                .unwrap()
+                .loaded
+        });
+        Arc::new(State::new(&config, embedder, reranker))
+    }
+
+    fn plain_stub() -> Stub {
+        Stub {
+            seen: Arc::default(),
+            gate: None,
+            started: None,
+        }
     }
 
     fn state() -> Arc<State> {
-        state_with(
-            config(),
-            Stub {
-                seen: Arc::default(),
-                gate: None,
-                started: None,
-            },
-        )
+        state_with(config(), plain_stub(), false)
     }
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -595,6 +710,7 @@ mod tests {
                     gate: None,
                     started: None,
                 },
+                false,
             );
             let (status, v) = call(
                 &state,
@@ -671,6 +787,14 @@ mod tests {
                     StatusCode::NOT_FOUND,
                     "no route for GET /nope",
                 ),
+                // No reranker was loaded, and the refusal says how to get one.
+                (
+                    Method::POST,
+                    "/v1/rerank",
+                    r#"{"query": "q", "documents": ["a"]}"#,
+                    StatusCode::NOT_FOUND,
+                    "--rerank-model-id",
+                ),
             ] {
                 let (got, v) = call(&state, method.clone(), path, body).await;
                 assert_eq!(got, status, "{method} {path} {body}");
@@ -680,8 +804,8 @@ mod tests {
             }
             // Every one of those was the client's mistake, and none embedded
             // anything.
-            assert_eq!(state.counts.requests.load(Relaxed), 8);
-            assert_eq!(state.counts.rejected.load(Relaxed), 8);
+            assert_eq!(state.counts.requests.load(Relaxed), 9);
+            assert_eq!(state.counts.rejected.load(Relaxed), 9);
             assert_eq!(state.counts.failed.load(Relaxed), 0);
             assert_eq!(state.counts.inputs.load(Relaxed), 0);
         });
@@ -721,23 +845,74 @@ mod tests {
     }
 
     #[test]
-    fn models_and_health_describe_the_loaded_model() {
+    fn models_and_health_describe_the_loaded_models() {
         block_on(async {
-            let state = state();
+            let state = state_with(config(), plain_stub(), true);
             let (status, v) = call(&state, Method::GET, "/v1/models", "").await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(v["data"][0]["id"], "stub/model");
+            let ids: Vec<&str> = v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, ["stub/model", "stub/reranker"]);
             assert_eq!(v["data"][0]["kohagi"]["dim"], 4);
             assert_eq!(v["data"][0]["kohagi"]["normalized"], true);
             assert_eq!(v["data"][0]["kohagi"]["sha256"], "ab".repeat(32));
+            assert_eq!(v["data"][1]["kohagi"]["score"], "sigmoid");
 
-            let (status, v) = call(&state, Method::GET, "/v1/models/stub/model", "").await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(v["id"], "stub/model");
+            for id in ["stub/model", "stub/reranker"] {
+                let (status, v) = call(&state, Method::GET, &format!("/v1/models/{id}"), "").await;
+                assert_eq!(status, StatusCode::OK, "{id}");
+                assert_eq!(v["id"], id);
+            }
 
             let (status, v) = call(&state, Method::GET, "/health", "").await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(v["status"], "ok");
+
+            // Without a reranker, the list has one entry.
+            let alone = state_with(config(), plain_stub(), false);
+            let (_, v) = call(&alone, Method::GET, "/v1/models", "").await;
+            assert_eq!(v["data"].as_array().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn rerank_orders_the_documents_by_score() {
+        block_on(async {
+            let state = state_with(config(), plain_stub(), true);
+            let (status, v) = call(
+                &state,
+                Method::POST,
+                "/v1/rerank",
+                r#"{"query": "q", "documents": ["aa", "aaaaaa", {"text": "aaaa"}], "top_n": 2, "return_documents": true}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["model"], "stub/reranker");
+            let results = v["results"].as_array().unwrap();
+            assert_eq!(results.len(), 2, "top_n");
+            assert_eq!(results[0]["index"], 1);
+            assert_eq!(results[0]["relevance_score"], 0.6);
+            assert_eq!(results[0]["document"]["text"], "aaaaaa");
+            assert_eq!(results[1]["index"], 2);
+            assert_eq!(results[1]["document"]["text"], "aaaa");
+            // Tokens for every pair, including the one top_n dropped.
+            assert_eq!(v["usage"]["total_tokens"], 1 + 2 + 1 + 6 + 1 + 4);
+            assert_eq!(state.counts.scored.load(Relaxed), 3);
+
+            // Without `return_documents`, no document comes back.
+            let (_, v) = call(
+                &state,
+                Method::POST,
+                "/v1/rerank",
+                r#"{"query": "q", "documents": ["a", "bb"]}"#,
+            )
+            .await;
+            assert!(v["results"][0].get("document").is_none(), "{v}");
+            assert_eq!(v["results"][0]["index"], 1);
         });
     }
 
@@ -753,6 +928,7 @@ mod tests {
                     gate: Some(gate_rx),
                     started: Some(started_tx),
                 },
+                false,
             );
             let post = |s: &Arc<State>| {
                 let s = s.clone();

@@ -1,10 +1,12 @@
 # Kohagi HTTP protocol (v1): `kohagi-serve`
 
 `kohagi-serve` is the same model as `kohagi`, loaded once and kept, answering
-OpenAI's `POST /v1/embeddings` instead of stdin. It exists for the caller that
-wants one model per host rather than one per process: a Rails cluster whose
-every Puma worker would otherwise hold its own copy, or a sidecar next to an
-application in another container.
+OpenAI's `POST /v1/embeddings` instead of stdin; started with
+`--rerank-model-id`, it is the same cross-encoder as `kohagi-rerank` too,
+behind `POST /v1/rerank` in the shape Cohere and Jina gave that call. It
+exists for the caller that wants one model per host rather than one per
+process: a Rails cluster whose every Puma worker would otherwise hold its own
+copy, or a sidecar next to an application in another container.
 
 The stdio protocol ([PROTOCOL.md](PROTOCOL.md)) stays the contract for
 batches. It streams a corpus with flat memory, which a request cannot, and it
@@ -18,6 +20,7 @@ its vectors and the exit codes at load are the CLI's.
 kohagi-serve --prefix "検索クエリ: "                            # http://127.0.0.1:8080
 kohagi-serve --listen unix:///run/kohagi.sock --device metal
 kohagi-serve --listen 0.0.0.0:8080 --model-path m/model.safetensors --tokenizer-path m/tokenizer.json
+kohagi-serve --rerank-model-id cl-nagoya/ruri-v3-reranker-310m       # /v1/rerank as well
 ```
 
 Every model flag of `kohagi` is taken as it is (`--model-id`, `--model-path`,
@@ -32,27 +35,35 @@ a model that is not there. Once listening it writes one line to stderr:
 
 ```
 kohagi-serve: listening on http://127.0.0.1:8080 model=cl-nagoya/ruri-v3-130m sha256=1c342581efc2 pooling=mean dim=512 max_seq=512
+kohagi-serve: reranker=cl-nagoya/ruri-v3-reranker-310m sha256=9f747a085a0a pooling=cls dim=768 max_seq=512 score=sigmoid
 ```
+
+The second line appears when a reranker was loaded.
 
 It then runs until SIGTERM or SIGINT, stops accepting, lets open connections
 finish the reply in flight (up to `--shutdown-timeout`, 30s), writes one
 summary line, and exits 0:
 
 ```
-kohagi-serve: model=cl-nagoya/ruri-v3-130m sha256=1c342581efc2 pooling=mean dim=512 max_seq=512 requests=1204 in=1310 truncated=2 rejected=3 failed=0
+kohagi-serve: model=cl-nagoya/ruri-v3-130m sha256=1c342581efc2 pooling=mean dim=512 max_seq=512 requests=1204 in=1310 truncated=2 scored=480 rejected=3 failed=0
 ```
 
 `requests` counts everything that arrived; `rejected` the 4xx among them
 (the client's mistake) and `failed` the 5xx (this side's, a full queue
-included). `in` and `truncated` are the stdio summary's, over the requests
-that were answered: texts embedded, and how many of them ran past
-`--max-seq-length`. A request is answered whole or not at all, so there is
-no `out`. Read the line as `key=value` pairs; later versions may add fields.
+included). `in` is the texts embedded and `scored` the documents reranked,
+over the requests that were answered; `truncated` counts the texts and the
+pairs that ran past their model's length. A request is answered whole or not
+at all, so there is no `out`. Read the line as `key=value` pairs; later
+versions may add fields.
 
 | flag | default | meaning |
 |---|---|---|
 | `--listen` | `127.0.0.1:8080` | `host:port`, or `unix:///path` (see below) |
-| `--max-inputs` | 2048 | the most `input` items one request may carry (OpenAI's own limit) |
+| `--rerank-model-id` | none | a reranker repo to load as well, which turns `/v1/rerank` on: `cl-nagoya/ruri-v3-reranker-310m`, or any ModernBERT sequence-classification checkpoint with one label |
+| `--rerank-model-path`, `--rerank-tokenizer-path` | none | the reranker from local files instead; also turns `/v1/rerank` on |
+| `--rerank-max-seq-length` | 512 | token-level truncation for a query/document pair; the longer half is trimmed first |
+| `--rerank-coreml-dir`, `--rerank-coreml-model-id` | none | the reranker's converted bundle under `--device coreml`; omitted, the checkpoint is converted on first use |
+| `--max-inputs` | 2048 | the most `input` items (or `documents`) one request may carry (OpenAI's own limit) |
 | `--max-body-bytes` | 32 MiB | the longest request body read; longer is 413 |
 | `--max-queue` | 64 | requests allowed to wait for the model (1 or more); one more is 503 |
 | `--shutdown-timeout` | 30 | seconds to let open connections finish after a stop signal |
@@ -104,6 +115,53 @@ vec = reply.dig("data", 0, "embedding").unpack("e*")          # Ruby
 vec = np.frombuffer(base64.b64decode(item["embedding"]), dtype="<f4")  # Python
 ```
 
+## `POST /v1/rerank`
+
+Answered only when the server was started with `--rerank-model-id` (or
+`--rerank-model-path`); otherwise 404, with the flag named. The reranker runs
+on the same `--device` at the same `--precision` as the embedder, on a thread
+of its own, so embedding and reranking do not wait for each other.
+
+```json
+{"query": "Rubyで配列を並べ替えるには",
+ "documents": ["配列の並べ替えには sort と sort_by がある。", "今日の天気は晴れです。", {"text": "Ruby の Array#sort は比較ブロックを取る。"}],
+ "top_n": 2,
+ "return_documents": true}
+```
+
+| field | type | notes |
+|---|---|---|
+| `query` | string | Not empty. Taken raw: `--prefix` is for embedding, and a cross-encoder takes the pair as it is. |
+| `documents` | array of strings, or of `{"text": …}` objects | Not empty, none of them empty; at most `--max-inputs`. Both spellings are accepted, as Cohere accepts both. |
+| `top_n` | integer | Return only the best `top_n`; omitted returns them all. `0` is refused. |
+| `return_documents` | bool, default `false` | Put each document's text in its result, so the caller need not look it up by index. |
+| `model` | string | **Ignored**, as for embeddings; the reply names what was loaded. |
+
+The reply is the shape Cohere's and Jina's `/v1/rerank` share, which TEI and
+vLLM follow as well:
+
+```json
+{"model": "cl-nagoya/ruri-v3-reranker-310m",
+ "results": [{"index": 2, "relevance_score": 0.9495417, "document": {"text": "Ruby の Array#sort は比較ブロックを取る。"}},
+             {"index": 0, "relevance_score": 0.6369629, "document": {"text": "配列の並べ替えには sort と sort_by がある。"}}],
+ "usage": {"total_tokens": 60}}
+```
+
+- `results` is best first, cut to `top_n`; equal scores keep their input
+  order. `index` is the position in `documents`.
+- `relevance_score` is the sigmoid of the model's logit, the number
+  `sentence_transformers.CrossEncoder.predict` returns and the one
+  `kohagi-rerank` writes by default, so thresholds carry over unchanged. The
+  same pair gets the same score on either.
+- `document` is present only with `return_documents`.
+- `usage.total_tokens` counts every pair the model saw, the ones `top_n`
+  dropped included.
+
+A cross-encoder scores every pair with a forward pass, so this costs what
+`kohagi-rerank` costs: about 2 seconds for 20 documents of 40 tokens on an M2
+CPU. Keep the candidate list short (see docs/reranking.md), and put the
+reranker on the ANE or a GPU when there is one.
+
 ## `GET /v1/models` and `GET /v1/models/{id}`
 
 ```json
@@ -117,8 +175,10 @@ vec = np.frombuffer(base64.b64decode(item["embedding"]), dtype="<f4")  # Python
 `kohagi` holds what `kohagi --print-model-info` prints (`output_dim` too, when
 `--dims` shortened the vectors). A client can check `dim` against its index's
 column and `sha256` against the digest it recorded, before it embeds anything.
-`/v1/models/{id}` returns that one object when `id` is the loaded model's
-label, and 404 otherwise.
+With a reranker loaded, `data` has a second entry for it, whose `kohagi`
+carries `score` (`sigmoid`) in place of `output_dim` and `normalized`, as
+`kohagi-rerank --print-model-info` does. `/v1/models/{id}` returns the one
+object whose `id` matches, and 404 otherwise.
 
 ## `GET /health`
 
@@ -137,8 +197,8 @@ exception from:
 
 | status | when |
 |---|---|
-| 400 | the body is not JSON, or not an embeddings request; `input`, `encoding_format` or `dimensions` failed a check above (`param` names which) |
-| 404 | no such path; `/v1/models/{id}` for a model that is not the loaded one |
+| 400 | the body is not JSON, or not an embeddings (or rerank) request; `input`, `encoding_format`, `dimensions`, `query`, `documents` or `top_n` failed a check above (`param` names which) |
+| 404 | no such path; `/v1/models/{id}` for a model that is not loaded; `/v1/rerank` when no reranker was loaded |
 | 405 | wrong method for a known path (`Allow` says which) |
 | 413 | the body is longer than `--max-body-bytes`, by `Content-Length` or as read |
 | 503 | `--max-queue` requests are already waiting; `Retry-After: 1` |
@@ -146,11 +206,14 @@ exception from:
 
 ## One request at a time
 
-The model answers requests one after another. A forward pass already uses
+A model answers requests one after another. A forward pass already uses
 every physical core (or the whole GPU), so nothing is gained by running two at
 once, and a request that arrives while another is answered waits in a queue
 of `--max-queue`. A request that finds the queue full is refused at once with
-503 rather than queued behind it; the client decides whether to retry.
+503 rather than queued behind it; the client decides whether to retry. The
+embedder and the reranker each have a thread and a queue of their own, so a
+long rerank does not hold up a query's embedding; on a CPU the two do share
+the cores.
 
 One request's cost is the forward pass for its texts; the HTTP around it is
 small. For a 20-token query on an M2 CPU, one request takes 36 ms median over

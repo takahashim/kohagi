@@ -18,6 +18,15 @@
   `--max-queue` are waiting; and prints one summary line on SIGTERM or
   SIGINT. HTTP/1.1, no TLS, no authentication. See PROTOCOL-http.md.
 
+- **`kohagi-serve --rerank-model-id`: the reranker over HTTP.** Loads the
+  cross-encoder beside the embedder, on a thread of its own, and answers
+  `POST /v1/rerank` in the shape Cohere and Jina share (`query`, `documents`
+  as strings or `{"text"}` objects, `top_n`, `return_documents`; results best
+  first with `index` and `relevance_score`). The scores are the sigmoid
+  `kohagi-rerank` writes, identical for the same pair. `GET /v1/models` lists
+  both models, and the summary line gains `scored=`. Without the flag,
+  `/v1/rerank` is 404 and says which flag turns it on.
+
 ### Changed
 
 - **`--print-model-info` reports `normalized`.** Whether each vector is unit
