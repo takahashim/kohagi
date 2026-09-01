@@ -162,36 +162,6 @@ fn remove_stale_socket(path: &std::path::Path) -> Result<()> {
     }
 }
 
-/// Completes on SIGTERM or SIGINT (Ctrl-C), which is how a supervisor and a
-/// terminal each ask for a stop. On Windows, on Ctrl-C, Ctrl-Break, or the
-/// console closing.
-pub(crate) async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).expect("registering a SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt()).expect("registering a SIGINT handler");
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
-        }
-    }
-    #[cfg(windows)]
-    {
-        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
-        let mut c = ctrl_c().expect("registering a Ctrl-C handler");
-        let mut b = ctrl_break().expect("registering a Ctrl-Break handler");
-        let mut close = ctrl_close().expect("registering a close handler");
-        let mut down = ctrl_shutdown().expect("registering a shutdown handler");
-        tokio::select! {
-            _ = c.recv() => {}
-            _ = b.recv() => {}
-            _ = close.recv() => {}
-            _ = down.recv() => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

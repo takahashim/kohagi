@@ -8,21 +8,22 @@
 //! model, its flags and the exit codes at load are the CLI's; the HTTP
 //! envelope is written down in PROTOCOL-http.md.
 //!
-//! One thread owns the model (see `worker`), and a current-thread tokio
-//! runtime reads requests and writes replies. A handler hands the worker a
-//! batch of texts and waits for the vectors; nothing else touches the model.
+//! One thread owns the model (`worker`); a current-thread tokio runtime
+//! accepts connections (`server`) and answers requests (`http`), which are
+//! checked and written in OpenAI's shapes (`openai`). A handler hands the
+//! worker a batch of texts and waits for the vectors; nothing else touches
+//! the model.
 
 mod http;
 mod listen;
 mod openai;
+mod server;
 mod worker;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::watch;
-use tokio::task::JoinSet;
 
 use crate::program::remark;
 use crate::{Embedder, ModelInfo, TokenInfo};
@@ -38,15 +39,12 @@ pub struct Config {
     pub label: String,
     /// Prepended to every input text, as the CLI's `--prefix` is.
     pub prefix: String,
-    /// Whether the embedder normalizes its output, which decides whether a
-    /// request's `dimensions` can be honoured (truncation re-normalizes).
-    pub normalize: bool,
     /// The most `input` items one request may carry.
     pub max_inputs: usize,
     /// The largest request body read; anything longer is refused with 413.
     pub max_body_bytes: usize,
-    /// Requests allowed to wait for the model; beyond that a request is
-    /// answered 503 at once rather than queued.
+    /// Requests allowed to wait for the model, at least 1; beyond that a
+    /// request is answered 503 at once rather than queued.
     pub max_queue: usize,
     /// How long to let open connections finish after a stop signal.
     pub shutdown_timeout: Duration,
@@ -81,7 +79,7 @@ pub fn run<E: Engine>(
     config: Config,
     load: impl FnOnce() -> Result<E> + Send + 'static,
 ) -> Result<()> {
-    let (handle, info, mut alive) = worker::spawn(load, config.max_queue)?;
+    let (handle, info, alive) = worker::spawn(load, config.max_queue)?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -89,60 +87,58 @@ pub fn run<E: Engine>(
         .context("starting the async runtime")?;
 
     runtime.block_on(async move {
-        let bound = listen::Bound::bind(&config.listen).await?;
+        let state = Arc::new(http::State::new(&config, info, handle));
+        let mut server = server::Server::start(&config.listen, state.clone()).await?;
         remark!(
             "listening on {} model={} {}",
-            bound.describe(),
-            config.label,
-            info.summary_facts()
+            server.describe(),
+            state.label(),
+            state.info().summary_facts()
         );
 
-        let state = Arc::new(http::State::new(&config, info.clone(), handle));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut connections = JoinSet::new();
-        let mut signal = std::pin::pin!(listen::shutdown_signal());
-
-        let outcome = loop {
-            tokio::select! {
-                biased;
-                _ = &mut signal => break Ok(()),
-                _ = &mut alive => {
-                    break Err(anyhow::anyhow!("the model thread exited; nothing can answer"));
-                }
-                accepted = bound.accept() => match accepted {
-                    Ok(io) => {
-                        connections.spawn(http::serve_connection(io, state.clone(), shutdown_rx.clone()));
-                    }
-                    Err(e) => {
-                        // Out of descriptors, or a connection that went away
-                        // between arriving and being accepted. Neither is a
-                        // reason to stop; a pause keeps a persistent one from
-                        // spinning.
-                        remark!("accept failed: {e}");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                },
-            }
-        };
-
-        // Stop accepting, let open connections finish what they are answering,
-        // and abandon whatever is still open after the timeout.
-        let _ = shutdown_tx.send(true);
-        let drained = tokio::time::timeout(config.shutdown_timeout, async {
-            while connections.join_next().await.is_some() {}
-        })
-        .await;
-        if drained.is_err() {
-            remark!(
-                "{} connections still open after {:?}; closing them",
-                connections.len(),
-                config.shutdown_timeout
-            );
-            connections.abort_all();
-        }
-
-        state.summarize(&config.label, &info);
-        drop(bound);
+        let outcome = server.serve_until(stop_reason(alive)).await;
+        server.stop(config.shutdown_timeout).await;
+        state.summarize();
         outcome
     })
+}
+
+/// Why the server stops: a signal asked it to (`Ok`), or the model thread
+/// died and nothing can answer (`Err`).
+async fn stop_reason(alive: worker::Alive) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = shutdown_signal() => Ok(()),
+        _ = alive => Err(anyhow::anyhow!("the model thread exited; nothing can answer")),
+    }
+}
+
+/// Completes on SIGTERM or SIGINT (Ctrl-C), which is how a supervisor and a
+/// terminal each ask for a stop. On Windows, on Ctrl-C, Ctrl-Break, or the
+/// console closing.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("registering a SIGTERM handler");
+        let mut int = signal(SignalKind::interrupt()).expect("registering a SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+        let mut c = ctrl_c().expect("registering a Ctrl-C handler");
+        let mut b = ctrl_break().expect("registering a Ctrl-Break handler");
+        let mut close = ctrl_close().expect("registering a close handler");
+        let mut down = ctrl_shutdown().expect("registering a shutdown handler");
+        tokio::select! {
+            _ = c.recv() => {}
+            _ = b.recv() => {}
+            _ = close.recv() => {}
+            _ = down.recv() => {}
+        }
+    }
 }

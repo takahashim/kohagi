@@ -126,7 +126,7 @@ struct Args {
     /// request at a time (one forward pass uses every core); a request that
     /// finds this many already waiting is refused with 503 and Retry-After
     /// rather than queued behind them.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     max_queue: usize,
     /// After SIGTERM or SIGINT, how long to let open connections finish the
     /// reply in flight before closing them.
@@ -175,7 +175,6 @@ fn run(args: Args) -> anyhow::Result<()> {
         listen: args.listen.clone(),
         label,
         prefix: args.prefix.clone(),
-        normalize: !args.no_normalize,
         max_inputs: args.max_inputs,
         max_body_bytes: args.max_body_bytes,
         max_queue: args.max_queue,

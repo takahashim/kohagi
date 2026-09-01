@@ -39,20 +39,22 @@ finish the reply in flight (up to `--shutdown-timeout`, 30s), writes one
 summary line, and exits 0:
 
 ```
-kohagi-serve: model=cl-nagoya/ruri-v3-130m sha256=1c342581efc2 pooling=mean dim=512 max_seq=512 requests=1204 in=1310 out=1310 truncated=2 rejected=3
+kohagi-serve: model=cl-nagoya/ruri-v3-130m sha256=1c342581efc2 pooling=mean dim=512 max_seq=512 requests=1204 in=1310 truncated=2 rejected=3 failed=0
 ```
 
-`in` and `out` are the stdio summary's: input texts received and vectors
-returned. `requests` counts everything that arrived, `rejected` the 4xx and
-5xx among them. Read the line as `key=value` pairs; later versions may add
-fields.
+`requests` counts everything that arrived; `rejected` the 4xx among them
+(the client's mistake) and `failed` the 5xx (this side's, a full queue
+included). `in` and `truncated` are the stdio summary's, over the requests
+that were answered: texts embedded, and how many of them ran past
+`--max-seq-length`. A request is answered whole or not at all, so there is
+no `out`. Read the line as `key=value` pairs; later versions may add fields.
 
 | flag | default | meaning |
 |---|---|---|
 | `--listen` | `127.0.0.1:8080` | `host:port`, or `unix:///path` (see below) |
 | `--max-inputs` | 2048 | the most `input` items one request may carry (OpenAI's own limit) |
 | `--max-body-bytes` | 32 MiB | the longest request body read; longer is 413 |
-| `--max-queue` | 64 | requests allowed to wait for the model; one more is 503 |
+| `--max-queue` | 64 | requests allowed to wait for the model (1 or more); one more is 503 |
 | `--shutdown-timeout` | 30 | seconds to let open connections finish after a stop signal |
 
 ## `POST /v1/embeddings`

@@ -1,5 +1,6 @@
-//! Routes and handlers. `handle` never fails: every outcome, a refusal
-//! included, is a reply, and the connection stays usable for the next one.
+//! Routes and handlers, and what a refusal is on the wire: which status,
+//! which headers. `handle` never fails: every outcome, a refusal included, is
+//! a reply, and the connection stays usable for the next one.
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -15,8 +16,8 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::sync::watch;
 
 use super::listen::Io;
-use super::openai::{self, ApiError, Limits};
-use super::worker::{EmbedError, Handle};
+use super::openai::{self, Refusal};
+use super::worker::{Batch, EmbedError, Handle};
 use super::Config;
 use crate::program::remark;
 use crate::ModelInfo;
@@ -27,23 +28,10 @@ pub(crate) struct State {
     label: String,
     prefix: String,
     info: ModelInfo,
-    limits: Limits,
+    max_inputs: usize,
     max_body_bytes: usize,
     worker: Handle,
     counts: Counts,
-}
-
-/// The summary's numbers. `requests` counts everything that arrived,
-/// `rejected` the 4xx and 5xx among them; `inputs`, `outputs` and `truncated`
-/// are the stdio summary's `in`, `out` and `truncated` for the embedding
-/// requests that were answered.
-#[derive(Default)]
-struct Counts {
-    requests: AtomicUsize,
-    rejected: AtomicUsize,
-    inputs: AtomicUsize,
-    outputs: AtomicUsize,
-    truncated: AtomicUsize,
 }
 
 impl State {
@@ -51,35 +39,176 @@ impl State {
         Self {
             label: config.label.clone(),
             prefix: config.prefix.clone(),
-            limits: Limits {
-                max_inputs: config.max_inputs,
-                output_dim: info.reported_dim(),
-                normalize: config.normalize,
-            },
-            max_body_bytes: config.max_body_bytes,
             info,
+            max_inputs: config.max_inputs,
+            max_body_bytes: config.max_body_bytes,
             worker,
             counts: Counts::default(),
         }
     }
 
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn info(&self) -> &ModelInfo {
+        &self.info
+    }
+
     /// The run's one summary line, on stderr at shutdown, reading like the
     /// CLI's: which weights answered, and how much they answered.
-    pub(crate) fn summarize(&self, label: &str, info: &ModelInfo) {
+    pub(crate) fn summarize(&self) {
         let c = &self.counts;
         remark!(
-            "model={label} {} requests={} in={} out={} truncated={} rejected={}",
-            info.summary_facts(),
+            "model={} {} requests={} in={} truncated={} rejected={} failed={}",
+            self.label,
+            self.info.summary_facts(),
             c.requests.load(Relaxed),
             c.inputs.load(Relaxed),
-            c.outputs.load(Relaxed),
             c.truncated.load(Relaxed),
-            c.rejected.load(Relaxed)
+            c.rejected.load(Relaxed),
+            c.failed.load(Relaxed)
         );
     }
 }
 
+/// The summary's numbers. `requests` counts everything that arrived;
+/// `rejected` the 4xx among them (the client's mistake) and `failed` the 5xx
+/// (this side's). `inputs` and `truncated` are the stdio summary's `in` and
+/// `truncated`, over the requests that were answered; a request is answered
+/// whole or not at all, so there is no separate `out`.
+#[derive(Default)]
+struct Counts {
+    requests: AtomicUsize,
+    rejected: AtomicUsize,
+    failed: AtomicUsize,
+    inputs: AtomicUsize,
+    truncated: AtomicUsize,
+}
+
+impl Counts {
+    fn saw(&self, status: StatusCode) {
+        self.requests.fetch_add(1, Relaxed);
+        if status.is_client_error() {
+            self.rejected.fetch_add(1, Relaxed);
+        } else if status.is_server_error() {
+            self.failed.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn answered(&self, batch: &Batch) {
+        self.inputs.fetch_add(batch.vectors.len(), Relaxed);
+        self.truncated
+            .fetch_add(batch.tokens.iter().filter(|t| t.truncated).count(), Relaxed);
+    }
+}
+
 type Reply = Response<Full<Bytes>>;
+
+/// A refusal on the wire: the status, the one header the status calls for
+/// (`Allow` for 405, `Retry-After` for 503), and OpenAI's error object.
+#[derive(Debug)]
+pub(crate) struct ApiError {
+    status: StatusCode,
+    header: Option<(&'static str, &'static str)>,
+    kind: &'static str,
+    param: Option<&'static str>,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, kind: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            header: None,
+            kind,
+            param: None,
+            message: message.into(),
+        }
+    }
+
+    fn invalid(param: Option<&'static str>, message: impl Into<String>) -> Self {
+        Self {
+            param,
+            ..Self::new(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "invalid_request_error", message)
+    }
+
+    fn method_not_allowed(allow: &'static str) -> Self {
+        Self {
+            header: Some(("allow", allow)),
+            ..Self::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "invalid_request_error",
+                format!("this path takes {allow}"),
+            )
+        }
+    }
+
+    fn too_large(limit: usize) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            format!(
+                "the request body is longer than this server reads ({limit} bytes, \
+                 --max-body-bytes); send fewer texts per request"
+            ),
+        )
+    }
+
+    fn busy() -> Self {
+        Self {
+            header: Some(("retry-after", "1")),
+            ..Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "the model's queue is full (--max-queue); retry shortly",
+            )
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", message)
+    }
+
+    fn reply(&self) -> Reply {
+        let mut builder = Response::builder()
+            .status(self.status)
+            .header(CONTENT_TYPE, "application/json");
+        if let Some((name, value)) = self.header {
+            builder = builder.header(name, value);
+        }
+        builder
+            .body(Full::new(Bytes::from(openai::error_body(
+                &self.message,
+                self.kind,
+                self.param,
+            ))))
+            .expect("a status and fixed headers make a valid response")
+    }
+}
+
+impl From<Refusal> for ApiError {
+    fn from(r: Refusal) -> Self {
+        Self::invalid(r.param, r.message)
+    }
+}
+
+impl From<EmbedError> for ApiError {
+    fn from(e: EmbedError) -> Self {
+        match e {
+            EmbedError::Busy => Self::busy(),
+            EmbedError::Gone => {
+                Self::internal("the model thread is gone; this server is shutting down")
+            }
+            EmbedError::Failed(e) => Self::internal(format!("embedding failed: {e:#}")),
+        }
+    }
+}
 
 /// Answer one request. Generic over the body so tests can hand it one they
 /// built; the server hands it hyper's.
@@ -88,14 +217,11 @@ where
     B: Body,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    state.counts.requests.fetch_add(1, Relaxed);
     let reply = match route(req, &state).await {
         Ok(reply) => reply,
-        Err(e) => reply_error(&e),
+        Err(e) => e.reply(),
     };
-    if reply.status().is_client_error() || reply.status().is_server_error() {
-        state.counts.rejected.fetch_add(1, Relaxed);
-    }
+    state.counts.saw(reply.status());
     reply
 }
 
@@ -145,38 +271,13 @@ where
     let request: openai::EmbeddingsRequest = serde_json::from_slice(&body).map_err(|e| {
         ApiError::invalid(None, format!("the body is not an embeddings request: {e}"))
     })?;
-    let validated = openai::validate(request, &state.limits)?;
+    let request = openai::validate(request, state.max_inputs, &state.info)?.prefixed(&state.prefix);
 
-    let n = validated.texts.len();
-    let texts = if state.prefix.is_empty() {
-        validated.texts
-    } else {
-        validated
-            .texts
-            .into_iter()
-            .map(|t| format!("{}{t}", state.prefix))
-            .collect()
-    };
-
-    let mut batch = state.worker.embed(texts).await.map_err(|e| match e {
-        EmbedError::Busy => ApiError::busy(),
-        EmbedError::Gone => {
-            ApiError::internal("the model thread is gone; this server is shutting down")
-        }
-        EmbedError::Failed(e) => {
-            remark!("error: {e:#}");
-            ApiError::internal(format!("embedding failed: {e:#}"))
-        }
-    })?;
-    if let Some(n) = validated.dimensions {
-        openai::truncate(&mut batch.vectors, n);
+    let mut batch = state.worker.embed(request.texts).await?;
+    if let Some(dims) = request.dimensions {
+        openai::truncate(&mut batch.vectors, dims);
     }
-
-    let c = &state.counts;
-    c.inputs.fetch_add(n, Relaxed);
-    c.outputs.fetch_add(batch.vectors.len(), Relaxed);
-    c.truncated
-        .fetch_add(batch.tokens.iter().filter(|t| t.truncated).count(), Relaxed);
+    state.counts.answered(&batch);
 
     Ok(json(
         StatusCode::OK,
@@ -184,7 +285,7 @@ where
             &state.label,
             &batch.vectors,
             &batch.tokens,
-            validated.encoding,
+            request.encoding,
         ),
     ))
 }
@@ -220,18 +321,6 @@ fn json(status: StatusCode, body: Vec<u8>) -> Reply {
         .header(CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body)))
         .expect("a status and one header make a valid response")
-}
-
-fn reply_error(e: &ApiError) -> Reply {
-    let mut builder = Response::builder()
-        .status(e.status)
-        .header(CONTENT_TYPE, "application/json");
-    if let Some((name, value)) = e.header {
-        builder = builder.header(name, value);
-    }
-    builder
-        .body(Full::new(Bytes::from(e.body())))
-        .expect("a status and fixed headers make a valid response")
 }
 
 /// One connection, for as many requests as the client sends on it. Told to
@@ -362,7 +451,6 @@ mod tests {
             listen: Listen::default(),
             label: "stub/model".to_string(),
             prefix: String::new(),
-            normalize: true,
             max_inputs: 4,
             max_body_bytes: 1024,
             max_queue: 1,
@@ -443,6 +531,7 @@ mod tests {
                 serde_json::json!([0.0, 1.0, 0.0, 0.0])
             );
             assert_eq!(v["usage"]["prompt_tokens"], 5);
+            assert_eq!(state.counts.inputs.load(Relaxed), 2);
         });
     }
 
@@ -587,11 +676,26 @@ mod tests {
                 assert_eq!(got, status, "{method} {path} {body}");
                 let message = v["error"]["message"].as_str().unwrap();
                 assert!(message.contains(says), "{method} {path}: {message}");
+                assert_eq!(v["error"]["type"], "invalid_request_error");
             }
-            // Nothing in that list embedded anything.
-            assert_eq!(state.counts.outputs.load(Relaxed), 0);
+            // Every one of those was the client's mistake, and none embedded
+            // anything.
+            assert_eq!(state.counts.requests.load(Relaxed), 8);
             assert_eq!(state.counts.rejected.load(Relaxed), 8);
+            assert_eq!(state.counts.failed.load(Relaxed), 0);
+            assert_eq!(state.counts.inputs.load(Relaxed), 0);
         });
+    }
+
+    #[test]
+    fn a_refusal_carries_the_header_its_status_calls_for() {
+        let busy = ApiError::busy().reply();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers()["retry-after"], "1");
+        let wrong = ApiError::method_not_allowed("POST").reply();
+        assert_eq!(wrong.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(wrong.headers()["allow"], "POST");
+        assert_eq!(wrong.headers()[CONTENT_TYPE], "application/json");
     }
 
     #[test]
@@ -624,6 +728,7 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(v["data"][0]["id"], "stub/model");
             assert_eq!(v["data"][0]["kohagi"]["dim"], 4);
+            assert_eq!(v["data"][0]["kohagi"]["normalized"], true);
             assert_eq!(v["data"][0]["kohagi"]["sha256"], "ab".repeat(32));
 
             let (status, v) = call(&state, Method::GET, "/v1/models/stub/model", "").await;
@@ -675,6 +780,9 @@ mod tests {
             gate_tx.send(()).unwrap();
             assert_eq!(a.await.unwrap(), StatusCode::OK);
             assert_eq!(b.await.unwrap(), StatusCode::OK);
+            // A 503 is this side's, not the client's.
+            assert_eq!(state.counts.failed.load(Relaxed), 1);
+            assert_eq!(state.counts.rejected.load(Relaxed), 0);
         });
     }
 

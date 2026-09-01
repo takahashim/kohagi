@@ -14,6 +14,7 @@ use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, oneshot};
 
 use super::Engine;
+use crate::program::remark;
 use crate::{ModelInfo, TokenInfo};
 
 /// One request's worth of vectors, in input order.
@@ -71,11 +72,12 @@ pub(crate) type Alive = oneshot::Receiver<()>;
 /// Start the model thread and wait for it to load. Returns the handle the
 /// handlers use, the loaded model's facts, and the liveness signal. A load
 /// error comes back here, so the caller can map it to the CLI's exit codes.
+/// `queue` is how many jobs may wait, at least 1; the flag enforces that.
 pub(crate) fn spawn<E: Engine>(
     load: impl FnOnce() -> Result<E> + Send + 'static,
     queue: usize,
 ) -> Result<(Handle, ModelInfo, Alive)> {
-    let (queue_tx, mut queue_rx) = mpsc::channel::<Job>(queue.max(1));
+    let (queue_tx, mut queue_rx) = mpsc::channel::<Job>(queue);
     let (loaded_tx, loaded_rx) = std::sync::mpsc::channel::<Result<ModelInfo>>();
     let (alive_tx, alive_rx) = oneshot::channel::<()>();
 
@@ -95,6 +97,11 @@ pub(crate) fn spawn<E: Engine>(
             };
             while let Some(job) = queue_rx.blocking_recv() {
                 let result = run_job(&engine, &job.texts);
+                // Logged here, where it happened, once; the reply carries it
+                // to the client as well.
+                if let Err(e) = &result {
+                    remark!("error: {e:#}");
+                }
                 // A caller that gave up meanwhile (client disconnected) has
                 // dropped its end; that is not an error here.
                 let _ = job.reply.send(result);
