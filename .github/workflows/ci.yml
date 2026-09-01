@@ -110,12 +110,23 @@ jobs:
         run: |
           : | ./target/${{ matrix.target }}/release/kohagi --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
           : | ./target/${{ matrix.target }}/release/kohagi-rerank --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
+      # The server is the other way round: it loads before it listens, so a
+      # missing model is a failed start, exit 1, and never a port left open.
+      - name: Smoke-test that the server refuses to start without a model (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set +e
+          ./target/${{ matrix.target }}/release/kohagi-serve --listen 127.0.0.1:0 --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
+          code=$?
+          set -e
+          test "$code" -eq 1
       # This runner has the CUDA Toolkit but no NVIDIA driver.  A CUDA-linked
       # executable therefore cannot be launched here, even with empty stdin;
       # the Windows job above deliberately validates compilation only.
       #
-      # `kohagi` and `kohagi-rerank` ship together: retrieval and reranking are
-      # two halves of one pipeline, and a caller that has one wants the other.
+      # `kohagi`, `kohagi-rerank` and `kohagi-serve` ship together: retrieval
+      # and reranking are two halves of one pipeline, and the server is the
+      # same model behind HTTP for callers that keep one per host.
       # `coreml-convert` does not — it needs `--features coreml-export`, so only
       # the macOS target builds it at all, and shipping it there alone would
       # make one platform's archive hold something the others' cannot.
@@ -123,7 +134,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir dist
-          tar -czf dist/kohagi-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release kohagi kohagi-rerank
+          tar -czf dist/kohagi-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release kohagi kohagi-rerank kohagi-serve
           cd dist && shasum -a 256 *.tar.gz > kohagi-${{ matrix.target }}.sha256
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -133,7 +144,8 @@ jobs:
           $archive = "kohagi-${{ matrix.target }}.zip"
           $binaries = @(
             ".\\target\\${{ matrix.target }}\\release\\kohagi.exe",
-            ".\\target\\${{ matrix.target }}\\release\\kohagi-rerank.exe"
+            ".\\target\\${{ matrix.target }}\\release\\kohagi-rerank.exe",
+            ".\\target\\${{ matrix.target }}\\release\\kohagi-serve.exe"
           )
           Compress-Archive -Path $binaries -DestinationPath ".\\dist\\$archive"
           $hash = (Get-FileHash ".\\dist\\$archive" -Algorithm SHA256).Hash.ToLower()
