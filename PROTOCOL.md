@@ -195,6 +195,10 @@ replaces the JSONL stream with one response object for the whole run:
  "usage": {"prompt_tokens": 15, "total_tokens": 15}}
 ```
 
+This is also the reply `kohagi-serve` gives over HTTP, where it is the
+protocol rather than an alternate format; see
+[PROTOCOL-http.md](PROTOCOL-http.md).
+
 Everything on stdin is unchanged; the input is still this protocol's JSONL.
 What changes on stdout:
 
