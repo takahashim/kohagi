@@ -19,7 +19,6 @@ use super::openai::{self, ApiError, Limits};
 use super::worker::{EmbedError, Handle};
 use super::Config;
 use crate::program::remark;
-use crate::protocol::summary_facts;
 use crate::ModelInfo;
 
 /// Everything a handler reads: the model's facts and its queue, the limits,
@@ -70,7 +69,7 @@ impl State {
         let c = &self.counts;
         remark!(
             "model={label} {} requests={} in={} out={} truncated={} rejected={}",
-            summary_facts(info),
+            info.summary_facts(),
             c.requests.load(Relaxed),
             c.inputs.load(Relaxed),
             c.outputs.load(Relaxed),
@@ -317,7 +316,10 @@ mod tests {
                 dim: 4,
                 max_seq_length: 8,
                 declared_max_seq_length: None,
-                output: Output::Embedding { output_dim: None },
+                output: Output::Embedding {
+                    output_dim: None,
+                    normalized: true,
+                },
             }
         }
 

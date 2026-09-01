@@ -18,6 +18,14 @@
   `--max-queue` are waiting; and prints one summary line on SIGTERM or
   SIGINT. HTTP/1.1, no TLS, no authentication. See PROTOCOL-http.md.
 
+### Changed
+
+- **`--print-model-info` reports `normalized`.** Whether each vector is unit
+  length (`true` unless `--no-normalize`), beside `pooling` and `dim`, since it
+  changes every vector as surely as they do and a results file could not say.
+  `kohagi-serve` reads the same field to decide whether a request's
+  `dimensions` can be honoured.
+
 ### Removed
 
 - **`examples/openai_proxy/`.** The Python, Ruby and TypeScript proxies were

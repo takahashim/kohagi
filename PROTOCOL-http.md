@@ -108,7 +108,8 @@ vec = np.frombuffer(base64.b64decode(item["embedding"]), dtype="<f4")  # Python
 {"object": "list",
  "data": [{"id": "cl-nagoya/ruri-v3-130m", "object": "model", "owned_by": "kohagi",
            "kohagi": {"backend": "cpu", "precision": "f32", "sha256": "1c342581…",
-                      "pooling": "mean", "dim": 512, "max_seq_length": 512, "declared_max_seq_length": 8192}}]}
+                      "pooling": "mean", "dim": 512, "max_seq_length": 512, "declared_max_seq_length": 8192,
+                      "normalized": true}}]}
 ```
 
 `kohagi` holds what `kohagi --print-model-info` prints (`output_dim` too, when

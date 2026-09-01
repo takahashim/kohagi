@@ -12,7 +12,7 @@ use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::batch::l2_normalize;
+use crate::batch::{truncate_renormalize, truncation};
 use crate::{ModelInfo, TokenInfo};
 
 /// `POST /v1/embeddings`, as sent. `input` is taken as a JSON value so that
@@ -80,17 +80,15 @@ pub(crate) fn validate(req: EmbeddingsRequest, limits: &Limits) -> Result<Valida
         }
         Some(n) => {
             let n = usize::try_from(n).unwrap_or(usize::MAX);
-            if n == 0 || n > limits.output_dim {
-                return Err(ApiError::invalid(
+            truncation(n, limits.output_dim).map_err(|e| {
+                ApiError::invalid(
                     Some("dimensions"),
                     format!(
-                        "`dimensions` must be in 1..={}; this server's vectors have {} dimensions",
-                        limits.output_dim, limits.output_dim
+                        "`dimensions` {e}; this server's vectors have {} dimensions",
+                        limits.output_dim
                     ),
-                ));
-            }
-            // Equal to the model's own changes no vector, so it is no request.
-            (n < limits.output_dim).then_some(n)
+                )
+            })?
         }
     };
 
@@ -162,13 +160,11 @@ fn texts_of(input: Value, max_inputs: usize) -> Result<Vec<String>, ApiError> {
     Ok(texts)
 }
 
-/// Matryoshka truncation for one request, as `--dims` does it for a run: keep
-/// the leading `n` and re-normalize, so dot = cosine holds on the shorter
-/// vectors too.
+/// Matryoshka truncation for one request, by the same definition `--dims`
+/// uses for a run.
 pub(crate) fn truncate(vectors: &mut [Vec<f32>], n: usize) {
     for v in vectors {
-        v.truncate(n);
-        l2_normalize(v);
+        truncate_renormalize(v, n);
     }
 }
 

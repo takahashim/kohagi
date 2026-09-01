@@ -91,7 +91,7 @@ exits without embedding anything, for a script to record beside its results:
 
 ```console
 $ kohagi --print-model-info
-{"model":"cl-nagoya/ruri-v3-130m","backend":"cpu","precision":"f32","sha256":"1c342581efc2…","pooling":"mean","dim":512,"max_seq_length":512}
+{"model":"cl-nagoya/ruri-v3-130m","backend":"cpu","precision":"f32","sha256":"1c342581efc2…","pooling":"mean","dim":512,"max_seq_length":512,"normalized":true}
 ```
 
 This matters as soon as there is more than one checkpoint: fine-tunes of one

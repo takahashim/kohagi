@@ -391,7 +391,10 @@ mod tests {
             dim: 512,
             max_seq_length: 512,
             declared_max_seq_length: None,
-            output: crate::Output::Embedding { output_dim: None },
+            output: crate::Output::Embedding {
+                output_dim: None,
+                normalized: true,
+            },
         }
     }
 

@@ -25,7 +25,6 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::program::remark;
-use crate::protocol::summary_facts;
 use crate::{Embedder, ModelInfo, TokenInfo};
 
 pub use listen::Listen;
@@ -95,7 +94,7 @@ pub fn run<E: Engine>(
             "listening on {} model={} {}",
             bound.describe(),
             config.label,
-            summary_facts(&info)
+            info.summary_facts()
         );
 
         let state = Arc::new(http::State::new(&config, info.clone(), handle));
