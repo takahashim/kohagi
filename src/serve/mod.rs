@@ -228,3 +228,34 @@ async fn shutdown_signal() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The other reason to stop, beside a signal: a model's thread died, and
+    /// the error names which, since that is what the operator reads.
+    #[test]
+    fn a_dead_model_thread_is_a_reason_to_stop_with_an_error() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_held, embedder) = tokio::sync::oneshot::channel::<()>();
+            let (gone, reranker) = tokio::sync::oneshot::channel::<()>();
+            drop(gone);
+            let e = stop_reason(embedder, Some(reranker))
+                .await
+                .expect_err("the reranker died");
+            assert!(e.to_string().contains("reranker"), "{e}");
+
+            let (gone, embedder) = tokio::sync::oneshot::channel::<()>();
+            drop(gone);
+            let e = stop_reason(embedder, None)
+                .await
+                .expect_err("the embedder died");
+            assert!(e.to_string().contains("embedding"), "{e}");
+        });
+    }
+}

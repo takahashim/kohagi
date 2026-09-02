@@ -781,6 +781,13 @@ mod tests {
                     "not loaded",
                 ),
                 (
+                    Method::POST,
+                    "/v1/models/stub/model",
+                    "",
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "GET, HEAD",
+                ),
+                (
                     Method::GET,
                     "/nope",
                     "",
@@ -804,8 +811,8 @@ mod tests {
             }
             // Every one of those was the client's mistake, and none embedded
             // anything.
-            assert_eq!(state.counts.requests.load(Relaxed), 9);
-            assert_eq!(state.counts.rejected.load(Relaxed), 9);
+            assert_eq!(state.counts.requests.load(Relaxed), 10);
+            assert_eq!(state.counts.rejected.load(Relaxed), 10);
             assert_eq!(state.counts.failed.load(Relaxed), 0);
             assert_eq!(state.counts.inputs.load(Relaxed), 0);
         });

@@ -198,4 +198,19 @@ mod tests {
         use clap::CommandFactory;
         Args::command().debug_assert();
     }
+
+    /// The contracts the flags promise: a queue of at least 1, reranker
+    /// files only in pairs, and the reranker off unless named.
+    #[test]
+    fn the_flags_guard_their_contracts() {
+        assert!(Args::try_parse_from(["kohagi-serve", "--max-queue", "0"]).is_err());
+        assert!(
+            Args::try_parse_from(["kohagi-serve", "--rerank-model-path", "m.safetensors"]).is_err()
+        );
+
+        let off = Args::try_parse_from(["kohagi-serve"]).unwrap();
+        assert!(!off.rerank.wanted());
+        let on = Args::try_parse_from(["kohagi-serve", "--rerank-model-id", "r"]).unwrap();
+        assert!(on.rerank.wanted());
+    }
 }

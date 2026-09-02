@@ -158,3 +158,114 @@ fn run_job<E: Engine>(engine: &E, input: E::Input) -> Result<E::Output> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Batch, Engine, Load};
+    use super::*;
+    use crate::{Output, TokenInfo};
+
+    /// Panics when told to, so the promise under test is `run_job`'s: a panic
+    /// costs the request that tripped it, not every request after it.
+    struct Fragile;
+
+    impl Engine for Fragile {
+        type Input = Vec<String>;
+        type Output = Batch;
+
+        fn info(&self) -> ModelInfo {
+            ModelInfo {
+                backend: "cpu",
+                precision: "f32",
+                sha256: None,
+                bundle: None,
+                pooling: "mean",
+                dim: 1,
+                max_seq_length: 8,
+                declared_max_seq_length: None,
+                output: Output::Embedding {
+                    output_dim: None,
+                    normalized: true,
+                },
+            }
+        }
+
+        fn answer(&self, texts: Vec<String>) -> Result<Batch> {
+            if texts.first().is_some_and(|t| t == "boom") {
+                panic!("kaboom");
+            }
+            Ok(Batch {
+                vectors: vec![vec![1.0]; texts.len()],
+                tokens: vec![
+                    TokenInfo {
+                        n_tokens: 1,
+                        truncated: false
+                    };
+                    texts.len()
+                ],
+            })
+        }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn a_panicking_forward_pass_costs_the_request_not_the_server() {
+        let spawned = spawn(
+            "test-fragile",
+            Load {
+                label: "f".to_string(),
+                load: || Ok(Fragile),
+            },
+            4,
+        )
+        .unwrap();
+        block_on(async {
+            match spawned.loaded.handle.ask(vec!["boom".to_string()]).await {
+                Err(WorkerError::Failed(e)) => {
+                    assert!(e.to_string().contains("kaboom"), "{e}");
+                }
+                _ => panic!("the panic should come back as this request's error"),
+            }
+            // The thread survived it and answers the next request.
+            let next = spawned.loaded.handle.ask(vec!["fine".to_string()]).await;
+            assert!(matches!(next, Ok(batch) if batch.vectors.len() == 1));
+        });
+    }
+
+    #[test]
+    fn a_load_error_comes_back_to_the_spawn_caller() {
+        let e = spawn(
+            "test-noload",
+            Load {
+                label: "f".to_string(),
+                load: || -> Result<Fragile> { anyhow::bail!("no such checkpoint") },
+            },
+            4,
+        )
+        .err()
+        .expect("the load failed");
+        assert!(e.to_string().contains("no such checkpoint"), "{e}");
+    }
+
+    #[test]
+    fn a_load_panic_reads_as_a_death_while_loading() {
+        let e = spawn(
+            "test-panicload",
+            Load {
+                label: "f".to_string(),
+                load: || -> Result<Fragile> { panic!("torn") },
+            },
+            4,
+        )
+        .err()
+        .expect("the load died");
+        assert!(e.to_string().contains("died while loading"), "{e}");
+    }
+}
