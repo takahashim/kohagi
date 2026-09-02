@@ -101,6 +101,7 @@ pub(crate) fn spawn<E: Engine>(
     let (alive_tx, alive_rx) = oneshot::channel::<()>();
 
     let load = model.load;
+    let label = model.label.clone();
     std::thread::Builder::new()
         .name(thread.to_string())
         .spawn(move || {
@@ -117,10 +118,11 @@ pub(crate) fn spawn<E: Engine>(
             };
             while let Some(job) = queue_rx.blocking_recv() {
                 let result = run_job(&engine, job.input);
-                // Logged here, where it happened, once; the reply carries it
-                // to the client as well.
+                // Logged here, where it happened, once, under the model's
+                // name (two are loaded); the reply carries it to the client
+                // as well.
                 if let Err(e) = &result {
-                    remark!("error: {e:#}");
+                    remark!("{label}: error: {e:#}");
                 }
                 // A caller that gave up meanwhile (client disconnected) has
                 // dropped its end; that is not an error here.

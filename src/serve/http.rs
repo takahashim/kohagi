@@ -177,19 +177,28 @@ impl ApiError {
         )
     }
 
-    fn busy() -> Self {
-        Self {
-            header: Some(("retry-after", "1")),
-            ..Self::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_error",
-                "the model's queue is full (--max-queue); retry shortly",
-            )
-        }
-    }
-
     fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", message)
+    }
+
+    /// A worker's refusal or failure, under the model's name: two models can
+    /// be loaded, and the operator should not have to guess which one this
+    /// was.
+    fn worker(e: WorkerError, label: &str) -> Self {
+        match e {
+            WorkerError::Busy => Self {
+                header: Some(("retry-after", "1")),
+                ..Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    format!("`{label}`'s queue is full (--max-queue); retry shortly"),
+                )
+            },
+            WorkerError::Gone => Self::internal(format!(
+                "`{label}`'s thread is gone; this server is shutting down"
+            )),
+            WorkerError::Failed(e) => Self::internal(format!("`{label}` failed: {e:#}")),
+        }
     }
 
     fn reply(&self) -> Reply {
@@ -212,18 +221,6 @@ impl ApiError {
 impl From<Refusal> for ApiError {
     fn from(r: Refusal) -> Self {
         Self::invalid(r.param, r.message)
-    }
-}
-
-impl From<WorkerError> for ApiError {
-    fn from(e: WorkerError) -> Self {
-        match e {
-            WorkerError::Busy => Self::busy(),
-            WorkerError::Gone => {
-                Self::internal("the model's thread is gone; this server is shutting down")
-            }
-            WorkerError::Failed(e) => Self::internal(format!("the model failed: {e:#}")),
-        }
     }
 }
 
@@ -293,7 +290,12 @@ where
     let request = embeddings::validate(request, state.max_inputs, &state.embedder.info)?
         .prefixed(&state.prefix);
 
-    let mut batch = state.embedder.handle.ask(request.texts).await?;
+    let mut batch = state
+        .embedder
+        .handle
+        .ask(request.texts)
+        .await
+        .map_err(|e| ApiError::worker(e, &state.embedder.label))?;
     if let Some(dims) = request.dimensions {
         embeddings::truncate(&mut batch.vectors, dims);
     }
@@ -326,7 +328,11 @@ where
         .map_err(|e| ApiError::invalid(None, format!("the body is not a rerank request: {e}")))?;
     let (pairs, reply) = rerank::validate(request, state.max_inputs)?.into_parts();
 
-    let scores = reranker.handle.ask(pairs).await?;
+    let scores = reranker
+        .handle
+        .ask(pairs)
+        .await
+        .map_err(|e| ApiError::worker(e, &reranker.label))?;
     state.counts.reranked(&scores);
 
     Ok(json(StatusCode::OK, reply.body(&reranker.label, &scores)))
@@ -726,7 +732,9 @@ mod tests {
 
     #[test]
     fn a_refusal_carries_the_header_its_status_calls_for() {
-        let busy = ApiError::busy().reply();
+        let busy = ApiError::worker(WorkerError::Busy, "m");
+        assert!(busy.message.contains("`m`"), "{}", busy.message);
+        let busy = busy.reply();
         assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(busy.headers()["retry-after"], "1");
         let wrong = ApiError::method_not_allowed("POST").reply();
