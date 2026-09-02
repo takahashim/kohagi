@@ -15,9 +15,9 @@
 //! handler hands a worker one question and waits for the answer; nothing
 //! else touches a model.
 
+mod api;
 mod http;
 mod listen;
-mod openai;
 mod server;
 mod worker;
 

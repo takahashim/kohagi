@@ -10,7 +10,7 @@ use hyper::body::{Body, Bytes};
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
 
-use super::openai::{self, Refusal};
+use super::api::{self, embeddings, rerank, Refusal};
 use super::worker::{Loaded, WorkerError};
 use super::{Batch, Config, Pairs, Scores};
 use crate::program::remark;
@@ -200,7 +200,7 @@ impl ApiError {
             builder = builder.header(name, value);
         }
         builder
-            .body(Full::new(Bytes::from(openai::error_body(
+            .body(Full::new(Bytes::from(api::error_body(
                 &self.message,
                 self.kind,
                 self.param,
@@ -254,9 +254,7 @@ where
         return match method {
             Method::GET | Method::HEAD => {
                 match state.models().into_iter().find(|(label, _)| *label == id) {
-                    Some((label, info)) => {
-                        Ok(json(StatusCode::OK, openai::model_body(label, info)))
-                    }
+                    Some((label, info)) => Ok(json(StatusCode::OK, api::model_body(label, info))),
                     None => Err(ApiError::not_found(format!(
                         "model `{id}` is not loaded; this server runs `{}`",
                         state.embedder.label
@@ -271,11 +269,11 @@ where
         (Method::POST, "/v1/embeddings") => embeddings(req, state).await,
         (Method::POST, "/v1/rerank") => rerank(req, state).await,
         (Method::GET | Method::HEAD, "/v1/models") => {
-            Ok(json(StatusCode::OK, openai::models_body(&state.models())))
+            Ok(json(StatusCode::OK, api::models_body(&state.models())))
         }
         (Method::GET | Method::HEAD, "/health") => Ok(json(
             StatusCode::OK,
-            openai::health_body(&state.embedder.label),
+            api::health_body(&state.embedder.label),
         )),
         (_, "/v1/embeddings" | "/v1/rerank") => Err(ApiError::method_not_allowed("POST")),
         (_, "/v1/models" | "/health") => Err(ApiError::method_not_allowed("GET, HEAD")),
@@ -289,21 +287,21 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let body = read_body(req, state.max_body_bytes).await?;
-    let request: openai::EmbeddingsRequest = serde_json::from_slice(&body).map_err(|e| {
+    let request: embeddings::Request = serde_json::from_slice(&body).map_err(|e| {
         ApiError::invalid(None, format!("the body is not an embeddings request: {e}"))
     })?;
-    let request =
-        openai::validate(request, state.max_inputs, &state.embedder.info)?.prefixed(&state.prefix);
+    let request = embeddings::validate(request, state.max_inputs, &state.embedder.info)?
+        .prefixed(&state.prefix);
 
     let mut batch = state.embedder.handle.ask(request.texts).await?;
     if let Some(dims) = request.dimensions {
-        openai::truncate(&mut batch.vectors, dims);
+        embeddings::truncate(&mut batch.vectors, dims);
     }
     state.counts.embedded(&batch);
 
     Ok(json(
         StatusCode::OK,
-        openai::embeddings_body(
+        embeddings::reply(
             &state.embedder.label,
             &batch.vectors,
             &batch.tokens,
@@ -324,31 +322,14 @@ where
         ));
     };
     let body = read_body(req, state.max_body_bytes).await?;
-    let request: openai::RerankRequest = serde_json::from_slice(&body)
+    let request: rerank::Request = serde_json::from_slice(&body)
         .map_err(|e| ApiError::invalid(None, format!("the body is not a rerank request: {e}")))?;
-    let request = openai::validate_rerank(request, state.max_inputs)?;
+    let (pairs, reply) = rerank::validate(request, state.max_inputs)?.into_parts();
 
-    // The reply carries the documents back only when asked to; the model
-    // needs them either way, so they are cloned rather than kept.
-    let documents = request.return_documents.then(|| request.documents.clone());
-    let scores = reranker
-        .handle
-        .ask(Pairs {
-            query: request.query,
-            documents: request.documents,
-        })
-        .await?;
+    let scores = reranker.handle.ask(pairs).await?;
     state.counts.reranked(&scores);
 
-    Ok(json(
-        StatusCode::OK,
-        openai::rerank_body(
-            &reranker.label,
-            &scores,
-            request.top_n,
-            documents.as_deref(),
-        ),
-    ))
+    Ok(json(StatusCode::OK, reply.body(&reranker.label, &scores)))
 }
 
 /// The whole body, or 413 once it is known to be longer than `limit`: from
