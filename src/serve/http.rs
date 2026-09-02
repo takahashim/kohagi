@@ -2,20 +2,14 @@
 //! which headers. `handle` never fails: every outcome, a refusal included, is
 //! a reply, and the connection stays usable for the next one.
 
-use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
-use hyper::body::{Body, Bytes, Incoming};
+use hyper::body::{Body, Bytes};
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::sync::watch;
 
-use super::listen::Io;
 use super::openai::{self, Refusal};
 use super::worker::{Loaded, WorkerError};
 use super::{Batch, Config, Pairs, Scores};
@@ -390,61 +384,12 @@ fn json(status: StatusCode, body: Vec<u8>) -> Reply {
         .expect("a status and one header make a valid response")
 }
 
-/// One connection, for as many requests as the client sends on it. Told to
-/// stop, it finishes the reply in flight and then closes, which is what hyper
-/// calls a graceful shutdown; an idle connection closes at once.
-pub(crate) async fn serve_connection(
-    io: Io,
-    state: Arc<State>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let service = service_fn(move |req: Request<Incoming>| {
-        let state = state.clone();
-        async move { Ok::<_, Infallible>(handle(req, state).await) }
-    });
-    let conn = http1::Builder::new()
-        .timer(TokioTimer::new())
-        .serve_connection(TokioIo::new(io), service);
-    tokio::pin!(conn);
-
-    let mut signalled = *shutdown.borrow();
-    if signalled {
-        conn.as_mut().graceful_shutdown();
-    }
-    loop {
-        tokio::select! {
-            outcome = conn.as_mut() => {
-                if let Err(e) = outcome {
-                    if worth_a_line(&e) {
-                        remark!("connection: {e}");
-                    }
-                }
-                return;
-            }
-            _ = shutdown.changed(), if !signalled => {
-                signalled = true;
-                conn.as_mut().graceful_shutdown();
-            }
-        }
-    }
-}
-
-/// A client that hung up mid-request, or a socket already closed by the peer
-/// when a stop signal shuts it down, is its own business: neither is anything
-/// this side can act on, and a supervisor's log is not the place for them.
-fn worth_a_line(e: &hyper::Error) -> bool {
-    let io_underneath = std::error::Error::source(e)
-        .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some());
-    !e.is_incomplete_message() && !io_underneath
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use base64::Engine as _;
     use serde_json::Value;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::super::{testing, worker};
     use super::super::{Engine, Listen, Load};
@@ -946,54 +891,6 @@ mod tests {
             // A 503 is this side's, not the client's.
             assert_eq!(state.counts.failed.load(Relaxed), 1);
             assert_eq!(state.counts.rejected.load(Relaxed), 0);
-        });
-    }
-
-    /// The wiring under hyper: a request on a byte stream gets its reply, the
-    /// connection stays open for the next, and a stop signal closes it after
-    /// the reply in flight.
-    #[test]
-    fn a_connection_serves_requests_until_told_to_stop() {
-        block_on(async {
-            let state = state();
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let (mut client, server) = tokio::io::duplex(64 * 1024);
-            let served = tokio::spawn(serve_connection(Box::pin(server), state, shutdown_rx));
-
-            async fn exchange(client: &mut tokio::io::DuplexStream, request: &str) -> String {
-                client.write_all(request.as_bytes()).await.unwrap();
-                let mut buf = vec![0u8; 8192];
-                let n = client.read(&mut buf).await.unwrap();
-                String::from_utf8_lossy(&buf[..n]).into_owned()
-            }
-
-            let first = exchange(&mut client, "GET /health HTTP/1.1\r\nhost: k\r\n\r\n").await;
-            assert!(first.starts_with("HTTP/1.1 200 OK\r\n"), "{first}");
-            assert!(
-                first.ends_with(r#"{"status":"ok","model":"stub/model"}"#),
-                "{first}"
-            );
-
-            let body = r#"{"input":"ab"}"#;
-            let second = exchange(
-                &mut client,
-                &format!(
-                    "POST /v1/embeddings HTTP/1.1\r\nhost: k\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                    body.len()
-                ),
-            )
-            .await;
-            assert!(second.starts_with("HTTP/1.1 200 OK\r\n"), "{second}");
-            assert!(
-                second.contains(r#""usage":{"prompt_tokens":2,"total_tokens":2}"#),
-                "{second}"
-            );
-
-            shutdown_tx.send(true).unwrap();
-            served.await.unwrap();
-            // Closed from the server's side: nothing more to read.
-            let mut rest = Vec::new();
-            assert_eq!(client.read_to_end(&mut rest).await.unwrap(), 0);
         });
     }
 }
