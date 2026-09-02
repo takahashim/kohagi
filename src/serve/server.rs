@@ -97,9 +97,9 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::super::{worker, Batch, Config, Engine, Listen, Load};
+    use super::super::{testing, worker, Batch, Config, Engine, Listen, Load};
     use super::*;
-    use crate::{ModelInfo, Output, TokenInfo};
+    use crate::{ModelInfo, TokenInfo};
 
     struct One;
 
@@ -108,20 +108,7 @@ mod tests {
         type Output = Batch;
 
         fn info(&self) -> ModelInfo {
-            ModelInfo {
-                backend: "cpu",
-                precision: "f32",
-                sha256: None,
-                bundle: None,
-                pooling: "mean",
-                dim: 1,
-                max_seq_length: 8,
-                declared_max_seq_length: None,
-                output: Output::Embedding {
-                    output_dim: None,
-                    normalized: true,
-                },
-            }
+            testing::embedding_info(1)
         }
 
         fn answer(&self, texts: Vec<String>) -> anyhow::Result<Batch> {

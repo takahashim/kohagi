@@ -446,24 +446,10 @@ mod tests {
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::super::worker;
+    use super::super::{testing, worker};
     use super::super::{Engine, Listen, Load};
     use super::*;
-    use crate::{Output, TokenInfo};
-
-    fn info(dim: usize, output: Output) -> ModelInfo {
-        ModelInfo {
-            backend: "cpu",
-            precision: "f32",
-            sha256: Some("ab".repeat(32)),
-            bundle: None,
-            pooling: "mean",
-            dim,
-            max_seq_length: 8,
-            declared_max_seq_length: None,
-            output,
-        }
-    }
+    use crate::TokenInfo;
 
     /// Four dimensions, one-hot on the text's position, and a token count of
     /// the text's characters, so a test can see what the model was handed.
@@ -480,13 +466,7 @@ mod tests {
         type Output = Batch;
 
         fn info(&self) -> ModelInfo {
-            info(
-                4,
-                Output::Embedding {
-                    output_dim: None,
-                    normalized: true,
-                },
-            )
+            testing::embedding_info(4)
         }
 
         fn answer(&self, texts: Vec<String>) -> anyhow::Result<Batch> {
@@ -525,7 +505,7 @@ mod tests {
         type Output = Scores;
 
         fn info(&self) -> ModelInfo {
-            info(768, Output::Score { score: "sigmoid" })
+            testing::reranker_info()
         }
 
         fn answer(&self, pairs: Pairs) -> anyhow::Result<Scores> {

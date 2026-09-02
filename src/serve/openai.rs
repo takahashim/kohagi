@@ -516,20 +516,7 @@ mod tests {
 
     /// A four-dimensional, normalized model.
     fn info() -> ModelInfo {
-        ModelInfo {
-            backend: "cpu",
-            precision: "f32",
-            sha256: None,
-            bundle: None,
-            pooling: "mean",
-            dim: 4,
-            max_seq_length: 8,
-            declared_max_seq_length: None,
-            output: Output::Embedding {
-                output_dim: None,
-                normalized: true,
-            },
-        }
+        super::super::testing::embedding_info(4)
     }
 
     fn request(body: &str) -> EmbeddingsRequest {

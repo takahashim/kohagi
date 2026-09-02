@@ -229,6 +229,38 @@ async fn shutdown_signal() {
     }
 }
 
+/// What a loaded model reports, for this module's tests: one definition, so
+/// the stubs in `worker`, `server`, `http` and `api` do not each carry a
+/// literal that drifts when [`ModelInfo`] gains a field (as `normalized` did).
+#[cfg(test)]
+pub(crate) mod testing {
+    use crate::{ModelInfo, Output};
+
+    pub(crate) fn embedding_info(dim: usize) -> ModelInfo {
+        ModelInfo {
+            backend: "cpu",
+            precision: "f32",
+            sha256: Some("ab".repeat(32)),
+            bundle: None,
+            pooling: "mean",
+            dim,
+            max_seq_length: 8,
+            declared_max_seq_length: None,
+            output: Output::Embedding {
+                output_dim: None,
+                normalized: true,
+            },
+        }
+    }
+
+    pub(crate) fn reranker_info() -> ModelInfo {
+        ModelInfo {
+            output: Output::Score { score: "sigmoid" },
+            ..embedding_info(768)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

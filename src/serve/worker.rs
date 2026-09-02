@@ -161,9 +161,9 @@ fn run_job<E: Engine>(engine: &E, input: E::Input) -> Result<E::Output> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Batch, Engine, Load};
+    use super::super::{testing, Batch, Engine, Load};
     use super::*;
-    use crate::{Output, TokenInfo};
+    use crate::TokenInfo;
 
     /// Panics when told to, so the promise under test is `run_job`'s: a panic
     /// costs the request that tripped it, not every request after it.
@@ -174,20 +174,7 @@ mod tests {
         type Output = Batch;
 
         fn info(&self) -> ModelInfo {
-            ModelInfo {
-                backend: "cpu",
-                precision: "f32",
-                sha256: None,
-                bundle: None,
-                pooling: "mean",
-                dim: 1,
-                max_seq_length: 8,
-                declared_max_seq_length: None,
-                output: Output::Embedding {
-                    output_dim: None,
-                    normalized: true,
-                },
-            }
+            testing::embedding_info(1)
         }
 
         fn answer(&self, texts: Vec<String>) -> Result<Batch> {
