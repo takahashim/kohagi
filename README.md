@@ -22,8 +22,9 @@ It is designed for one job: embedding text in batches from any environment that 
 
 ## Install
 
-Prebuilt binaries for macOS (Apple Silicon), Linux (x86_64), and Windows x64
-(NVIDIA CUDA) are on the [releases page](https://github.com/takahashim/kohagi/releases).
+Prebuilt binaries for macOS (Apple Silicon), Linux (x86_64 and aarch64), and
+Windows x64 (NVIDIA CUDA) are on the
+[releases page](https://github.com/takahashim/kohagi/releases).
 On macOS and Linux:
 
 ```bash

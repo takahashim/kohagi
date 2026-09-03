@@ -16,7 +16,10 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        # `ubuntu-24.04-arm` is here rather than only under `build` because it
+        # is the one runner that executes the CPU path on ARM: macos-14 is ARM
+        # too, but reaches its sgemm through Accelerate.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -53,9 +56,9 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
 
-  # Release binaries: Apple Silicon macOS, x86_64 Linux, and x86_64 Windows.
-  # Uploaded as artifacts on every push; attached to the GitHub Release on v*
-  # tags.
+  # Release binaries: Apple Silicon macOS, x86_64 and aarch64 Linux, and x86_64
+  # Windows. Uploaded as artifacts on every push; attached to the GitHub Release
+  # on v* tags.
   #
   # The macOS binary bundles the Metal and CoreML backends so `--device metal`
   # and `--device coreml` work out of the box; both are macOS-only, so the
@@ -71,6 +74,11 @@ jobs:
             features: --features metal,coreml,coreml-export
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            features: ""
+          # Graviton and the Raspberry Pi class of machine. A native runner
+          # rather than a cross build, which public repositories get for free.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
             features: ""
           # CUDA 12.4 supports the Visual Studio 2022 toolchain on this image.
           - os: windows-2022

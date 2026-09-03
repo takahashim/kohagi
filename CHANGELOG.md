@@ -41,6 +41,11 @@
   `coreml-convert` is in no archive; binstall treats a `[[bin]]` with
   `required-features` as optional and installs the rest.
 
+- **aarch64 Linux release binaries.** `kohagi-aarch64-unknown-linux-gnu.tar.gz`,
+  for Graviton and the Raspberry Pi class of machine. Built and tested on a
+  native ARM runner, so the CPU path is now exercised on ARM without Accelerate
+  under it.
+
 ### Changed
 
 - **`--print-model-info` reports `normalized`.** Whether each vector is unit
