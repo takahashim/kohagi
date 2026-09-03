@@ -227,6 +227,12 @@ embedder and the reranker each have a thread and a queue of their own, so a
 long rerank does not hold up a query's embedding; on a CPU the two do share
 the cores.
 
+A model's thread dying (a panic outside a forward pass, which is caught) stops
+the server, exit 1, whichever model it was: a supervisor restarting the process
+brings both back, where a server that quietly lost its reranker would answer
+404 to a caller whose flags asked for one. A panic inside a forward pass is
+that request's 500 and nothing more.
+
 One request's cost is the forward pass for its texts; the HTTP around it is
 small. For a 20-token query on an M2 CPU, one request takes 36 ms median over
 HTTP against 32 ms for one blank-line batch on the pipe. Keep the connection
@@ -243,7 +249,10 @@ previous run is replaced; a running `kohagi-serve` at that path, or anything
 that is not a socket, is refused rather than replaced. The file is removed at
 shutdown.
 
-shutdown. Unix only; on Windows
+A lock file is created beside it, at `<path>.lock`, and is **not** removed:
+it is what makes "replace a stale socket" safe when two servers start at once,
+and unlinking it would race the next start. It is empty, and the directory
+therefore has to be writable, not just the socket's path. Unix only; on Windows
 `--listen` takes `host:port`.
 
 ```bash

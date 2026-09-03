@@ -24,8 +24,17 @@
   as strings or `{"text"}` objects, `top_n`, `return_documents`; results best
   first with `index` and `relevance_score`). The scores are the sigmoid
   `kohagi-rerank` writes, identical for the same pair. `GET /v1/models` lists
-  both models, and the summary line gains `scored=`. Without the flag,
-  `/v1/rerank` is 404 and says which flag turns it on.
+  both models, and the summary gains `scored=` and a line naming the reranker.
+  Without the flag, `/v1/rerank` is 404 and says which flag turns it on.
+  `--rerank-expect-sha256` pins its weights as `--expect-sha256` pins the
+  embedder's, and `--rerank-coreml-buckets` converts it to the same lengths
+  `kohagi-rerank` uses; both are refused when no reranker was asked for.
+
+- **`tools/`: the development jigs, outside the workspace.** `kohagi-pairs`
+  reads an mteb reranking dataset into pairs, `kohagi-dataset` scores them with
+  the teacher once so a student can be trained many times, and
+  `kohagi-reference` writes one forward pass down for another implementation to
+  be held to. Not shipped and not in Kohagi's `Cargo.lock`; see tools/README.md.
 
 ### Changed
 
