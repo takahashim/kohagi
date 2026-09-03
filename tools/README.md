@@ -24,8 +24,8 @@ of the published crate.
   artifact — token ids and the pooled, normalized vector — so another
   implementation of the same architecture can be held to it. Torobi (the MLX
   training framework) uses it to check that the ModernBERT it describes in its
-  own IR computes what Kohagi computes. Rust, no Python, and it reads Kohagi's
-  public API rather than widening it.
+  own IR computes what Kohagi computes. Rust, no Python, and the settings it
+  records are read off the loaded model rather than written down in the jig.
 - [`coreml-jigs/`](coreml-jigs/) holds Rust jigs for the CoreML backend, which
   read a converted bundle, check Neural Engine placement, measure per-bucket
   latency, and compare two configurations. See its own README.

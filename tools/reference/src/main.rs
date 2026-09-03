@@ -9,12 +9,16 @@
 //!
 //! What this writes is everything the other side needs to reproduce the
 //! same forward and nothing about how Kohagi got there: the token ids (so
-//! no tokenizer is needed on the other side), the pooled and normalized
-//! vector, and the settings both sides must agree on. Kohagi is not changed
-//! to produce it, and its public API is not widened: this loads the same
-//! tokenizer the same way (Kohagi's `batch::load_tokenizer` is four lines
-//! and private) and checks that the ids it emits are the ones Kohagi
-//! actually embedded, by count, before writing anything.
+//! no tokenizer is needed on the other side), the digest of the weights, the
+//! pooled and normalized vector, and the settings both sides must agree on.
+//! Those settings are read off the loaded model rather than written down
+//! here, so a run with other options cannot describe itself as this one.
+//!
+//! Kohagi gained one item for this, `VERSION`, so the artifact can name what
+//! produced it; nothing else. The tokenizer is loaded the same way rather
+//! than exported (Kohagi's `batch::load_tokenizer` is four lines and
+//! private), and the ids emitted are checked against what Kohagi embedded,
+//! by count, before anything is written.
 //!
 //!     cargo run --release --manifest-path tools/reference/Cargo.toml -- \
 //!       --model-path <snapshot>/model.safetensors \
@@ -106,13 +110,20 @@ fn main() -> Result<()> {
 
     let artifact = serde_json::json!({
         "schema_version": 1,
-        "produced_by": format!("kohagi {}", env!("CARGO_PKG_VERSION")),
+        // kohagi's version, not this jig's: the numbers below are kohagi's.
+        "produced_by": format!("kohagi {}", kohagi::VERSION),
+        // Which weights answered. The other side is being held to these
+        // numbers, and `pooling` and `dim` agreeing means nothing if the
+        // checkpoint behind them was a different one.
+        "sha256": info.sha256,
         // What both sides have to agree on, or the comparison means nothing.
+        // Read off the loaded model rather than written down here, so a run
+        // with other options cannot describe itself as this one.
         "settings": {
-            "max_seq_length": max_seq_length,
+            "max_seq_length": info.max_seq_length,
             "pooling": info.pooling,
-            "normalized": true,
-            "precision": "f32",
+            "normalized": info.normalized(),
+            "precision": info.precision,
         },
         "dim": embedder.dim(),
         "cases": cases,

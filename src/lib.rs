@@ -56,6 +56,12 @@ pub mod serve;
 mod source;
 pub mod stdio;
 
+/// This crate's version, for a caller that records which Kohagi produced a
+/// file. A tool of its own has its own `CARGO_PKG_VERSION`, which is not this
+/// one, and an artifact that names the wrong version is worse than one that
+/// names none.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use batch::{Pooling, TokenInfo};
 pub use config::{CoreMlForm, CoreMlQuantize};
 pub use errors::UnsupportedRequest;
