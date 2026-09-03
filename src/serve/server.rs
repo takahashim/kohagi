@@ -206,16 +206,9 @@ mod tests {
             max_queue: 1,
             shutdown_timeout: Duration::from_secs(1),
         };
-        let loaded = worker::spawn(
-            "test-serve",
-            Load {
-                label: "one".to_string(),
-                load: || Ok(One),
-            },
-            config.max_queue,
-        )
-        .unwrap()
-        .loaded;
+        let loaded = worker::spawn("test-serve", Load::new("one", || Ok(One)), config.max_queue)
+            .unwrap()
+            .loaded;
         Arc::new(State::new(&config, loaded, None))
     }
 

@@ -151,10 +151,9 @@ fn run(args: Args) -> anyhow::Result<()> {
     let reranker = if args.rerank.wanted() {
         let (rerank_source, rerank_label) = args.rerank.model(&args.model).source()?;
         let (rerank, model) = (args.rerank.clone(), args.model.clone());
-        Some(Load {
-            label: rerank_label,
-            load: move || rerank.model(&model).load(&rerank_source),
-        })
+        Some(Load::new(rerank_label, move || {
+            rerank.model(&model).load(&rerank_source)
+        }))
     } else {
         None
     };
@@ -172,10 +171,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     // digest check happens there too, before anything can be answered.
     serve::run(
         config,
-        Load {
-            label,
-            load: move || model.load(&source),
-        },
+        Load::new(label, move || model.load(&source)),
         reranker,
     )
 }

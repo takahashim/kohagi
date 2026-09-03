@@ -93,7 +93,7 @@ pub(crate) struct Spawned<I, O> {
 /// many jobs may wait, at least 1; the flag enforces that.
 pub(crate) fn spawn<E: Engine>(
     thread: &'static str,
-    model: Load<impl FnOnce() -> Result<E> + Send + 'static>,
+    model: Load<E>,
     queue: usize,
 ) -> Result<Spawned<E::Input, E::Output>> {
     let (queue_tx, mut queue_rx) = mpsc::channel::<Job<E::Input, E::Output>>(queue);
@@ -206,15 +206,7 @@ mod tests {
 
     #[test]
     fn a_panicking_forward_pass_costs_the_request_not_the_server() {
-        let spawned = spawn(
-            "test-fragile",
-            Load {
-                label: "f".to_string(),
-                load: || Ok(Fragile),
-            },
-            4,
-        )
-        .unwrap();
+        let spawned = spawn("test-fragile", Load::new("f", || Ok(Fragile)), 4).unwrap();
         block_on(async {
             match spawned.loaded.handle.ask(vec!["boom".to_string()]).await {
                 Err(WorkerError::Failed(e)) => {
@@ -232,10 +224,9 @@ mod tests {
     fn a_load_error_comes_back_to_the_spawn_caller() {
         let e = spawn(
             "test-noload",
-            Load {
-                label: "f".to_string(),
-                load: || -> Result<Fragile> { anyhow::bail!("no such checkpoint") },
-            },
+            Load::new("f", || -> Result<Fragile> {
+                anyhow::bail!("no such checkpoint")
+            }),
             4,
         )
         .err()
@@ -247,10 +238,7 @@ mod tests {
     fn a_load_panic_reads_as_a_death_while_loading() {
         let e = spawn(
             "test-panicload",
-            Load {
-                label: "f".to_string(),
-                load: || -> Result<Fragile> { panic!("torn") },
-            },
+            Load::new("f", || -> Result<Fragile> { panic!("torn") }),
             4,
         )
         .err()

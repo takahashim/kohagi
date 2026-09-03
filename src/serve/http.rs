@@ -1,19 +1,20 @@
-//! Routes and handlers, and what a refusal is on the wire: which status,
-//! which headers. `handle` never fails: every outcome, a refusal included, is
-//! a reply, and the connection stays usable for the next one.
+//! Routes and handlers: which path is answered by which model, and what one
+//! request's answer is made of. `handle` never fails: every outcome, a refusal
+//! included, is a reply (`reply`), and the connection stays usable for the
+//! next one.
 
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::{Body, Bytes};
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::header::CONTENT_LENGTH;
+use hyper::{Method, Request, StatusCode};
 
-use super::api::{self, embeddings, rerank, Refusal};
-use super::worker::{Loaded, WorkerError};
+use super::api::{self, embeddings, rerank};
+use super::counts::Counts;
+use super::reply::{json, ApiError, Reply};
+use super::worker::Loaded;
 use super::{Batch, Config, Pairs, Scores};
-use crate::program::remark;
 use crate::ModelInfo;
 
 /// Everything a handler reads: the models, the limits, and the counters the
@@ -51,6 +52,16 @@ impl State {
         self.reranker.as_ref()
     }
 
+    /// The loaded models' names, for a refusal that has to say what this
+    /// server does run instead: one name, or both joined by "and".
+    fn loaded_models(&self) -> String {
+        self.models()
+            .iter()
+            .map(|(label, _)| format!("`{label}`"))
+            .collect::<Vec<_>>()
+            .join(" and ")
+    }
+
     /// Every loaded model, as `/v1/models` lists them.
     fn models(&self) -> Vec<(&str, &ModelInfo)> {
         let mut models = vec![(self.embedder.label.as_str(), &self.embedder.info)];
@@ -60,167 +71,11 @@ impl State {
         models
     }
 
-    /// The run's one summary line, on stderr at shutdown, reading like the
-    /// CLI's: which weights answered, and how much they answered.
+    /// The run's one summary line: the numbers are [`Counts`]', and which
+    /// model answered is this state's.
     pub(crate) fn summarize(&self) {
-        let c = &self.counts;
-        remark!(
-            "model={} {} requests={} in={} truncated={} scored={} rejected={} failed={}",
-            self.embedder.label,
-            self.embedder.info.summary_facts(),
-            c.requests.load(Relaxed),
-            c.inputs.load(Relaxed),
-            c.truncated.load(Relaxed),
-            c.scored.load(Relaxed),
-            c.rejected.load(Relaxed),
-            c.failed.load(Relaxed)
-        );
-    }
-}
-
-/// The summary's numbers. `requests` counts everything that arrived;
-/// `rejected` the 4xx among them (the client's mistake) and `failed` the 5xx
-/// (this side's). `inputs` and `truncated` are the stdio summary's `in` and
-/// `truncated`, over the requests that were answered: texts embedded, and
-/// texts or pairs that ran past a model's length. `scored` is the documents
-/// reranked. A request is answered whole or not at all, so there is no
-/// separate `out`.
-#[derive(Default)]
-struct Counts {
-    requests: AtomicUsize,
-    rejected: AtomicUsize,
-    failed: AtomicUsize,
-    inputs: AtomicUsize,
-    truncated: AtomicUsize,
-    scored: AtomicUsize,
-}
-
-impl Counts {
-    fn saw(&self, status: StatusCode) {
-        self.requests.fetch_add(1, Relaxed);
-        if status.is_client_error() {
-            self.rejected.fetch_add(1, Relaxed);
-        } else if status.is_server_error() {
-            self.failed.fetch_add(1, Relaxed);
-        }
-    }
-
-    fn embedded(&self, batch: &Batch) {
-        self.inputs.fetch_add(batch.vectors.len(), Relaxed);
-        self.truncated
-            .fetch_add(batch.tokens.iter().filter(|t| t.truncated).count(), Relaxed);
-    }
-
-    fn reranked(&self, scores: &Scores) {
-        self.scored.fetch_add(scores.scores.len(), Relaxed);
-        self.truncated.fetch_add(
-            scores.tokens.iter().filter(|t| t.truncated).count(),
-            Relaxed,
-        );
-    }
-}
-
-type Reply = Response<Full<Bytes>>;
-
-/// A refusal on the wire: the status, the one header the status calls for
-/// (`Allow` for 405, `Retry-After` for 503), and OpenAI's error object.
-#[derive(Debug)]
-pub(crate) struct ApiError {
-    status: StatusCode,
-    header: Option<(&'static str, &'static str)>,
-    kind: &'static str,
-    param: Option<&'static str>,
-    message: String,
-}
-
-impl ApiError {
-    fn new(status: StatusCode, kind: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            header: None,
-            kind,
-            param: None,
-            message: message.into(),
-        }
-    }
-
-    fn invalid(param: Option<&'static str>, message: impl Into<String>) -> Self {
-        Self {
-            param,
-            ..Self::new(StatusCode::BAD_REQUEST, "invalid_request_error", message)
-        }
-    }
-
-    fn not_found(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::NOT_FOUND, "invalid_request_error", message)
-    }
-
-    fn method_not_allowed(allow: &'static str) -> Self {
-        Self {
-            header: Some(("allow", allow)),
-            ..Self::new(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "invalid_request_error",
-                format!("this path takes {allow}"),
-            )
-        }
-    }
-
-    fn too_large(limit: usize) -> Self {
-        Self::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "invalid_request_error",
-            format!(
-                "the request body is longer than this server reads ({limit} bytes, \
-                 --max-body-bytes); send fewer texts per request"
-            ),
-        )
-    }
-
-    fn internal(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", message)
-    }
-
-    /// A worker's refusal or failure, under the model's name: two models can
-    /// be loaded, and the operator should not have to guess which one this
-    /// was.
-    fn worker(e: WorkerError, label: &str) -> Self {
-        match e {
-            WorkerError::Busy => Self {
-                header: Some(("retry-after", "1")),
-                ..Self::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "server_error",
-                    format!("`{label}`'s queue is full (--max-queue); retry shortly"),
-                )
-            },
-            WorkerError::Gone => Self::internal(format!(
-                "`{label}`'s thread is gone; this server is shutting down"
-            )),
-            WorkerError::Failed(e) => Self::internal(format!("`{label}` failed: {e:#}")),
-        }
-    }
-
-    fn reply(&self) -> Reply {
-        let mut builder = Response::builder()
-            .status(self.status)
-            .header(CONTENT_TYPE, "application/json");
-        if let Some((name, value)) = self.header {
-            builder = builder.header(name, value);
-        }
-        builder
-            .body(Full::new(Bytes::from(api::error_body(
-                &self.message,
-                self.kind,
-                self.param,
-            ))))
-            .expect("a status and fixed headers make a valid response")
-    }
-}
-
-impl From<Refusal> for ApiError {
-    fn from(r: Refusal) -> Self {
-        Self::invalid(r.param, r.message)
+        self.counts
+            .summarize(&self.embedder.label, &self.embedder.info.summary_facts());
     }
 }
 
@@ -252,9 +107,12 @@ where
             Method::GET | Method::HEAD => {
                 match state.models().into_iter().find(|(label, _)| *label == id) {
                     Some((label, info)) => Ok(json(StatusCode::OK, api::model_body(label, info))),
+                    // Every loaded model is named, not just the embedder: a
+                    // server with a reranker has two, and the one the caller
+                    // meant is likelier to be in the list than in a guess.
                     None => Err(ApiError::not_found(format!(
-                        "model `{id}` is not loaded; this server runs `{}`",
-                        state.embedder.label
+                        "model `{id}` is not loaded; this server runs {}",
+                        state.loaded_models()
                     ))),
                 }
             }
@@ -363,19 +221,13 @@ where
     }
 }
 
-fn json(status: StatusCode, body: Vec<u8>) -> Reply {
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .expect("a status and one header make a valid response")
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering::Relaxed;
     use std::sync::Mutex;
 
     use base64::Engine as _;
+    use http_body_util::Full;
     use serde_json::Value;
 
     use super::super::{testing, worker};
@@ -470,18 +322,12 @@ mod tests {
     }
 
     fn state_with(config: Config, stub: Stub, reranker: bool) -> Arc<State> {
-        let embedder = Load {
-            label: "stub/model".to_string(),
-            load: move || Ok(stub),
-        };
+        let embedder = Load::new("stub/model", move || Ok(stub));
         let embedder = worker::spawn("test-model", embedder, config.max_queue)
             .unwrap()
             .loaded;
         let reranker = reranker.then(|| {
-            let reranker = Load {
-                label: "stub/reranker".to_string(),
-                load: || Ok(RerankStub),
-            };
+            let reranker = Load::new("stub/reranker", || Ok(RerankStub));
             worker::spawn("test-reranker", reranker, config.max_queue)
                 .unwrap()
                 .loaded
@@ -731,19 +577,6 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_carries_the_header_its_status_calls_for() {
-        let busy = ApiError::worker(WorkerError::Busy, "m");
-        assert!(busy.message.contains("`m`"), "{}", busy.message);
-        let busy = busy.reply();
-        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(busy.headers()["retry-after"], "1");
-        let wrong = ApiError::method_not_allowed("POST").reply();
-        assert_eq!(wrong.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(wrong.headers()["allow"], "POST");
-        assert_eq!(wrong.headers()[CONTENT_TYPE], "application/json");
-    }
-
-    #[test]
     fn a_body_past_the_limit_is_413_whether_declared_or_discovered() {
         block_on(async {
             let state = state();
@@ -788,6 +621,16 @@ mod tests {
                 assert_eq!(status, StatusCode::OK, "{id}");
                 assert_eq!(v["id"], id);
             }
+
+            // A model that is not here is refused by naming the ones that are,
+            // both of them: the caller's next guess should not have to be one.
+            let (status, v) = call(&state, Method::GET, "/v1/models/other", "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let message = v["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("`stub/model` and `stub/reranker`"),
+                "{message}"
+            );
 
             let (status, v) = call(&state, Method::GET, "/health", "").await;
             assert_eq!(status, StatusCode::OK);

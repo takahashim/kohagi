@@ -11,13 +11,16 @@
 //!
 //! Each model has a thread of its own (`worker`); a current-thread tokio
 //! runtime accepts connections (`server`) and answers requests (`http`),
-//! which are checked and written in the shapes clients expect (`openai`). A
-//! handler hands a worker one question and waits for the answer; nothing
+//! which are checked and written in the shapes clients expect (`api`), put on
+//! the wire with a status (`reply`), and counted for the summary (`counts`).
+//! A handler hands a worker one question and waits for the answer; nothing
 //! else touches a model.
 
 mod api;
+mod counts;
 mod http;
 mod listen;
+mod reply;
 mod server;
 mod worker;
 
@@ -116,9 +119,26 @@ impl Engine for Reranker {
 /// does not know its own name; one model has many), and how to load it. The
 /// loading runs on the model's own thread, so what it returns never has to
 /// cross one; that is what lets a CoreML encoder, which cannot, serve here.
-pub struct Load<F> {
+///
+/// The closure is boxed rather than another type parameter: it is called once,
+/// on a thread of its own, so the indirection costs nothing measurable, and it
+/// lets [`run`] name the models it loads instead of being generic over the
+/// closures that load them.
+pub struct Load<T> {
     pub label: String,
-    pub load: F,
+    pub load: Box<dyn FnOnce() -> Result<T> + Send>,
+}
+
+impl<T> Load<T> {
+    pub fn new(
+        label: impl Into<String>,
+        load: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            load: Box::new(load),
+        }
+    }
 }
 
 /// Load the models, listen, and answer until told to stop.
@@ -127,13 +147,11 @@ pub struct Load<F> {
 /// as a failed start, and `/health` answering means ready. Returns when a
 /// SIGTERM or SIGINT has been handled (`Ok`), or when a model's thread died
 /// (`Err`), so the process exits 1 and the supervisor restarts it.
-pub fn run<E, R, F, G>(config: Config, embedder: Load<F>, reranker: Option<Load<G>>) -> Result<()>
-where
-    E: Engine<Input = Vec<String>, Output = Batch>,
-    R: Engine<Input = Pairs, Output = Scores>,
-    F: FnOnce() -> Result<E> + Send + 'static,
-    G: FnOnce() -> Result<R> + Send + 'static,
-{
+pub fn run(
+    config: Config,
+    embedder: Load<Embedder>,
+    reranker: Option<Load<Reranker>>,
+) -> Result<()> {
     let embedder = worker::spawn("kohagi-model", embedder, config.max_queue)?;
     let reranker = match reranker {
         Some(reranker) => Some(worker::spawn(
