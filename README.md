@@ -177,7 +177,8 @@ authentication (keep it off the open network as you would a database); it
 answers `GET /v1/models` and `GET /health`; and it prints one summary line on
 SIGTERM. With `--rerank-model-id` it loads the cross-encoder beside the
 embedder and answers `POST /v1/rerank` in the shape Cohere and Jina gave it,
-with the same scores `kohagi-rerank` writes. See
+with the same scores `kohagi-rerank` writes; `--rerank-expect-sha256` pins
+those weights as `--expect-sha256` pins the embedder's. See
 [PROTOCOL-http.md](PROTOCOL-http.md).
 
 ### Ruby

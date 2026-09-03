@@ -20,10 +20,8 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use kohagi::cli::{self, BackendArg, ModelArgs};
-use kohagi::rerank::{self, Reranker};
+use kohagi::cli::{self, ModelArgs};
 use kohagi::serve::{self, Listen, Load};
-use kohagi::{CoreMlQuantize, ModelSource};
 
 /// Serve local sentence embeddings over HTTP, OpenAI-compatible.
 ///
@@ -102,6 +100,18 @@ struct RerankArgs {
     /// first use. --rerank-coreml-dir wins if both are set.
     #[arg(long)]
     rerank_coreml_model_id: Option<String>,
+    /// Fixed sequence lengths to emit when `--device coreml` converts the
+    /// reranker itself. A pair fills more of a bucket than a single text does,
+    /// so these run longer than --coreml-buckets; they are `kohagi-rerank`'s
+    /// defaults, so the two produce the same bundle.
+    #[arg(long, value_delimiter = ',', default_values_t = cli::RERANK_COREML_BUCKETS)]
+    rerank_coreml_buckets: Vec<usize>,
+    /// Refuse to start unless the reranker's sha256 starts with this hex
+    /// prefix, as --expect-sha256 does for the embedder. A threshold belongs to
+    /// the weights it was tuned on; a mismatch exits 1 before anything is
+    /// served.
+    #[arg(long, value_name = "HEX")]
+    rerank_expect_sha256: Option<String>,
 }
 
 impl RerankArgs {
@@ -110,54 +120,40 @@ impl RerankArgs {
         self.rerank_model_id.is_some() || self.rerank_model_path.is_some()
     }
 
-    fn options(&self, model: &ModelArgs) -> rerank::Options {
-        rerank::Options {
+    /// These flags as the shared loader reads them. The device, the precision
+    /// and the batch size are the embedder's: one server, one machine, and a
+    /// reranker that ran somewhere else would be a second thing to configure
+    /// for no gain. Everything the two models do not share is spelled
+    /// `--rerank-*` here.
+    fn model<'a>(&'a self, model: &'a ModelArgs) -> cli::RerankModel<'a> {
+        cli::RerankModel {
+            model_path: self.rerank_model_path.as_ref(),
+            tokenizer_path: self.rerank_tokenizer_path.as_ref(),
+            model_id: self.rerank_model_id.as_deref().unwrap_or_default(),
+            device: model.device,
+            precision: model.precision,
+            coreml_dir: self.rerank_coreml_dir.as_ref(),
+            coreml_model_id: self.rerank_coreml_model_id.as_deref(),
+            coreml_buckets: &self.rerank_coreml_buckets,
+            coreml_prefer: model.coreml_prefer,
             max_seq_length: self.rerank_max_seq_length,
             batch_size: model.batch_size,
-            precision: model.precision.into(),
-            backend: model.device.into(),
             // The sigmoid, as `kohagi-rerank` reports by default and as
             // CrossEncoder does, so published thresholds carry over.
             sigmoid: true,
-            coreml_form: model.coreml_prefer.into(),
+            expect_sha256: self.rerank_expect_sha256.as_deref(),
         }
-    }
-
-    /// Where the reranker comes from, plus the name to show for it.
-    fn source(&self, model: &ModelArgs) -> anyhow::Result<(ModelSource, String)> {
-        let checkpoint = cli::checkpoint_source(
-            self.rerank_model_path.as_ref(),
-            self.rerank_tokenizer_path.as_ref(),
-            self.rerank_model_id.as_deref().unwrap_or_default(),
-        );
-        // CoreML loads converted fixed-shape models rather than safetensors.
-        // Never quantized, and with `kohagi-rerank`'s bucket lengths: a pair
-        // fills more of a bucket than a text does.
-        if model.device == BackendArg::Coreml {
-            return cli::coreml_source(
-                self.rerank_coreml_dir.as_ref(),
-                self.rerank_coreml_model_id.as_deref(),
-                &[128, 256, 512],
-                CoreMlQuantize::None,
-                checkpoint,
-            );
-        }
-        Ok(checkpoint)
-    }
-
-    fn load(&self, model: &ModelArgs, source: &ModelSource) -> anyhow::Result<Reranker> {
-        Reranker::load(source, self.options(model))
     }
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
     let (source, label) = args.model.source()?;
     let reranker = if args.rerank.wanted() {
-        let (rerank_source, rerank_label) = args.rerank.source(&args.model)?;
+        let (rerank_source, rerank_label) = args.rerank.model(&args.model).source()?;
         let (rerank, model) = (args.rerank.clone(), args.model.clone());
         Some(Load {
             label: rerank_label,
-            load: move || rerank.load(&model, &rerank_source),
+            load: move || rerank.model(&model).load(&rerank_source),
         })
     } else {
         None
@@ -212,5 +208,32 @@ mod tests {
         assert!(!off.rerank.wanted());
         let on = Args::try_parse_from(["kohagi-serve", "--rerank-model-id", "r"]).unwrap();
         assert!(on.rerank.wanted());
+    }
+
+    /// What the `--rerank-*` flags mean is `cli::RerankModel`'s, so the test
+    /// worth having is that they arrive there: the digest the caller pinned,
+    /// the buckets `kohagi-rerank` would convert, and the device and precision
+    /// of the embedder this reranker runs beside.
+    #[test]
+    fn the_rerank_flags_reach_the_shared_loader() {
+        let args = Args::try_parse_from([
+            "kohagi-serve",
+            "--rerank-model-id",
+            "org/reranker",
+            "--rerank-expect-sha256",
+            "1c342581efc2",
+            "--precision",
+            "bf16",
+        ])
+        .unwrap();
+        let model = args.rerank.model(&args.model);
+
+        assert_eq!(model.model_id, "org/reranker");
+        assert_eq!(model.expect_sha256, Some("1c342581efc2"));
+        assert_eq!(model.coreml_buckets, cli::RERANK_COREML_BUCKETS);
+        assert_eq!(model.options().precision, kohagi::Precision::Bf16);
+        assert_eq!(model.options().backend, kohagi::Backend::Cpu);
+        // The sigmoid, so a threshold tuned with `kohagi-rerank` carries over.
+        assert!(model.options().sigmoid);
     }
 }

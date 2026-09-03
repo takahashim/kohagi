@@ -10,9 +10,11 @@
 //! things, and a new binary inherits them rather than copying them.
 //!
 //! `kohagi` and `kohagi-serve` load the very same model, so they share the
-//! flag definitions too, flattened from [`ModelArgs`]. `kohagi-rerank` loads a
-//! cross-encoder with its own `Options` and its own defaults, and keeps its own
-//! flags; only the value enums and the source helpers are shared with it.
+//! flag definitions too, flattened from [`ModelArgs`]. A cross-encoder has
+//! other defaults and another `Options` type, so `kohagi-rerank` and
+//! `kohagi-serve` keep their own spellings for it (`--model-id` against
+//! `--rerank-model-id`); what they do not keep their own copy of is what those
+//! flags mean, which is [`RerankModel`].
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,6 +22,7 @@ use std::process::ExitCode;
 use clap::ValueEnum;
 
 use crate::program::remark;
+use crate::rerank::{self, Reranker};
 
 use crate::{
     Backend, CoreMlForm, CoreMlQuantize, Embedder, ModelInfo, ModelSource, Options, Pooling,
@@ -255,6 +258,82 @@ impl ModelArgs {
         let embedder = Embedder::load(source, self.options())?;
         verify_fingerprint(self.expect_sha256.as_deref(), &embedder.info())?;
         Ok(embedder)
+    }
+}
+
+/// The sequence lengths `--device coreml` converts a cross-encoder to when it
+/// converts one itself. A pair fills more of a bucket than a single text does,
+/// so these run longer than [`ModelArgs`]'s embedding defaults.
+pub const RERANK_COREML_BUCKETS: [usize; 3] = [128, 256, 512];
+
+/// How a cross-encoder is loaded, from whichever binary's flags carry it.
+///
+/// `kohagi-rerank` spells these `--model-id`, `--device` and so on;
+/// `kohagi-serve` spells them `--rerank-model-id` and takes the device and the
+/// precision from the embedder it runs beside. The spellings are each binary's,
+/// because a cross-encoder's defaults are not an embedder's, but which
+/// checkpoint they name and how it is loaded is decided once, here: the same
+/// flags through either binary must load the same reranker.
+pub struct RerankModel<'a> {
+    /// Local safetensors weights, with [`Self::tokenizer_path`] (offline mode).
+    pub model_path: Option<&'a PathBuf>,
+    pub tokenizer_path: Option<&'a PathBuf>,
+    /// The Hugging Face repo, used unless the two paths above are given.
+    pub model_id: &'a str,
+    pub device: BackendArg,
+    pub precision: PrecisionArg,
+    pub coreml_dir: Option<&'a PathBuf>,
+    pub coreml_model_id: Option<&'a str>,
+    /// What to convert when `--device coreml` converts the checkpoint itself;
+    /// [`RERANK_COREML_BUCKETS`] is what both binaries default it to.
+    pub coreml_buckets: &'a [usize],
+    pub coreml_prefer: CoreMlFormArg,
+    pub max_seq_length: usize,
+    pub batch_size: usize,
+    /// Report the sigmoid rather than the raw logit.
+    pub sigmoid: bool,
+    /// `--expect-sha256`, when the caller pinned a digest.
+    pub expect_sha256: Option<&'a str>,
+}
+
+impl RerankModel<'_> {
+    pub fn options(&self) -> rerank::Options {
+        rerank::Options {
+            max_seq_length: self.max_seq_length,
+            batch_size: self.batch_size,
+            precision: self.precision.into(),
+            backend: self.device.into(),
+            sigmoid: self.sigmoid,
+            coreml_form: self.coreml_prefer.into(),
+        }
+    }
+
+    /// Where the reranker comes from, plus the name to show for it.
+    pub fn source(&self) -> anyhow::Result<(ModelSource, String)> {
+        let checkpoint = checkpoint_source(self.model_path, self.tokenizer_path, self.model_id);
+        // CoreML loads converted fixed-shape models rather than safetensors.
+        // Never quantized: a reranker's output is one number compared against a
+        // threshold, and int8 moves it further than fp16 already does.
+        if self.device == BackendArg::Coreml {
+            return coreml_source(
+                self.coreml_dir,
+                self.coreml_model_id,
+                self.coreml_buckets,
+                CoreMlQuantize::None,
+                checkpoint,
+            );
+        }
+        Ok(checkpoint)
+    }
+
+    /// Load from `source` and, when `--expect-sha256` pinned a digest, refuse
+    /// weights that do not carry it, before any pair is scored or served. A
+    /// threshold belongs to the weights it was tuned on, so both binaries owe
+    /// the caller this check.
+    pub fn load(&self, source: &ModelSource) -> anyhow::Result<Reranker> {
+        let reranker = Reranker::load(source, self.options())?;
+        verify_fingerprint(self.expect_sha256, &reranker.info())?;
+        Ok(reranker)
     }
 }
 

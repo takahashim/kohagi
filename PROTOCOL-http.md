@@ -29,9 +29,10 @@ Every model flag of `kohagi` is taken as it is (`--model-id`, `--model-path`,
 prepended to every input text, as it is on the CLI; one server has one prefix.
 
 The server **loads before it listens**. A missing checkpoint, a bad flag or a
-failed `--expect-sha256` is a failed start with the CLI's exit code (1 fatal,
-3 the CoreML backend cannot serve this request), and no port is ever open for
-a model that is not there. Once listening it writes one line to stderr:
+failed `--expect-sha256` (or `--rerank-expect-sha256`) is a failed start with
+the CLI's exit code (1 fatal, 3 the CoreML backend cannot serve this request),
+and no port is ever open for a model that is not there. Once listening it
+writes one line to stderr:
 
 ```
 kohagi-serve: listening on http://127.0.0.1:8080 model=cl-nagoya/ruri-v3-130m sha256=1c342581efc2 pooling=mean dim=512 max_seq=512
@@ -63,6 +64,8 @@ versions may add fields.
 | `--rerank-model-path`, `--rerank-tokenizer-path` | none | the reranker from local files instead; also turns `/v1/rerank` on |
 | `--rerank-max-seq-length` | 512 | token-level truncation for a query/document pair; the longer half is trimmed first |
 | `--rerank-coreml-dir`, `--rerank-coreml-model-id` | none | the reranker's converted bundle under `--device coreml`; omitted, the checkpoint is converted on first use |
+| `--rerank-coreml-buckets` | 128,256,512 | what to convert when `--device coreml` converts the reranker itself; `kohagi-rerank`'s defaults, so the two produce the same bundle |
+| `--rerank-expect-sha256` | none | the reranker's digest, checked as `--expect-sha256` checks the embedder's; a mismatch is a failed start |
 | `--max-inputs` | 2048 | the most `input` items (or `documents`) one request may carry (OpenAI's own limit) |
 | `--max-body-bytes` | 32 MiB | the longest request body read; longer is 413 |
 | `--max-queue` | 64 | requests allowed to wait for the model (1 or more); one more is 503 |

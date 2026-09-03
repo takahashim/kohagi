@@ -17,7 +17,6 @@ use clap::Parser;
 
 use kohagi::cli::{self, BackendArg, CoreMlFormArg, PrecisionArg};
 use kohagi::rerank::{self, Reranker};
-use kohagi::ModelSource;
 
 /// Score query/document pairs with a Japanese ModernBERT cross-encoder.
 ///
@@ -57,7 +56,7 @@ struct Args {
     /// Fixed sequence lengths to emit when `--device coreml` converts a
     /// checkpoint itself. A pair fills more of a bucket than a single text
     /// does, so these run longer than the embedding defaults.
-    #[arg(long, value_delimiter = ',', default_values_t = [128usize, 256, 512])]
+    #[arg(long, value_delimiter = ',', default_values_t = cli::RERANK_COREML_BUCKETS)]
     coreml_buckets: Vec<usize>,
     /// When a --coreml-model-id repo ships both forms of a bucket, which to
     /// download.
@@ -98,46 +97,26 @@ struct Args {
 }
 
 impl Args {
-    fn options(&self) -> rerank::Options {
-        rerank::Options {
+    /// These flags as the shared loader reads them: what they mean, including
+    /// the digest check, is [`cli::RerankModel`]'s, so `kohagi-serve` loads the
+    /// same checkpoint the same way from its own `--rerank-*` spellings.
+    fn model(&self) -> cli::RerankModel<'_> {
+        cli::RerankModel {
+            model_path: self.model_path.as_ref(),
+            tokenizer_path: self.tokenizer_path.as_ref(),
+            model_id: &self.model_id,
+            device: self.device,
+            precision: self.precision,
+            coreml_dir: self.coreml_dir.as_ref(),
+            coreml_model_id: self.coreml_model_id.as_deref(),
+            coreml_buckets: &self.coreml_buckets,
+            coreml_prefer: self.coreml_prefer,
             max_seq_length: self.max_seq_length,
             batch_size: self.batch_size,
-            precision: self.precision.into(),
-            backend: self.device.into(),
             sigmoid: !self.raw_logits,
-            coreml_form: self.coreml_prefer.into(),
+            expect_sha256: self.expect_sha256.as_deref(),
         }
     }
-
-    /// Where the model comes from, plus the name to show in the summary.
-    fn source(&self) -> anyhow::Result<(ModelSource, String)> {
-        let checkpoint = cli::checkpoint_source(
-            self.model_path.as_ref(),
-            self.tokenizer_path.as_ref(),
-            &self.model_id,
-        );
-        // CoreML loads converted fixed-shape models rather than safetensors.
-        // Never quantized: a reranker's output is one number being compared
-        // against a threshold, and int8 moves it further than fp16 already does.
-        if self.device == BackendArg::Coreml {
-            return cli::coreml_source(
-                self.coreml_dir.as_ref(),
-                self.coreml_model_id.as_deref(),
-                &self.coreml_buckets,
-                kohagi::CoreMlQuantize::None,
-                checkpoint,
-            );
-        }
-        Ok(checkpoint)
-    }
-}
-
-/// Load the model and, when `--expect-sha256` pinned a digest, refuse weights
-/// that do not carry it — before anything is scored, whichever mode loads.
-fn load_checked(args: &Args, source: &ModelSource) -> anyhow::Result<Reranker> {
-    let reranker = Reranker::load(source, args.options())?;
-    cli::verify_fingerprint(args.expect_sha256.as_deref(), &reranker.info())?;
-    Ok(reranker)
 }
 
 /// `--pair` mode: send argument pairs to the protocol, which writes them like
@@ -159,10 +138,10 @@ fn score_arguments(
 }
 
 fn run(args: Args) -> anyhow::Result<usize> {
-    let (source, label) = args.source()?;
+    let (source, label) = args.model().source()?;
 
     if args.print_model_info || !args.pair.is_empty() {
-        let reranker = load_checked(&args, &source)?;
+        let reranker = args.model().load(&source)?;
         if args.print_model_info {
             cli::print_model_info(&label, &reranker.info())?;
         } else {
@@ -171,7 +150,7 @@ fn run(args: Args) -> anyhow::Result<usize> {
         return Ok(0);
     }
 
-    rerank::stdio::run(|| load_checked(&args, &source), args.report_tokens, &label)
+    rerank::stdio::run(|| args.model().load(&source), args.report_tokens, &label)
 }
 
 fn main() -> ExitCode {
