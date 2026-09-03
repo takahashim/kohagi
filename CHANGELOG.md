@@ -36,6 +36,11 @@
   `kohagi-reference` writes one forward pass down for another implementation to
   be held to. Not shipped and not in Kohagi's `Cargo.lock`; see tools/README.md.
 
+- **`cargo binstall kohagi`.** Metadata in `Cargo.toml` pointing binstall at the
+  release archives, so the three binaries can be installed without a compile.
+  `coreml-convert` is in no archive; binstall treats a `[[bin]]` with
+  `required-features` as optional and installs the rest.
+
 ### Changed
 
 - **`--print-model-info` reports `normalized`.** Whether each vector is unit

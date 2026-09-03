@@ -42,6 +42,13 @@ Or with cargo:
 cargo install kohagi
 ```
 
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) fetches the
+same release archive instead of compiling, and installs all three binaries:
+
+```bash
+cargo binstall kohagi
+```
+
 ### NVIDIA GPU on Windows
 
 Kohagi can use an NVIDIA GPU through CUDA on Windows x64. Install a compatible
@@ -258,7 +265,7 @@ Kohagiは[Ruri v3](https://huggingface.co/cl-nagoya/ruri-v3-130m) などのModer
 外部サービス等を使用せず、バイナリ単体で動作します。CPUのみでも動作しますし、Apple Neural EngineやCUDAもサポートしています。
 
 ```bash
-# インストール(リリースのバイナリ、または cargo install kohagi)
+# インストール(リリースのバイナリ、cargo install kohagi、cargo binstall kohagi のいずれか)
 kohagi --text "瑠璃も玻璃も照らせば光る"          # 動作確認
 kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 ```
