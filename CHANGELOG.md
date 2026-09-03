@@ -1,55 +1,46 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.0] - 2026-09-03
 
 ### Added
 
-- **`kohagi-serve`: the same model behind an OpenAI-compatible HTTP API.** A
-  third binary, shipped beside the other two, that loads a model once and
-  answers `POST /v1/embeddings` (`input` as a string or strings,
-  `encoding_format: "base64"`, `dimensions`), `GET /v1/models` (with
-  `--print-model-info`'s facts under `kohagi`) and `GET /health`. For the
-  caller that wants one model per host rather than one per process, which a
-  pipe cannot give a Rails cluster; batches stay on the stdio protocol. It
-  loads before it listens, so a missing checkpoint is a failed start (exit 1,
-  or 3 for CoreML) rather than an open port; binds to `127.0.0.1:8080` unless
-  `--listen` says otherwise, `unix:///path` included (a Unix socket, mode
-  0600); answers one request at a time and refuses with 503 once
-  `--max-queue` are waiting; and prints one summary line on SIGTERM or
-  SIGINT. HTTP/1.1, no TLS, no authentication. See PROTOCOL-http.md.
+- **`kohagi-serve`: an OpenAI-compatible HTTP server.** A third binary, in the
+  release archives beside the other two, for callers that want one model per
+  host rather than one per process. It loads the model once and answers
+  `POST /v1/embeddings` (`encoding_format: "base64"` and `dimensions`
+  included), `GET /v1/models` and `GET /health` until SIGTERM. OpenAI clients
+  work by pointing `base_url` at it.
 
-- **`kohagi-serve --rerank-model-id`: the reranker over HTTP.** Loads the
-  cross-encoder beside the embedder, on a thread of its own, and answers
-  `POST /v1/rerank` in the shape Cohere and Jina share (`query`, `documents`
-  as strings or `{"text"}` objects, `top_n`, `return_documents`; results best
-  first with `index` and `relevance_score`). The scores are the sigmoid
-  `kohagi-rerank` writes, identical for the same pair. `GET /v1/models` lists
-  both models, and the summary gains `scored=` and a line naming the reranker.
-  Without the flag, `/v1/rerank` is 404 and says which flag turns it on.
-  `--rerank-expect-sha256` pins its weights as `--expect-sha256` pins the
-  embedder's, and `--rerank-coreml-buckets` converts it to the same lengths
-  `kohagi-rerank` uses; both are refused when no reranker was asked for.
+  `--listen` takes `host:port` (default `127.0.0.1:8080`) or `unix:///path`,
+  and the model flags are `kohagi`'s. There is no TLS and no authentication, so
+  keep it off the open network as you would a database. The contract, with the
+  request limits and every error, is [PROTOCOL-http.md](PROTOCOL-http.md).
 
-- **`tools/`: the development jigs, outside the workspace.** `kohagi-pairs`
-  reads an mteb reranking dataset into pairs, `kohagi-dataset` scores them with
-  the teacher once so a student can be trained many times, and
-  `kohagi-reference` writes one forward pass down for another implementation to
-  be held to. Not shipped and not in Kohagi's `Cargo.lock`; see tools/README.md.
+- **`POST /v1/rerank`, with `--rerank-model-id`.** The cross-encoder
+  `kohagi-rerank` runs, loaded beside the embedder, in the shape Cohere and
+  Jina share. The same pair gets the same score on either, so a threshold
+  carries over. `--rerank-expect-sha256` pins those weights as
+  `--expect-sha256` pins the embedder's.
+
+- **`kohagi::serve` and `kohagi::VERSION`** for callers of the library.
 
 ### Changed
 
-- **`--print-model-info` reports `normalized`.** Whether each vector is unit
-  length (`true` unless `--no-normalize`), beside `pooling` and `dim`, since it
-  changes every vector as surely as they do and a results file could not say.
-  `kohagi-serve` reads the same field to decide whether a request's
-  `dimensions` can be honoured.
+- **`--print-model-info` reports `normalized`**, whether each vector is unit
+  length (`true` unless `--no-normalize`), which the numbers in a results file
+  cannot say. `GET /v1/models` carries the same field.
 
 ### Removed
 
-- **`examples/openai_proxy/`.** The Python, Ruby and TypeScript proxies were
-  the bridge to the OpenAI ecosystem while Kohagi had no HTTP mode. With
-  `kohagi-serve` the bridge is a binary, and keeping the scripts would leave
-  two answers to one question.
+- **`examples/openai_proxy/`.** The Python, Ruby and TypeScript proxies bridged
+  Kohagi to OpenAI clients while it had no HTTP mode; `kohagi-serve` is that
+  bridge now.
+
+### Compatibility
+
+- **`Output::Embedding` has a new `normalized` field.** Rust code that
+  constructs or matches it exhaustively needs updating; reading `ModelInfo` as
+  JSON does not.
 
 ## [0.6.0] - 2026-08-23
 
@@ -419,6 +410,9 @@
 - Hardened CI: `cargo fmt` / `--locked` checks, per-target release builds, and a
   Metal lint.
 
+[0.7.0]: https://github.com/takahashim/kohagi/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/takahashim/kohagi/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/takahashim/kohagi/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/takahashim/kohagi/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/takahashim/kohagi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/takahashim/kohagi/compare/v0.2.0...v0.3.0
