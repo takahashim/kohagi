@@ -140,5 +140,25 @@ coreml = [
 name = "coreml-convert"
 required-features = ["coreml-export"]
 
+# `cargo binstall kohagi`: take the release archive rather than compile it.
+#
+# `pkg-url` is spelled out because binstall's default expects the version in the
+# archive name (`{name}-{version}-{target}`) and ci.yml packages without it. The
+# archives are built with `tar -C target/<target>/release`, so the binaries sit
+# at the archive root and `bin-dir` needs no directory component.
+#
+# `coreml-convert` is in no archive and stays that way: binstall treats a
+# `[[bin]]` carrying `required-features` as optional, so it warns that the file
+# is missing and installs the other three.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/kohagi-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+# Windows is the one target packaged as a zip; see ci.yml's `Package (Windows)`.
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/kohagi-{ target }.zip"
+pkg-fmt = "zip"
+
 [profile.release]
 lto = "thin"

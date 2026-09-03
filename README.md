@@ -22,8 +22,9 @@ It is designed for one job: embedding text in batches from any environment that 
 
 ## Install
 
-Prebuilt binaries for macOS (Apple Silicon), Linux (x86_64), and Windows x64
-(NVIDIA CUDA) are on the [releases page](https://github.com/takahashim/kohagi/releases).
+Prebuilt binaries for macOS (Apple Silicon), Linux (x86_64 and aarch64), and
+Windows x64 (NVIDIA CUDA) are on the
+[releases page](https://github.com/takahashim/kohagi/releases).
 On macOS and Linux:
 
 ```bash
@@ -40,6 +41,13 @@ Or with cargo:
 
 ```bash
 cargo install kohagi
+```
+
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) fetches the
+same release archive instead of compiling, and installs all three binaries:
+
+```bash
+cargo binstall kohagi
 ```
 
 ### NVIDIA GPU on Windows
@@ -258,7 +266,7 @@ Kohagiは[Ruri v3](https://huggingface.co/cl-nagoya/ruri-v3-130m) などのModer
 外部サービス等を使用せず、バイナリ単体で動作します。CPUのみでも動作しますし、Apple Neural EngineやCUDAもサポートしています。
 
 ```bash
-# インストール(リリースのバイナリ、または cargo install kohagi)
+# インストール(リリースのバイナリ、cargo install kohagi、cargo binstall kohagi のいずれか)
 kohagi --text "瑠璃も玻璃も照らせば光る"          # 動作確認
 kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 ```
