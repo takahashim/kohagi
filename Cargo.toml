@@ -133,13 +133,12 @@ coreml = [
 # release build enables that feature (so `--device coreml` can convert a
 # checkpoint itself), but only `kohagi` is packaged: converting to a directory is
 # a publisher's one-off, not part of embedding text. See src/bin/coreml-convert.rs.
+#
+# The only binary that needs a section here. `kohagi-rerank` and `kohagi-serve`
+# need no feature and ship on every target, so src/bin is left to say so.
 [[bin]]
 name = "coreml-convert"
 required-features = ["coreml-export"]
-
-# Ships with `kohagi` and `kohagi-rerank` on every target: it needs no feature.
-[[bin]]
-name = "kohagi-serve"
 
 [profile.release]
 lto = "thin"
