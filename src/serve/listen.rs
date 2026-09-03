@@ -101,18 +101,7 @@ impl Bound {
                 .with_context(|| format!("listening on {addr}"))
                 .map(Bound::Tcp),
             #[cfg(unix)]
-            Listen::Unix(path) => {
-                let lock = lock_socket(path)?;
-                remove_stale_socket(path)?;
-                let listener = UnixListener::bind(path)
-                    .with_context(|| format!("listening on unix://{}", path.display()))?;
-                // Owner only, as a database's socket is. The file exists for a
-                // moment before this with the umask's mode; a connection in that
-                // moment still waits for accept, which starts after.
-                std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-                    .with_context(|| format!("setting the mode of {}", path.display()))?;
-                Ok(Bound::Unix(listener, SocketFile::at(path, lock)?))
-            }
+            Listen::Unix(path) => bind_unix(path),
             #[cfg(not(unix))]
             Listen::Unix(_) => unreachable!("refused when the flag was parsed"),
         }
@@ -165,6 +154,24 @@ impl Drop for Bound {
             }
         }
     }
+}
+
+/// Take over a socket path: hold the per-socket lock, clear a previous run's
+/// socket if that is what is there, bind, and shut the file to its owner. The
+/// listener's own file is recorded last, and is what [`Bound`]'s `Drop`
+/// unlinks.
+#[cfg(unix)]
+fn bind_unix(path: &Path) -> Result<Bound> {
+    let lock = lock_socket(path)?;
+    remove_stale_socket(path)?;
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("listening on unix://{}", path.display()))?;
+    // Owner only, as a database's socket is. The file exists for a moment
+    // before this with the umask's mode; a connection in that moment still
+    // waits for accept, which starts after.
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .with_context(|| format!("setting the mode of {}", path.display()))?;
+    Ok(Bound::Unix(listener, SocketFile::at(path, lock)?))
 }
 
 #[cfg(unix)]
