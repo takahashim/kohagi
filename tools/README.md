@@ -14,6 +14,12 @@ of the published crate.
 - [`eval_retrieval.py`](eval_retrieval.py) measures JaCWIR and JQaRA retrieval
   quality for any Kohagi configuration, which is what the quantization numbers
   rest on.
+- [`reference/`](reference/) writes Kohagi's forward pass down as a JSON
+  artifact — token ids and the pooled, normalized vector — so another
+  implementation of the same architecture can be held to it. Torobi (the MLX
+  training framework) uses it to check that the ModernBERT it describes in its
+  own IR computes what Kohagi computes. Rust, no Python, and it reads Kohagi's
+  public API rather than widening it.
 - [`coreml-jigs/`](coreml-jigs/) holds Rust jigs for the CoreML backend, which
   read a converted bundle, check Neural Engine placement, measure per-bucket
   latency, and compare two configurations. See its own README.
