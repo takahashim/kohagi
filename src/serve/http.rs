@@ -15,6 +15,7 @@ use super::counts::Counts;
 use super::reply::{json, ApiError, Reply};
 use super::worker::Loaded;
 use super::{Batch, Config, Pairs, Scores};
+use crate::program::remark;
 use crate::ModelInfo;
 
 /// Everything a handler reads: the models, the limits, and the counters the
@@ -71,11 +72,19 @@ impl State {
         models
     }
 
-    /// The run's one summary line: the numbers are [`Counts`]', and which
-    /// model answered is this state's.
+    /// The summary at shutdown: the numbers are [`Counts`]', and which models
+    /// answered is this state's. A loaded reranker gets the second line the
+    /// start already gives it, so `scored=` above has weights to belong to.
     pub(crate) fn summarize(&self) {
         self.counts
             .summarize(&self.embedder.label, &self.embedder.info.summary_facts());
+        if let Some(reranker) = &self.reranker {
+            remark!(
+                "reranker={} {}",
+                reranker.label,
+                reranker.info.summary_facts()
+            );
+        }
     }
 }
 

@@ -47,7 +47,11 @@ summary line, and exits 0:
 
 ```
 kohagi-serve: model=cl-nagoya/ruri-v3-130m sha256=1c342581efc2 pooling=mean dim=512 max_seq=512 requests=1204 in=1310 truncated=2 scored=480 rejected=3 failed=0
+kohagi-serve: reranker=cl-nagoya/ruri-v3-reranker-310m sha256=9f747a085a0a pooling=cls dim=768 max_seq=512 score=sigmoid
 ```
+
+The second line appears when a reranker was loaded, as at the start, so the
+weights behind `scored=` are in the same place as the numbers.
 
 `requests` counts everything that arrived; `rejected` the 4xx among them
 (the client's mistake) and `failed` the 5xx (this side's, a full queue
@@ -237,6 +241,8 @@ callers: the file's permissions are the access control and no port needs
 choosing. The socket is created with mode 0600. A socket left at the path by a
 previous run is replaced; a running `kohagi-serve` at that path, or anything
 that is not a socket, is refused rather than replaced. The file is removed at
+shutdown.
+
 shutdown. Unix only; on Windows
 `--listen` takes `host:port`.
 
