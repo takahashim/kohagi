@@ -126,7 +126,7 @@ model, writes one JSON object on stdout, and exits 0 without reading stdin:
 
 ```console
 $ kohagi --print-model-info
-{"model":"cl-nagoya/ruri-v3-130m","backend":"cpu","precision":"f32","sha256":"1c342581efc23d0b50b92fb11ac1eeb02719691bcc59bdc0dc0b09a36b4fc6d1","pooling":"mean","dim":512,"max_seq_length":512}
+{"model":"cl-nagoya/ruri-v3-130m","backend":"cpu","precision":"f32","sha256":"1c342581efc23d0b50b92fb11ac1eeb02719691bcc59bdc0dc0b09a36b4fc6d1","pooling":"mean","dim":512,"max_seq_length":512,"normalized":true}
 ```
 
 Call it once at the start of an evaluation and record the object beside the
@@ -141,6 +141,7 @@ change what the numbers say they came from.
 | `pooling` | The pooling resolved at load, taken from the checkpoint's own `1_Pooling/config.json` unless `--pooling` overrode it. |
 | `dim` | The model's own dimension. |
 | `output_dim` | `--dims N`, when it truncated the output below `dim`. Absent when nothing was truncated, whether because the flag was not given or because `--dims` equalled `dim` and changed no vector. |
+| `normalized` | Whether each vector is unit length, so that dot product is cosine: `true` unless `--no-normalize`. Changes every vector as surely as `pooling` does, and the numbers alone do not say. |
 | `max_seq_length` | Token-level truncation length for this run. |
 | `declared_max_seq_length` | What the checkpoint's `sentence_bert_config.json` says it can take, when it ships one. Reported, not obeyed: `--max-seq-length` decides the run. sentence-transformers reads this field, so a value above `max_seq_length` is where the two libraries embed the same long text differently (`ruri-v3-130m` declares 8192). |
 | `source`, `source_sha256` | `--device coreml` only: the checkpoint the bundle was converted from, and the digest of *its* weights. Absent for a bundle whose converter recorded none; an unknown provenance is reported as unknown rather than guessed. |
@@ -194,6 +195,10 @@ replaces the JSONL stream with one response object for the whole run:
  "model": "cl-nagoya/ruri-v3-130m",
  "usage": {"prompt_tokens": 15, "total_tokens": 15}}
 ```
+
+This is also the reply `kohagi-serve` gives over HTTP, where it is the
+protocol rather than an alternate format; see
+[PROTOCOL-http.md](PROTOCOL-http.md).
 
 Everything on stdin is unchanged; the input is still this protocol's JSONL.
 What changes on stdout:

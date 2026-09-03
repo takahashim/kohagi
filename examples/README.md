@@ -1,13 +1,12 @@
 # Examples
 
-How to call Kohagi from your own code. Both work the same way underneath.
-They spawn the process, write JSONL, and read JSONL.
+How to call Kohagi from your own code.
 
 - [`rails_open3.rb`](rails_open3.rb) shows the stdio protocol from
-  Ruby/Rails, the pattern any language can copy.
-- [`openai_proxy/`](openai_proxy/) serves an OpenAI-compatible
-  `/v1/embeddings` endpoint in Python, Ruby and TypeScript, so existing
-  OpenAI code works by swapping `base_url`.
+  Ruby/Rails, the pattern any language can copy: spawn the process, write
+  JSONL, and read JSONL.
+- An OpenAI-compatible `/v1/embeddings` endpoint is `kohagi-serve`, a binary
+  rather than an example; see [PROTOCOL-http.md](../PROTOCOL-http.md).
 
 The scripts that measure and verify Kohagi rather than demonstrate it
 (`parity_check.py`, `benchmark.py`, `model_check.py`, `scaling_check.py`,

@@ -13,9 +13,7 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::protocol::{
-    drive, parse_object, summarize, summary_facts, take_id, take_nonempty_str, Lazy, Records,
-};
+use crate::protocol::{drive, parse_object, summarize, take_id, take_nonempty_str, Lazy, Records};
 use crate::{Embedder, TokenInfo};
 
 #[derive(Serialize)]
@@ -294,7 +292,7 @@ pub fn run(
     let facts = records
         .model
         .loaded()
-        .map_or_else(|| "dim=0".to_string(), |e| summary_facts(&e.info()));
+        .map_or_else(|| "dim=0".to_string(), |e| e.info().summary_facts());
     summarize(model_label, &facts, &counts);
     Ok(counts.skipped)
 }
@@ -471,7 +469,10 @@ mod tests {
             dim: 512,
             max_seq_length: 512,
             declared_max_seq_length: None,
-            output: crate::Output::Embedding { output_dim: None },
+            output: crate::Output::Embedding {
+                output_dim: None,
+                normalized: true,
+            },
         }
     }
 
@@ -494,7 +495,7 @@ mod tests {
     #[test]
     fn the_summary_says_which_weights_it_used() {
         assert_eq!(
-            summary_facts(&info()),
+            info().summary_facts(),
             "sha256=0123456789ab pooling=mean dim=512 max_seq=512"
         );
 
@@ -505,7 +506,7 @@ mod tests {
             ..info()
         };
         assert_eq!(
-            summary_facts(&coreml),
+            coreml.summary_facts(),
             "source_sha256=fedcba987654 pooling=mean dim=512 max_seq=512"
         );
 
@@ -515,7 +516,7 @@ mod tests {
             bundle: Some(bundle(None)),
             ..coreml
         };
-        assert_eq!(summary_facts(&unknown), "pooling=mean dim=512 max_seq=512");
+        assert_eq!(unknown.summary_facts(), "pooling=mean dim=512 max_seq=512");
     }
 
     /// `--dims` changes what every vector is, so the summary's `dim=` reports
@@ -525,11 +526,12 @@ mod tests {
         let truncated = crate::ModelInfo {
             output: crate::Output::Embedding {
                 output_dim: Some(256),
+                normalized: true,
             },
             ..info()
         };
         assert_eq!(
-            summary_facts(&truncated),
+            truncated.summary_facts(),
             "sha256=0123456789ab pooling=mean dim=256 max_seq=512"
         );
     }
@@ -539,7 +541,7 @@ mod tests {
     fn the_documented_model_info_line_is_unchanged() {
         assert_eq!(
             serde_json::to_string(&info()).unwrap(),
-            r#"{"backend":"cpu","precision":"f32","sha256":"0123456789abcdef0123456789abcdef","pooling":"mean","dim":512,"max_seq_length":512}"#
+            r#"{"backend":"cpu","precision":"f32","sha256":"0123456789abcdef0123456789abcdef","pooling":"mean","dim":512,"max_seq_length":512,"normalized":true}"#
         );
 
         // Bundle metadata replaces the old loose fields.
@@ -551,10 +553,11 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&coreml).unwrap(),
-            r#"{"backend":"coreml","precision":"f32","source_sha256":"fedcba98","buckets":[512],"quantization":"none","pooling":"mean","dim":512,"max_seq_length":512}"#
+            r#"{"backend":"coreml","precision":"f32","source_sha256":"fedcba98","buckets":[512],"quantization":"none","pooling":"mean","dim":512,"max_seq_length":512,"normalized":true}"#
         );
 
-        // A reranker has `score`, not `output_dim`.
+        // A reranker has `score`; `output_dim` and `normalized` are about
+        // vectors, which it does not produce.
         let reranker = crate::ModelInfo {
             output: crate::Output::Score { score: "sigmoid" },
             ..info()
@@ -563,6 +566,7 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&reranker).unwrap()).unwrap();
         assert_eq!(json["score"], "sigmoid");
         assert!(json.get("output_dim").is_none());
+        assert!(json.get("normalized").is_none());
     }
 
     /// What `--print-model-info` writes, which evaluation scripts read into
@@ -578,6 +582,7 @@ mod tests {
         assert_eq!(json["dim"], 512);
         assert_eq!(json["max_seq_length"], 512);
         assert_eq!(json["sha256"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(json["normalized"], true);
         for absent in [
             "source",
             "source_sha256",
@@ -593,6 +598,7 @@ mod tests {
         let truncated = crate::ModelInfo {
             output: crate::Output::Embedding {
                 output_dim: Some(256),
+                normalized: true,
             },
             ..info()
         };

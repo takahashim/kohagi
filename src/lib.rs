@@ -5,7 +5,9 @@
 //! Hub or local files), hand it a batch of texts, get back one `Vec<f32>` per
 //! text. The binary in `main.rs` wraps it in a stdin/stdout JSONL protocol
 //! (see `stdio.rs` and PROTOCOL.md) so any language that can spawn a process
-//! can embed text without an HTTP server.
+//! can embed text without an HTTP server; `kohagi-serve` (see `serve`) puts
+//! the same type behind an OpenAI-compatible `/v1/embeddings`, for callers
+//! that want one model per host instead of one per process.
 //!
 //! ```no_run
 //! use kohagi::{Embedder, ModelSource, Options};
@@ -50,6 +52,7 @@ mod model;
 pub mod program;
 mod protocol;
 pub mod rerank;
+pub mod serve;
 mod source;
 pub mod stdio;
 

@@ -208,6 +208,69 @@ pub fn l2_normalize(row: &mut [f32]) {
     }
 }
 
+/// Matryoshka truncation: keep the leading `n` dimensions and re-normalize,
+/// so the shorter vector is unit-length in its own space and dot = cosine
+/// holds on it. Truncating first is the order `SentenceTransformer(...,
+/// truncate_dim=N)` uses. This is the one definition, for a run's `--dims`
+/// and a request's `dimensions` alike, so the two cannot drift.
+pub fn truncate_renormalize(row: &mut Vec<f32>, n: usize) {
+    row.truncate(n);
+    l2_normalize(row);
+}
+
+/// What a truncation to `n` means on vectors of `dim` dimensions: `Some(n)`
+/// when it shortens them, `None` when `n == dim` and it changes no vector,
+/// and an error outside `1..=dim`. Callers phrase the error for their own
+/// flag or field; this only decides.
+pub fn truncation(n: usize, dim: usize) -> Result<Option<usize>, OutOfRange> {
+    if !(1..=dim).contains(&n) {
+        return Err(OutOfRange { dim });
+    }
+    Ok((n < dim).then_some(n))
+}
+
+/// A truncation outside what the vectors can be cut to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutOfRange {
+    pub dim: usize,
+}
+
+impl std::fmt::Display for OutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "must be in 1..={}", self.dim)
+    }
+}
+
+impl std::error::Error for OutOfRange {}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    /// The truncated vector is unit-length in its own space, not a slice of a
+    /// unit vector: that is the difference between dot = cosine holding on the
+    /// shorter vectors and silently not.
+    #[test]
+    fn truncation_renormalizes_the_kept_prefix() {
+        let mut v = vec![3.0, 4.0, 12.0];
+        truncate_renormalize(&mut v, 2);
+        assert_eq!(v, [0.6, 0.8]);
+    }
+
+    /// Equal to the dimension asks for nothing, since it changes no vector;
+    /// outside `1..=dim` is refused with the dimension named.
+    #[test]
+    fn a_truncation_is_a_shortening_or_nothing() {
+        assert_eq!(truncation(256, 512), Ok(Some(256)));
+        assert_eq!(truncation(1, 512), Ok(Some(1)));
+        assert_eq!(truncation(512, 512), Ok(None));
+        for bad in [0, 513] {
+            let e = truncation(bad, 512).unwrap_err();
+            assert_eq!(e.to_string(), "must be in 1..=512");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

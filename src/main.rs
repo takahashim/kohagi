@@ -8,13 +8,12 @@
 //! converted bucket) — caught before any input is read, so the caller can
 //! retry on `--device cpu`.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
-use kohagi::cli::{self, BackendArg, CoreMlFormArg, CoreMlQuantizeArg, PoolingArg, PrecisionArg};
-use kohagi::{stdio, Embedder, ModelSource, Options};
+use kohagi::cli::{self, ModelArgs};
+use kohagi::{stdio, ModelSource};
 
 /// This binary's own output shape; the rest of the CLI value enums are shared
 /// with `kohagi-rerank` in [`kohagi::cli`].
@@ -43,68 +42,13 @@ impl From<FormatArg> for stdio::Format {
 #[derive(Parser)]
 #[command(name = "kohagi", version)]
 struct Args {
-    /// Hugging Face model repo to download (ignored with --model-path).
-    #[arg(long, default_value = "cl-nagoya/ruri-v3-130m")]
-    model_id: String,
-    /// Local safetensors weights (offline mode; config.json must sit next to
-    /// it). Requires --tokenizer-path.
-    #[arg(long, requires = "tokenizer_path")]
-    model_path: Option<PathBuf>,
-    /// Local tokenizer.json (offline mode).
-    #[arg(long, requires = "model_path")]
-    tokenizer_path: Option<PathBuf>,
+    #[command(flatten)]
+    model: ModelArgs,
     /// Prefix prepended to every text before embedding. Ruri v3 task
     /// prefixes: "検索文書: ", "検索クエリ: ", "トピック: ", or "" (plain
     /// sentence similarity).
     #[arg(long, default_value = "")]
     prefix: String,
-    /// How to reduce token embeddings to one vector per text. Omit to take the
-    /// model's own choice from its 1_Pooling/config.json (mean if it ships
-    /// none); pass this only to override that.
-    #[arg(long, value_enum)]
-    pooling: Option<PoolingArg>,
-    /// Numeric precision of the forward pass. f32 is identical everywhere;
-    /// bf16 is faster but not bit-identical.
-    #[arg(long, value_enum, default_value_t = PrecisionArg::F32)]
-    precision: PrecisionArg,
-    /// Device for the forward pass. cuda requires an NVIDIA GPU and a binary
-    /// built with `--features cuda`. metal requires a binary built with
-    /// `--features metal`, and runs ~1.2x faster than cpu on Apple Silicon.
-    /// coreml (Apple Neural Engine) requires `--features coreml`; with no
-    /// --coreml-dir or --coreml-model-id it converts --model-id itself and
-    /// caches the result.
-    #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
-    device: BackendArg,
-    /// Directory of pre-converted CoreML models for `--device coreml`: one
-    /// `seq-<N>.mlpackage` per bucket length, plus tokenizer.json and
-    /// config.json. Produce one with the coreml-convert binary or
-    /// scripts/convert_coreml.py. Omit it to convert --model-id on first use.
-    #[arg(long)]
-    coreml_dir: Option<PathBuf>,
-    /// Hugging Face repo holding the CoreML models (same layout as
-    /// --coreml-dir), downloaded and cached on first use. Alternative to
-    /// --coreml-dir for `--device coreml`; --coreml-dir wins if both are set.
-    #[arg(long)]
-    coreml_model_id: Option<String>,
-    /// Fixed sequence lengths to emit when `--device coreml` converts a
-    /// checkpoint itself (that is, when neither --coreml-dir nor
-    /// --coreml-model-id is given). Each becomes one CoreML function over a
-    /// single shared copy of the weights, so the set costs no disk; what it
-    /// costs is one model to open per length. Match it to the lengths your
-    /// texts actually are — a bucket nothing lands in is pure overhead.
-    #[arg(long, value_delimiter = ',', default_values_t = [64usize, 128, 256, 512])]
-    coreml_buckets: Vec<usize>,
-    /// Quantize the model when `--device coreml` converts it. `embeddings`
-    /// halves a large-vocabulary bundle at no measured retrieval cost;
-    /// `all` roughly halves it again for a small one. Omit for fp16 — a
-    /// quantized bundle's vectors are not interchangeable with an fp16 one's.
-    #[arg(long, value_enum)]
-    coreml_quantize: Option<CoreMlQuantizeArg>,
-    /// When a --coreml-model-id repo ships both forms of a bucket, which to
-    /// download: `compiled` (.mlmodelc, faster) or `package` (.mlpackage,
-    /// portable). Only the chosen form is fetched.
-    #[arg(long, value_enum, default_value_t = CoreMlFormArg::Compiled)]
-    coreml_prefer: CoreMlFormArg,
     /// Shape of stdout. `jsonl` is Kohagi's protocol, one record per line,
     /// echoing each input's id. `openai` is one `/v1/embeddings` response
     /// object for the whole run, so code written against that API can read it
@@ -118,31 +62,6 @@ struct Args {
     /// line always reports how many records were truncated regardless.
     #[arg(long)]
     report_tokens: bool,
-    /// Skip L2 normalization (normalized output is the default; unit vectors
-    /// make dot product = cosine).
-    #[arg(long)]
-    no_normalize: bool,
-    /// Keep only the first N dimensions of each embedding and re-normalize
-    /// (Matryoshka truncation — meaningful for models trained for it). dot =
-    /// cosine still holds on the shorter vectors, and they must not share an
-    /// index with full-dimension ones. Refused if N is 0 or exceeds the model
-    /// dimension, or combined with --no-normalize.
-    #[arg(long, value_name = "N")]
-    dims: Option<usize>,
-    /// Refuse to embed anything unless the loaded weights' sha256 starts with
-    /// this hex prefix — paste the 12 digits from a summary line or the full
-    /// digest from --print-model-info. A mismatch exits 1 before any record is
-    /// answered, so the wrong checkpoint cannot survive into results. With
-    /// --device coreml the bundle's recorded source_sha256 is checked instead,
-    /// and a bundle that recorded none is refused.
-    #[arg(long, value_name = "HEX")]
-    expect_sha256: Option<String>,
-    /// Token-level truncation length.
-    #[arg(long, default_value_t = 512)]
-    max_seq_length: usize,
-    /// Bucketing granularity; memory stays bounded regardless (see model.rs).
-    #[arg(long, default_value_t = 64)]
-    batch_size: usize,
     /// Embed these texts and exit, instead of reading stdin. Repeatable;
     /// output ids are the argument positions (0, 1, …).
     #[arg(long)]
@@ -155,53 +74,10 @@ struct Args {
     print_model_info: bool,
 }
 
-impl Args {
-    fn options(&self) -> Options {
-        Options {
-            pooling: self.pooling.map(Into::into),
-            normalize: !self.no_normalize,
-            dims: self.dims,
-            max_seq_length: self.max_seq_length,
-            batch_size: self.batch_size,
-            precision: self.precision.into(),
-            backend: self.device.into(),
-            coreml_form: self.coreml_prefer.into(),
-        }
-    }
-
-    /// Where to load the model from, plus the name to show in the summary.
-    fn source(&self) -> anyhow::Result<(ModelSource, String)> {
-        let checkpoint = cli::checkpoint_source(
-            self.model_path.as_ref(),
-            self.tokenizer_path.as_ref(),
-            &self.model_id,
-        );
-        // CoreML loads converted fixed-shape models rather than safetensors.
-        if self.device == BackendArg::Coreml {
-            return cli::coreml_source(
-                self.coreml_dir.as_ref(),
-                self.coreml_model_id.as_deref(),
-                &self.coreml_buckets,
-                self.coreml_quantize.map(Into::into).unwrap_or_default(),
-                checkpoint,
-            );
-        }
-        Ok(checkpoint)
-    }
-}
-
-/// Load the model and, when `--expect-sha256` pinned a digest, refuse weights
-/// that do not carry it — before anything is embedded, whichever mode loads.
-fn load_checked(args: &Args, source: &ModelSource) -> anyhow::Result<Embedder> {
-    let embedder = Embedder::load(source, args.options())?;
-    cli::verify_fingerprint(args.expect_sha256.as_deref(), &embedder.info())?;
-    Ok(embedder)
-}
-
 /// `--text` mode: embed the arguments and print what stdio mode would, with the
 /// argument positions as ids.
 fn embed_arguments(args: &Args, source: &ModelSource, label: &str) -> anyhow::Result<()> {
-    let embedder = load_checked(args, source)?;
+    let embedder = args.model.load(source)?;
     let prefixed: Vec<String> = args
         .text
         .iter()
@@ -225,7 +101,7 @@ fn embed_arguments(args: &Args, source: &ModelSource, label: &str) -> anyhow::Re
 
 /// Returns the number of skipped input lines (0 in `--text` mode).
 fn run(args: Args) -> anyhow::Result<usize> {
-    let (source, label) = args.source()?;
+    let (source, label) = args.model.source()?;
 
     // The OpenAI item shape has nowhere to put per-record token counts, and
     // dropping what was asked for silently is worse than saying so. The total is
@@ -243,7 +119,7 @@ fn run(args: Args) -> anyhow::Result<usize> {
     if args.print_model_info {
         // Checked here too, so `--print-model-info --expect-sha256 …` is a
         // standalone "is this the checkpoint I think it is" that exits 1.
-        let embedder = load_checked(&args, &source)?;
+        let embedder = args.model.load(&source)?;
         cli::print_model_info(&label, &embedder.info())?;
         return Ok(0);
     }
@@ -254,7 +130,7 @@ fn run(args: Args) -> anyhow::Result<usize> {
     }
 
     stdio::run(
-        || load_checked(&args, &source),
+        || args.model.load(&source),
         &args.prefix,
         args.report_tokens,
         &label,

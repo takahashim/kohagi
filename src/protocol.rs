@@ -186,24 +186,6 @@ pub(crate) fn summarize(model_label: &str, facts: &str, counts: &Counts) {
     );
 }
 
-/// Returns the model-specific part of the summary line.
-pub(crate) fn summary_facts(info: &crate::ModelInfo) -> String {
-    let mut out = String::new();
-    if let Some((claim, sha)) = info.digest() {
-        out.push_str(&format!("{claim}={} ", crate::fingerprint::short(sha)));
-    }
-    out.push_str(&format!(
-        "pooling={} dim={} max_seq={}",
-        info.pooling,
-        info.reported_dim(),
-        info.max_seq_length
-    ));
-    if let crate::Output::Score { score } = info.output {
-        out.push_str(&format!(" score={score}"));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

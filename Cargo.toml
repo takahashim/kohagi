@@ -29,6 +29,21 @@ tokenizers = "0.21"
 half = "2"
 hf-hub = "0.4"
 
+# `kohagi-serve` (src/serve): the OpenAI-compatible HTTP face of the same
+# Embedder. hyper, hyper-util, tokio and base64 are already in the tree as
+# hf-hub's HTTP client (through reqwest), so what the server mostly adds is
+# features on crates that are compiled anyway: hyper's `server` half, tokio's
+# runtime, signals and channels, and TokioIo. The two crates that are new to
+# the lock file are the ones those features pull in, `httpdate` (the `Date`
+# header) and `signal-hook-registry` (SIGTERM), both small and without build
+# scripts. HTTP/1.1 only; see PROTOCOL-http.md.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt", "net", "sync", "signal", "macros", "time"] }
+# `encoding_format: "base64"` in /v1/embeddings: float32, little-endian.
+base64 = "0.22"
+
 # The model fingerprint (src/fingerprint.rs). fnv.rs cannot do this job, being
 # a 64-bit non-cryptographic hash whose only users are cache keys.
 #
@@ -121,6 +136,10 @@ coreml = [
 [[bin]]
 name = "coreml-convert"
 required-features = ["coreml-export"]
+
+# Ships with `kohagi` and `kohagi-rerank` on every target: it needs no feature.
+[[bin]]
+name = "kohagi-serve"
 
 [profile.release]
 lto = "thin"

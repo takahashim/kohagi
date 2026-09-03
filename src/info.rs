@@ -62,6 +62,11 @@ pub enum Output {
         /// Output dimension after `--dims`, when it changes the vector size.
         #[serde(skip_serializing_if = "Option::is_none")]
         output_dim: Option<usize>,
+        /// Whether each vector is unit length, so that dot product is cosine:
+        /// `true` unless `--no-normalize`. Reported because it changes every
+        /// vector as surely as `pooling` does, and a reader of a results file
+        /// cannot tell from the numbers.
+        normalized: bool,
     },
     /// One score per pair, represented as `sigmoid` or `logit`.
     Score { score: &'static str },
@@ -99,8 +104,43 @@ impl ModelInfo {
         match self.output {
             Output::Embedding {
                 output_dim: Some(n),
+                ..
             } => n,
             _ => self.dim,
         }
+    }
+
+    /// Whether each vector is unit length. `false` for a reranker, whose
+    /// scores are not vectors.
+    pub fn normalized(&self) -> bool {
+        matches!(
+            self.output,
+            Output::Embedding {
+                normalized: true,
+                ..
+            }
+        )
+    }
+
+    /// The facts a summary line carries about the model: which weights, and
+    /// the settings that silently change every vector when they differ.
+    /// `sha256=` for a checkpoint's own digest, `source_sha256=` for a CoreML
+    /// bundle's report of the checkpoint behind it: not the same claim, and a
+    /// line that conflated them would be worse than one with neither.
+    pub fn summary_facts(&self) -> String {
+        let mut out = String::new();
+        if let Some((claim, sha)) = self.digest() {
+            out.push_str(&format!("{claim}={} ", crate::fingerprint::short(sha)));
+        }
+        out.push_str(&format!(
+            "pooling={} dim={} max_seq={}",
+            self.pooling,
+            self.reported_dim(),
+            self.max_seq_length
+        ));
+        if let Output::Score { score } = self.output {
+            out.push_str(&format!(" score={score}"));
+        }
+        out
     }
 }

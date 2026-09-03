@@ -13,4 +13,7 @@
 
 - The input and output contract (record shapes, batching, exit codes) is in
   [PROTOCOL.md](../PROTOCOL.md) and [PROTOCOL-rerank.md](../PROTOCOL-rerank.md).
-- Every flag is in `kohagi --help` and `kohagi-rerank --help`.
+- The HTTP contract of `kohagi-serve` (endpoints, errors, limits, the Unix
+  socket) is in [PROTOCOL-http.md](../PROTOCOL-http.md).
+- Every flag is in `kohagi --help`, `kohagi-rerank --help` and
+  `kohagi-serve --help`.

@@ -91,7 +91,7 @@ exits without embedding anything, for a script to record beside its results:
 
 ```console
 $ kohagi --print-model-info
-{"model":"cl-nagoya/ruri-v3-130m","backend":"cpu","precision":"f32","sha256":"1c342581efc2…","pooling":"mean","dim":512,"max_seq_length":512}
+{"model":"cl-nagoya/ruri-v3-130m","backend":"cpu","precision":"f32","sha256":"1c342581efc2…","pooling":"mean","dim":512,"max_seq_length":512,"normalized":true}
 ```
 
 This matters as soon as there is more than one checkpoint: fine-tunes of one
@@ -147,16 +147,17 @@ Use the `id` field to match each result with its input record.
 A complete Ruby example is available in [`examples/rails_open3.rb`](examples/rails_open3.rb).
 See [PROTOCOL.md](PROTOCOL.md) for the exit-code semantics.
 
-### An OpenAI-compatible endpoint
+### An OpenAI-compatible endpoint: `kohagi-serve`
 
-If the calling code is already written against OpenAI's `/v1/embeddings`, the
-value of that compatibility is swapping `base_url` and changing nothing else.
-Kohagi has no HTTP mode, so the examples supply one, the same ~150-line proxy in
-[Python](examples/openai_proxy/proxy.py), [Ruby](examples/openai_proxy/proxy.rb) and
-[TypeScript](examples/openai_proxy/proxy.ts):
+A pipe gives every process its own Kohagi, which is right for a batch and
+wrong for a Rails cluster, where each Puma worker would hold its own copy of
+the model. `kohagi-serve` is the third binary: the same model, loaded once per
+host, behind OpenAI's `/v1/embeddings`.
 
 ```bash
-python3 examples/openai_proxy/proxy.py --kohagi ./target/release/kohagi
+kohagi-serve --prefix "検索クエリ: "                            # http://127.0.0.1:8080
+kohagi-serve --listen unix:///run/kohagi.sock --device metal
+kohagi-serve --rerank-model-id cl-nagoya/ruri-v3-reranker-310m   # /v1/rerank as well
 ```
 
 ```python
@@ -164,13 +165,21 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
 client.embeddings.create(model="ruri-v3-130m", input=["…", "…"])
 ```
 
-Each keeps one Kohagi loaded and ends every request with a blank line, which is
-Kohagi's "embed what you have and reply now" signal; with `--format openai` the
-reply is that batch's complete response object, so there is nothing to assemble.
-A request costs about 40 ms warm. Two caveats before pointing production at it: an
-existing index has to be rebuilt, since `ruri-v3-130m` returns 512 dimensions
-where `text-embedding-3-small` returns 1536, and the request's `model` is
-ignored; the flags passed to Kohagi decide which checkpoint runs.
+The value of the compatibility is that swap of `base_url`: clients written for
+OpenAI (ruby-openai, langchainrb, LangChain) work unchanged, `encoding_format:
+"base64"` and `dimensions` included. Two things do not carry over: an existing
+index has to be rebuilt, since `ruri-v3-130m` returns 512 dimensions where
+`text-embedding-3-small` returns 1536, and the request's `model` is ignored;
+the flags the server started with decide which checkpoint runs, and the reply
+names it. The server loads before it listens, so a missing checkpoint is a
+failed start rather than an open port; it binds to loopback, having no
+authentication (keep it off the open network as you would a database); it
+answers `GET /v1/models` and `GET /health`; and it prints one summary line on
+SIGTERM. With `--rerank-model-id` it loads the cross-encoder beside the
+embedder and answers `POST /v1/rerank` in the shape Cohere and Jina gave it,
+with the same scores `kohagi-rerank` writes; `--rerank-expect-sha256` pins
+those weights as `--expect-sha256` pins the embedder's. See
+[PROTOCOL-http.md](PROTOCOL-http.md).
 
 ### Ruby
 
@@ -197,6 +206,23 @@ end
 summary.dim        # => 512
 summary.out        # => 2
 summary.truncated  # => 0
+```
+
+For a query at request time, where a Rails cluster wants one model per host
+rather than one per worker, point [ruby-openai](https://github.com/alexrudall/ruby-openai)
+at `kohagi-serve` instead. `base64` spares Ruby the parsing of 512 JSON numbers:
+
+```ruby
+require "base64"
+
+client = OpenAI::Client.new(uri_base: ENV.fetch("KOHAGI_URL", "http://127.0.0.1:8080/v1"),
+                            access_token: "unused")
+encoded = client.embeddings(parameters: {
+  model: "ruri-v3-130m",
+  input: "検索クエリ: #{q}",
+  encoding_format: "base64",
+}).dig("data", 0, "embedding")
+vec = Base64.strict_decode64(encoded).unpack("e*")
 ```
 
 ## Using the Rust library
@@ -245,7 +271,8 @@ kohagi --prefix "検索文書: " < in.jsonl > out.jsonl  # 本番はこちら
 - 同様に `--features coreml` でビルドすると `--device coreml` が使え、Apple Neural Engine (ANE) 上で動かせます。長い入力ほど高速で、CPU 出力に対し cosine ≈ 0.99999 です(短い入力では ANE が固定長にパディングする分、PyTorch (MPS) やマルチコア CPU の方が速いこともあります)。ローカルの変換済みモデルは `--coreml-dir`、Hugging Face Hub 上のものは `--coreml-model-id` で指定します
 - 出力は f32 で PyTorch / sentence-transformers と一致するのを確認しています (cosine ≈ 1.0)
 - 入出力の契約・exit code(0/1/2/3)は [PROTOCOL.md](PROTOCOL.md) を参照してください。
-  Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) に、OpenAI Embeddings API互換サーバのサンプルは[`examples/openai_proxy/proxy.py`](examples/openai_proxy/proxy.py)(Python)、[`examples/openai_proxy/proxy.rb`](examples/openai_proxy/proxy.rb)(Ruby)、[`examples/openai_proxy/proxy.ts`](examples/openai_proxy/proxy.ts)(TypeScript)にあります。
+  Rails からの呼び出し例は [`examples/rails_open3.rb`](examples/rails_open3.rb) にあります。
+- `kohagi-serve` は同じモデルを OpenAI 互換の `/v1/embeddings` で提供するサーバです。バッチはパイプのままで、検索時のクエリ埋め込みのようにホストあたり 1 モデルを複数プロセスで共有したいときに使います(`kohagi-serve --prefix "検索クエリ: "` で `http://127.0.0.1:8080`、`--listen unix:///run/kohagi.sock` で Unix socket)。ruby-openai や langchainrb から `base_url` を向けるだけで使えます。`--rerank-model-id cl-nagoya/ruri-v3-reranker-310m` を付けると reranker も同時にロードし、Cohere / Jina 形の `/v1/rerank` に `kohagi-rerank` と同じスコアで答えます。契約は [PROTOCOL-http.md](PROTOCOL-http.md) を参照してください。
 
 また、Ruby では Kohagi 専用の gem である [kohagi-ruby](https://github.com/takahashim/kohagi-ruby)が使えます。
 

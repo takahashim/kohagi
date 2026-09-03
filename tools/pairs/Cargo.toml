@@ -1,0 +1,25 @@
+[package]
+name = "kohagi-pairs"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+description = "Turns an mteb reranking dataset into the (query, text) pairs a distillation reads"
+
+# Deliberately outside the kohagi workspace (the root Cargo.toml excludes
+# `tools`), so this stays out of kohagi's Cargo.lock and out of the published
+# crate. It does not use Kohagi at all: it reads parquet and writes JSONL,
+# and exists because the dataset ships as parquet and nothing else here
+# reads that.
+#
+#     cargo run --release --manifest-path tools/pairs/Cargo.toml -- --help
+
+[dependencies]
+parquet = { version = "53", default-features = false, features = ["arrow", "snap", "zstd"] }
+arrow = { version = "53", default-features = false }
+serde_json = "1"
+anyhow = "1"
+
+[[bin]]
+name = "kohagi-pairs"
+path = "src/main.rs"

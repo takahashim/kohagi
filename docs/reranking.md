@@ -32,6 +32,14 @@ $ echo '{"id":"doc-41","query":"Rubyで配列を並べ替えるには","text":"�
   process can serve one query's candidates per request.
 - See [PROTOCOL-rerank.md](../PROTOCOL-rerank.md) for the full contract.
 
+Over HTTP, `kohagi-serve --rerank-model-id cl-nagoya/ruri-v3-reranker-310m`
+loads the same reranker beside the embedder and answers `POST /v1/rerank`
+(`{"query", "documents", "top_n"}` in, results best first out, the shape
+Cohere and Jina gave that call) with the same scores; see
+[PROTOCOL-http.md](../PROTOCOL-http.md). That is the form for a request at
+search time, where the shortlist is one query's; a corpus-wide pass belongs on
+the pipe.
+
 ## How many candidates
 
 - Cost is linear in pairs, so this is arithmetic rather than tuning.

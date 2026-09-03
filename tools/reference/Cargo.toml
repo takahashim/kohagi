@@ -1,0 +1,23 @@
+[package]
+name = "kohagi-reference"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+description = "Emits Kohagi's forward pass as a reference artifact, for another implementation to be held to"
+
+# Deliberately outside the kohagi workspace (the root Cargo.toml excludes
+# `tools`), so this stays out of kohagi's Cargo.lock and out of the published
+# crate. It reads Kohagi's public API and changes nothing:
+#
+#     cargo run --release --manifest-path tools/reference/Cargo.toml -- --help
+
+[dependencies]
+kohagi = { path = "../.." }
+tokenizers = "0.21"
+serde_json = "1"
+anyhow = "1"
+
+[[bin]]
+name = "kohagi-reference"
+path = "src/main.rs"

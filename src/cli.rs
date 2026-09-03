@@ -1,17 +1,20 @@
-//! What `kohagi` and `kohagi-rerank` share above the library: the CLI
-//! spellings of the library's enums, how a model source is named on the command
-//! line, and how a run's outcome becomes an exit code.
+//! What the binaries share above the library: the CLI spellings of the
+//! library's enums, the flags that choose and load an embedding model
+//! ([`ModelArgs`]), how a model source is named on the command line, and how a
+//! run's outcome becomes an exit code.
 //!
-//! Both binaries load the same models onto the same devices and answer to the
-//! same exit codes; only the record they read and write differs. Keeping the
-//! mapping here means `--device`, `--precision` and the exit codes cannot come
-//! to mean two things — and that a third binary would inherit them rather than
-//! copy them.
+//! `kohagi`, `kohagi-serve` and `kohagi-rerank` load models onto the same
+//! devices and answer to the same exit codes; what differs is the record they
+//! read and write, or whether they read one at all. Keeping the mapping here
+//! means `--device`, `--precision` and the exit codes cannot come to mean two
+//! things, and a new binary inherits them rather than copying them.
 //!
-//! Flag *definitions* stay in each binary. Their help text is about that
-//! binary's job (`--coreml-buckets` defaults differ, because a pair fills more
-//! of a bucket than a text does), and the two `Args` structs share no fields
-//! worth naming in common.
+//! `kohagi` and `kohagi-serve` load the very same model, so they share the
+//! flag definitions too, flattened from [`ModelArgs`]. A cross-encoder has
+//! other defaults and another `Options` type, so `kohagi-rerank` and
+//! `kohagi-serve` keep their own spellings for it (`--model-id` against
+//! `--rerank-model-id`); what they do not keep their own copy of is what those
+//! flags mean, which is [`RerankModel`].
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,10 +22,11 @@ use std::process::ExitCode;
 use clap::ValueEnum;
 
 use crate::program::remark;
+use crate::rerank::{self, Reranker};
 
 use crate::{
-    Backend, CoreMlForm, CoreMlQuantize, ModelInfo, ModelSource, Pooling, Precision,
-    UnsupportedRequest,
+    Backend, CoreMlForm, CoreMlQuantize, Embedder, ModelInfo, ModelSource, Options, Pooling,
+    Precision, UnsupportedRequest,
 };
 
 /// CLI spellings of the library enums, so `--help` lists the valid values and
@@ -116,6 +120,220 @@ impl From<CoreMlQuantizeArg> for CoreMlQuantize {
             CoreMlQuantizeArg::Embeddings => CoreMlQuantize::Embeddings,
             CoreMlQuantizeArg::All => CoreMlQuantize::All,
         }
+    }
+}
+
+/// The flags that decide which model is loaded, and how: shared by `kohagi`
+/// and `kohagi-serve` through `#[command(flatten)]`, so the two cannot come to
+/// load the same checkpoint differently, and `--help` describes each flag in
+/// one place. `kohagi-rerank` keeps its own: a cross-encoder has other
+/// defaults (`--coreml-buckets` run longer, a pair fills more of a bucket than
+/// a text does) and another `Options` type.
+#[derive(Clone, clap::Args)]
+pub struct ModelArgs {
+    /// Hugging Face model repo to download (ignored with --model-path).
+    #[arg(long, default_value = "cl-nagoya/ruri-v3-130m")]
+    pub model_id: String,
+    /// Local safetensors weights (offline mode; config.json must sit next to
+    /// it). Requires --tokenizer-path.
+    #[arg(long, requires = "tokenizer_path")]
+    pub model_path: Option<PathBuf>,
+    /// Local tokenizer.json (offline mode).
+    #[arg(long, requires = "model_path")]
+    pub tokenizer_path: Option<PathBuf>,
+    /// How to reduce token embeddings to one vector per text. Omit to take the
+    /// model's own choice from its 1_Pooling/config.json (mean if it ships
+    /// none); pass this only to override that.
+    #[arg(long, value_enum)]
+    pub pooling: Option<PoolingArg>,
+    /// Numeric precision of the forward pass. f32 is identical everywhere;
+    /// bf16 is faster but not bit-identical.
+    #[arg(long, value_enum, default_value_t = PrecisionArg::F32)]
+    pub precision: PrecisionArg,
+    /// Device for the forward pass. cuda requires an NVIDIA GPU and a binary
+    /// built with `--features cuda`. metal requires a binary built with
+    /// `--features metal`, and runs ~1.2x faster than cpu on Apple Silicon.
+    /// coreml (Apple Neural Engine) requires `--features coreml`; with no
+    /// --coreml-dir or --coreml-model-id it converts --model-id itself and
+    /// caches the result.
+    #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
+    pub device: BackendArg,
+    /// Directory of pre-converted CoreML models for `--device coreml`: one
+    /// `seq-<N>.mlpackage` per bucket length, plus tokenizer.json and
+    /// config.json. Produce one with the coreml-convert binary or
+    /// scripts/convert_coreml.py. Omit it to convert --model-id on first use.
+    #[arg(long)]
+    pub coreml_dir: Option<PathBuf>,
+    /// Hugging Face repo holding the CoreML models (same layout as
+    /// --coreml-dir), downloaded and cached on first use. Alternative to
+    /// --coreml-dir for `--device coreml`; --coreml-dir wins if both are set.
+    #[arg(long)]
+    pub coreml_model_id: Option<String>,
+    /// Fixed sequence lengths to emit when `--device coreml` converts a
+    /// checkpoint itself (that is, when neither --coreml-dir nor
+    /// --coreml-model-id is given). Each becomes one CoreML function over a
+    /// single shared copy of the weights, so the set costs no disk; what it
+    /// costs is one model to open per length. Match it to the lengths your
+    /// texts actually are: a bucket nothing lands in is pure overhead.
+    #[arg(long, value_delimiter = ',', default_values_t = [64usize, 128, 256, 512])]
+    pub coreml_buckets: Vec<usize>,
+    /// Quantize the model when `--device coreml` converts it. `embeddings`
+    /// halves a large-vocabulary bundle at no measured retrieval cost;
+    /// `all` roughly halves it again for a small one. Omit for fp16; a
+    /// quantized bundle's vectors are not interchangeable with an fp16 one's.
+    #[arg(long, value_enum)]
+    pub coreml_quantize: Option<CoreMlQuantizeArg>,
+    /// When a --coreml-model-id repo ships both forms of a bucket, which to
+    /// download: `compiled` (.mlmodelc, faster) or `package` (.mlpackage,
+    /// portable). Only the chosen form is fetched.
+    #[arg(long, value_enum, default_value_t = CoreMlFormArg::Compiled)]
+    pub coreml_prefer: CoreMlFormArg,
+    /// Skip L2 normalization (normalized output is the default; unit vectors
+    /// make dot product = cosine).
+    #[arg(long)]
+    pub no_normalize: bool,
+    /// Keep only the first N dimensions of each embedding and re-normalize
+    /// (Matryoshka truncation, meaningful for models trained for it). dot =
+    /// cosine still holds on the shorter vectors, and they must not share an
+    /// index with full-dimension ones. Refused if N is 0 or exceeds the model
+    /// dimension, or combined with --no-normalize.
+    #[arg(long, value_name = "N")]
+    pub dims: Option<usize>,
+    /// Refuse to embed anything unless the loaded weights' sha256 starts with
+    /// this hex prefix: paste the 12 digits from a summary line, or the full
+    /// digest from --print-model-info or /v1/models. A mismatch exits 1 before
+    /// anything is answered, so the wrong checkpoint cannot survive into
+    /// results. With --device coreml the bundle's recorded source_sha256 is
+    /// checked instead, and a bundle that recorded none is refused.
+    #[arg(long, value_name = "HEX")]
+    expect_sha256: Option<String>,
+    /// Token-level truncation length.
+    #[arg(long, default_value_t = 512)]
+    pub max_seq_length: usize,
+    /// Bucketing granularity; memory stays bounded regardless (see model.rs).
+    #[arg(long, default_value_t = 64)]
+    pub batch_size: usize,
+}
+
+impl ModelArgs {
+    pub fn options(&self) -> Options {
+        Options {
+            pooling: self.pooling.map(Into::into),
+            normalize: !self.no_normalize,
+            dims: self.dims,
+            max_seq_length: self.max_seq_length,
+            batch_size: self.batch_size,
+            precision: self.precision.into(),
+            backend: self.device.into(),
+            coreml_form: self.coreml_prefer.into(),
+        }
+    }
+
+    /// Where to load the model from, plus the name to show for it (in a
+    /// summary line, or a reply): the `--model-id` repo, or the directory of a
+    /// `--model-path` checkpoint.
+    pub fn source(&self) -> anyhow::Result<(ModelSource, String)> {
+        let checkpoint = checkpoint_source(
+            self.model_path.as_ref(),
+            self.tokenizer_path.as_ref(),
+            &self.model_id,
+        );
+        // CoreML loads converted fixed-shape models rather than safetensors.
+        if self.device == BackendArg::Coreml {
+            return coreml_source(
+                self.coreml_dir.as_ref(),
+                self.coreml_model_id.as_deref(),
+                &self.coreml_buckets,
+                self.coreml_quantize.map(Into::into).unwrap_or_default(),
+                checkpoint,
+            );
+        }
+        Ok(checkpoint)
+    }
+
+    /// Load the model from `source` and, when `--expect-sha256` pinned a
+    /// digest, refuse weights that do not carry it, before anything is
+    /// embedded, whichever binary loads.
+    pub fn load(&self, source: &ModelSource) -> anyhow::Result<Embedder> {
+        let embedder = Embedder::load(source, self.options())?;
+        verify_fingerprint(self.expect_sha256.as_deref(), &embedder.info())?;
+        Ok(embedder)
+    }
+}
+
+/// The sequence lengths `--device coreml` converts a cross-encoder to when it
+/// converts one itself. A pair fills more of a bucket than a single text does,
+/// so these run longer than [`ModelArgs`]'s embedding defaults.
+pub const RERANK_COREML_BUCKETS: [usize; 3] = [128, 256, 512];
+
+/// How a cross-encoder is loaded, from whichever binary's flags carry it.
+///
+/// `kohagi-rerank` spells these `--model-id`, `--device` and so on;
+/// `kohagi-serve` spells them `--rerank-model-id` and takes the device and the
+/// precision from the embedder it runs beside. The spellings are each binary's,
+/// because a cross-encoder's defaults are not an embedder's, but which
+/// checkpoint they name and how it is loaded is decided once, here: the same
+/// flags through either binary must load the same reranker.
+pub struct RerankModel<'a> {
+    /// Local safetensors weights, with [`Self::tokenizer_path`] (offline mode).
+    pub model_path: Option<&'a PathBuf>,
+    pub tokenizer_path: Option<&'a PathBuf>,
+    /// The Hugging Face repo, used unless the two paths above are given.
+    pub model_id: &'a str,
+    pub device: BackendArg,
+    pub precision: PrecisionArg,
+    pub coreml_dir: Option<&'a PathBuf>,
+    pub coreml_model_id: Option<&'a str>,
+    /// What to convert when `--device coreml` converts the checkpoint itself;
+    /// [`RERANK_COREML_BUCKETS`] is what both binaries default it to.
+    pub coreml_buckets: &'a [usize],
+    pub coreml_prefer: CoreMlFormArg,
+    pub max_seq_length: usize,
+    pub batch_size: usize,
+    /// Report the sigmoid rather than the raw logit.
+    pub sigmoid: bool,
+    /// `--expect-sha256`, when the caller pinned a digest.
+    pub expect_sha256: Option<&'a str>,
+}
+
+impl RerankModel<'_> {
+    pub fn options(&self) -> rerank::Options {
+        rerank::Options {
+            max_seq_length: self.max_seq_length,
+            batch_size: self.batch_size,
+            precision: self.precision.into(),
+            backend: self.device.into(),
+            sigmoid: self.sigmoid,
+            coreml_form: self.coreml_prefer.into(),
+        }
+    }
+
+    /// Where the reranker comes from, plus the name to show for it.
+    pub fn source(&self) -> anyhow::Result<(ModelSource, String)> {
+        let checkpoint = checkpoint_source(self.model_path, self.tokenizer_path, self.model_id);
+        // CoreML loads converted fixed-shape models rather than safetensors.
+        // Never quantized: a reranker's output is one number compared against a
+        // threshold, and int8 moves it further than fp16 already does.
+        if self.device == BackendArg::Coreml {
+            return coreml_source(
+                self.coreml_dir,
+                self.coreml_model_id,
+                self.coreml_buckets,
+                CoreMlQuantize::None,
+                checkpoint,
+            );
+        }
+        Ok(checkpoint)
+    }
+
+    /// Load from `source` and, when `--expect-sha256` pinned a digest, refuse
+    /// weights that do not carry it, before any pair is scored or served. A
+    /// threshold belongs to the weights it was tuned on, so both binaries owe
+    /// the caller this check.
+    pub fn load(&self, source: &ModelSource) -> anyhow::Result<Reranker> {
+        let reranker = Reranker::load(source, self.options())?;
+        verify_fingerprint(self.expect_sha256, &reranker.info())?;
+        Ok(reranker)
     }
 }
 
@@ -391,7 +609,10 @@ mod tests {
             dim: 512,
             max_seq_length: 512,
             declared_max_seq_length: None,
-            output: crate::Output::Embedding { output_dim: None },
+            output: crate::Output::Embedding {
+                output_dim: None,
+                normalized: true,
+            },
         }
     }
 

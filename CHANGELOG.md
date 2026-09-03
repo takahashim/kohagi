@@ -1,5 +1,47 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`kohagi-serve`: the same model behind an OpenAI-compatible HTTP API.** A
+  third binary, shipped beside the other two, that loads a model once and
+  answers `POST /v1/embeddings` (`input` as a string or strings,
+  `encoding_format: "base64"`, `dimensions`), `GET /v1/models` (with
+  `--print-model-info`'s facts under `kohagi`) and `GET /health`. For the
+  caller that wants one model per host rather than one per process, which a
+  pipe cannot give a Rails cluster; batches stay on the stdio protocol. It
+  loads before it listens, so a missing checkpoint is a failed start (exit 1,
+  or 3 for CoreML) rather than an open port; binds to `127.0.0.1:8080` unless
+  `--listen` says otherwise, `unix:///path` included (a Unix socket, mode
+  0600); answers one request at a time and refuses with 503 once
+  `--max-queue` are waiting; and prints one summary line on SIGTERM or
+  SIGINT. HTTP/1.1, no TLS, no authentication. See PROTOCOL-http.md.
+
+- **`kohagi-serve --rerank-model-id`: the reranker over HTTP.** Loads the
+  cross-encoder beside the embedder, on a thread of its own, and answers
+  `POST /v1/rerank` in the shape Cohere and Jina share (`query`, `documents`
+  as strings or `{"text"}` objects, `top_n`, `return_documents`; results best
+  first with `index` and `relevance_score`). The scores are the sigmoid
+  `kohagi-rerank` writes, identical for the same pair. `GET /v1/models` lists
+  both models, and the summary line gains `scored=`. Without the flag,
+  `/v1/rerank` is 404 and says which flag turns it on.
+
+### Changed
+
+- **`--print-model-info` reports `normalized`.** Whether each vector is unit
+  length (`true` unless `--no-normalize`), beside `pooling` and `dim`, since it
+  changes every vector as surely as they do and a results file could not say.
+  `kohagi-serve` reads the same field to decide whether a request's
+  `dimensions` can be honoured.
+
+### Removed
+
+- **`examples/openai_proxy/`.** The Python, Ruby and TypeScript proxies were
+  the bridge to the OpenAI ecosystem while Kohagi had no HTTP mode. With
+  `kohagi-serve` the bridge is a binary, and keeping the scripts would leave
+  two answers to one question.
+
 ## [0.6.0] - 2026-08-23
 
 ### Added

@@ -35,7 +35,10 @@ use candle_nn::VarBuilder;
 use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
-use crate::batch::{l2_normalize, load_tokenizer, pool_row, BatchInput, Pooling, TokenInfo};
+use crate::batch::{
+    l2_normalize, load_tokenizer, pool_row, truncate_renormalize, truncation, BatchInput, Pooling,
+    TokenInfo,
+};
 use crate::config::CoreMlForm;
 use crate::errors::UnsupportedRequest;
 use crate::info::{ModelInfo, Output};
@@ -347,7 +350,10 @@ impl Embedder {
             .context("model path has no parent dir for config.json")?;
         let config: Config = read_config(&config_path)?;
         let dim = config.hidden_size;
-        check_dims(opts.dims, dim)?;
+        let opts = Options {
+            dims: check_dims(opts.dims, dim)?,
+            ..opts
+        };
         check_max_seq(opts.max_seq_length, config.max_position_embeddings)?;
 
         check_precision(opts.backend, opts.precision)?;
@@ -384,7 +390,10 @@ impl Embedder {
 
         let config: Config = read_config(&dir.join("config.json"))?;
         let dim = config.hidden_size;
-        check_dims(opts.dims, dim)?;
+        let opts = Options {
+            dims: check_dims(opts.dims, dim)?,
+            ..opts
+        };
         let encoder = crate::coreml::CoreMlEncoder::load(&dir, dim)?;
 
         // The ANE only has the bucket lengths that were converted. Every input
@@ -508,7 +517,9 @@ impl Embedder {
     }
 
     /// The dimension of the vectors this embedder produces: `Options::dims`
-    /// when set, otherwise the model's `hidden_size` (512 for ruri-v3-130m).
+    /// when it shortens them, otherwise the model's `hidden_size` (512 for
+    /// ruri-v3-130m). `load` already reduced a `dims` equal to the model's own
+    /// to `None`, since it changes no vector.
     pub fn dim(&self) -> usize {
         self.opts.dims.unwrap_or(self.dim)
     }
@@ -539,7 +550,8 @@ impl Embedder {
             max_seq_length: self.opts.max_seq_length,
             declared_max_seq_length: self.declared_max_seq,
             output: Output::Embedding {
-                output_dim: output_dim(self.opts.dims, self.dim),
+                output_dim: self.opts.dims,
+                normalized: self.opts.normalize,
             },
         };
         #[cfg(feature = "coreml")]
@@ -632,43 +644,32 @@ struct Reduce {
 /// that is not shareable between threads.
 fn embed_row(hidden: &[f32], mask: &[i64], dim: usize, reduce: Reduce) -> Vec<f32> {
     let mut vector = pool_row(hidden, mask, dim, reduce.pooling);
-    // Truncate before normalizing, so the kept prefix comes out unit-length —
-    // the order that makes dot = cosine hold on the shorter vectors, and the
-    // one `SentenceTransformer(..., truncate_dim=N)` uses. `load` refused
-    // `dims` without `normalize`, so the truncated arm always re-normalizes.
-    if let Some(n) = reduce.dims {
-        vector.truncate(n);
-    }
-    if reduce.normalize {
-        l2_normalize(&mut vector);
+    match (reduce.dims, reduce.normalize) {
+        // `load` refused `dims` without `normalize`, so a truncation always
+        // re-normalizes; the order is the shared function's business.
+        (Some(n), _) => truncate_renormalize(&mut vector, n),
+        (None, true) => l2_normalize(&mut vector),
+        (None, false) => {}
     }
     vector
 }
 
-/// What `output_dim` should claim: a `--dims` that actually
-/// shortened the vectors, and nothing else.
-///
-/// `--dims` equal to the model's own dimension changes no vector, so it
-/// claims nothing. The field marks output that is not interchangeable with a
-/// full run's, and vectors identical to a full run's are.
-fn output_dim(dims: Option<usize>, dim: usize) -> Option<usize> {
-    dims.filter(|&n| n < dim)
-}
-
-/// Refuse a `--dims` outside what the loaded model can be truncated to.
-///
-/// At load rather than at the first embed, so a bad value stops the run before
-/// any input is read — and it names the model's dimension, which is the number
-/// the caller was guessing at.
-fn check_dims(dims: Option<usize>, dim: usize) -> Result<()> {
-    if let Some(n) = dims {
-        anyhow::ensure!(
-            (1..=dim).contains(&n),
-            "--dims {n} is outside this model's dimensions; it produces {dim}, so \
-             --dims takes 1..={dim}"
-        );
+/// `--dims` as the truncation it asks for: `None` when it asks for nothing
+/// (not given, or equal to the model's own dimension, which changes no
+/// vector), refused outside `1..=dim`. Decided at load rather than at the
+/// first embed, so a bad value stops the run before any input is read, and
+/// the refusal names the model's dimension, which is the number the caller
+/// was guessing at.
+fn check_dims(dims: Option<usize>, dim: usize) -> Result<Option<usize>> {
+    match dims {
+        None => Ok(None),
+        Some(n) => truncation(n, dim).map_err(|e| {
+            anyhow::anyhow!(
+                "--dims {n} is outside this model's dimensions; it produces {dim}, so \
+                 --dims {e}"
+            )
+        }),
     }
-    Ok(())
 }
 
 /// Refuse a `--max-seq-length` the model has no positions for.
@@ -962,21 +963,19 @@ mod dims_tests {
         assert_eq!(same, full);
     }
 
-    /// `output_dim` marks vectors that are not interchangeable with a full
-    /// run's. `--dims` equal to the model dimension produces identical
-    /// vectors, so it must produce identical metadata too.
+    /// A `--dims` that shortens nothing is no truncation: the vectors are a
+    /// full run's, so the metadata must say so too, and `output_dim` marks
+    /// only vectors that are not interchangeable with a full run's.
     #[test]
-    fn output_dim_claims_only_an_actual_truncation() {
-        assert_eq!(output_dim(Some(256), 512), Some(256));
-        assert_eq!(output_dim(Some(512), 512), None);
-        assert_eq!(output_dim(None, 512), None);
+    fn dims_equal_to_the_model_claim_nothing() {
+        assert_eq!(check_dims(Some(256), 512).unwrap(), Some(256));
+        assert_eq!(check_dims(Some(512), 512).unwrap(), None);
+        assert_eq!(check_dims(None, 512).unwrap(), None);
     }
 
     #[test]
     fn dims_outside_the_model_are_refused_with_the_model_dimension_named() {
-        assert!(check_dims(None, 512).is_ok());
         assert!(check_dims(Some(1), 512).is_ok());
-        assert!(check_dims(Some(512), 512).is_ok());
         for bad in [0, 513] {
             let e = check_dims(Some(bad), 512).unwrap_err().to_string();
             assert!(e.contains("512"), "should name the model dim: {e}");
