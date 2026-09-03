@@ -27,39 +27,44 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use clap::Parser;
 use kohagi::{Embedder, ModelSource, Options};
 use tokenizers::{Tokenizer, TruncationParams};
 
+/// Write Kohagi's forward pass down as a reference artifact.
+///
+/// Emits the token ids, the pooled and normalized vector, and the settings
+/// both sides must agree on, so another implementation of the same
+/// architecture can be held to these numbers.
+#[derive(Parser)]
+#[command(name = "kohagi-reference", version)]
+struct Cli {
+    /// The safetensors weights to embed with (config.json must sit next to it).
+    #[arg(long)]
+    model_path: PathBuf,
+    /// The tokenizer.json for those weights.
+    #[arg(long)]
+    tokenizer_path: PathBuf,
+    /// Where to write the artifact.
+    #[arg(long)]
+    out: PathBuf,
+    /// Token-level truncation length.
+    #[arg(long, default_value_t = 512)]
+    max_seq_length: usize,
+    /// The texts to embed, one artifact case each.
+    #[arg(required = true, value_name = "TEXT")]
+    texts: Vec<String>,
+}
+
 fn main() -> Result<()> {
-    let mut model_path: Option<PathBuf> = None;
-    let mut tokenizer_path: Option<PathBuf> = None;
-    let mut out: Option<PathBuf> = None;
-    let mut max_seq_length = 512usize;
-    let mut texts: Vec<String> = Vec::new();
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--model-path" => model_path = args.next().map(PathBuf::from),
-            "--tokenizer-path" => tokenizer_path = args.next().map(PathBuf::from),
-            "--out" => out = args.next().map(PathBuf::from),
-            "--max-seq-length" => {
-                max_seq_length = args.next().context("--max-seq-length wants a number")?.parse()?
-            }
-            "--help" | "-h" => {
-                eprintln!("{}", usage());
-                return Ok(());
-            }
-            other if other.starts_with("--") => anyhow::bail!("unknown flag {other}"),
-            text => texts.push(text.to_string()),
-        }
-    }
-
-    let model_path = model_path.context(usage())?;
-    let tokenizer_path = tokenizer_path.context(usage())?;
-    let out = out.context(usage())?;
-    anyhow::ensure!(!texts.is_empty(), "give at least one text\n{}", usage());
+    let Cli {
+        model_path,
+        tokenizer_path,
+        out,
+        max_seq_length,
+        texts,
+    } = Cli::parse();
 
     let tokenizer = load_tokenizer(&tokenizer_path, max_seq_length)?;
     let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
@@ -128,7 +133,10 @@ fn main() -> Result<()> {
         "dim": embedder.dim(),
         "cases": cases,
     });
-    std::fs::write(&out, format!("{}\n", serde_json::to_string_pretty(&artifact)?))?;
+    std::fs::write(
+        &out,
+        format!("{}\n", serde_json::to_string_pretty(&artifact)?),
+    )?;
     eprintln!("wrote {} ({} cases)", out.display(), texts.len());
     Ok(())
 }
@@ -147,10 +155,4 @@ fn load_tokenizer(path: &std::path::Path, max_seq_length: usize) -> Result<Token
         .map_err(|e| anyhow::anyhow!("truncation config: {e}"))?;
     tokenizer.with_padding(None);
     Ok(tokenizer)
-}
-
-fn usage() -> String {
-    "usage: kohagi-reference --model-path <model.safetensors> \
-     --tokenizer-path <tokenizer.json> --out <file.json> [--max-seq-length N] <text>..."
-        .to_string()
 }

@@ -17,6 +17,7 @@ description = "Turns an mteb reranking dataset into the (query, text) pairs a di
 [dependencies]
 parquet = { version = "53", default-features = false, features = ["arrow", "snap", "zstd"] }
 arrow = { version = "53", default-features = false }
+clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 

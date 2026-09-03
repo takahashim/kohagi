@@ -27,6 +27,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use kohagi::rerank::{Options, Reranker};
 use kohagi::ModelSource;
 use tokenizers::{EncodeInput, Tokenizer, TruncationParams};
@@ -36,7 +37,7 @@ use tokenizers::{EncodeInput, Tokenizer, TruncationParams};
 const CHUNK: usize = 256;
 
 fn main() -> Result<()> {
-    let options = Cli::parse()?;
+    let options = Cli::parse();
     let tokenizer = load_tokenizer(&options.tokenizer_path, options.max_seq_length)?;
     let reranker = Reranker::load(
         &ModelSource::Files {
@@ -51,7 +52,11 @@ fn main() -> Result<()> {
     )?;
 
     let rows = read_pairs(&options.pairs)?;
-    anyhow::ensure!(!rows.is_empty(), "{} holds no pairs", options.pairs.display());
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "{} holds no pairs",
+        options.pairs.display()
+    );
 
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(&options.out)
@@ -72,11 +77,7 @@ fn main() -> Result<()> {
 
 /// One chunk of pairs: tokenized here, scored by the teacher, and checked
 /// that the two saw the same thing before either is written.
-fn score_chunk(
-    reranker: &Reranker,
-    tokenizer: &Tokenizer,
-    rows: &[Row],
-) -> Result<Vec<String>> {
+fn score_chunk(reranker: &Reranker, tokenizer: &Tokenizer, rows: &[Row]) -> Result<Vec<String>> {
     let pairs: Vec<(&str, &str)> = rows
         .iter()
         .map(|row| (row.query.as_str(), row.text.as_str()))
@@ -119,8 +120,7 @@ struct Row {
 }
 
 fn read_pairs(path: &std::path::Path) -> Result<Vec<Row>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     BufReader::new(file)
         .lines()
         .enumerate()
@@ -161,57 +161,34 @@ fn load_tokenizer(path: &std::path::Path, max_seq_length: usize) -> Result<Token
     Ok(tokenizer)
 }
 
+/// Score query/document pairs with Kohagi's cross-encoder and write the token
+/// ids beside the score, so a student can be trained on them many times.
+///
+/// `--pairs` is one {"query", "text"} per line; anything else on the line is
+/// carried through. The output is the same with `input_ids`, `teacher` and
+/// `truncated` added.
+#[derive(Parser)]
+#[command(name = "kohagi-dataset", version)]
 struct Cli {
+    /// The teacher's safetensors weights (config.json must sit next to it).
+    #[arg(long)]
     model_path: PathBuf,
+    /// The teacher's tokenizer.json, which is also what tokenizes the pairs.
+    #[arg(long)]
     tokenizer_path: PathBuf,
+    /// The pairs to score, one JSON object per line.
+    #[arg(long)]
     pairs: PathBuf,
+    /// Where to write the scored rows.
+    #[arg(long)]
     out: PathBuf,
+    /// Token-level truncation length for a pair.
+    #[arg(long, default_value_t = 512)]
     max_seq_length: usize,
+    /// Distil against the raw logit instead of its sigmoid. Which one to
+    /// distil against is the recipe's business: a squashed target loses
+    /// resolution at the ends, and an unsquashed one is what a distillation
+    /// loss usually wants.
+    #[arg(long = "logit", action = clap::ArgAction::SetFalse)]
     sigmoid: bool,
 }
-
-impl Cli {
-    fn parse() -> Result<Self> {
-        let (mut model_path, mut tokenizer_path, mut pairs, mut out) = (None, None, None, None);
-        let mut max_seq_length = 512usize;
-        let mut sigmoid = true;
-
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--model-path" => model_path = args.next().map(PathBuf::from),
-                "--tokenizer-path" => tokenizer_path = args.next().map(PathBuf::from),
-                "--pairs" => pairs = args.next().map(PathBuf::from),
-                "--out" => out = args.next().map(PathBuf::from),
-                "--max-seq-length" => {
-                    max_seq_length = args
-                        .next()
-                        .context("--max-seq-length wants a number")?
-                        .parse()?
-                }
-                // The raw logit rather than its sigmoid. Which one to
-                // distil against is the recipe's business: a squashed
-                // target loses resolution at the ends, and an unsquashed
-                // one is what a distillation loss usually wants.
-                "--logit" => sigmoid = false,
-                "--help" | "-h" => {
-                    eprintln!("{USAGE}");
-                    std::process::exit(0);
-                }
-                other => anyhow::bail!("unknown argument {other}\n{USAGE}"),
-            }
-        }
-        Ok(Self {
-            model_path: model_path.context(USAGE)?,
-            tokenizer_path: tokenizer_path.context(USAGE)?,
-            pairs: pairs.context(USAGE)?,
-            out: out.context(USAGE)?,
-            max_seq_length,
-            sigmoid,
-        })
-    }
-}
-
-const USAGE: &str = "usage: kohagi-dataset --model-path <model.safetensors> \
---tokenizer-path <tokenizer.json> --pairs <pairs.jsonl> --out <train.jsonl> \
-[--max-seq-length N] [--logit]";

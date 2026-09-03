@@ -27,19 +27,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use arrow::array::{Array, AsArray, StringArray};
 use arrow::datatypes::Int64Type;
+use clap::Parser;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-const USAGE: &str = "\
-usage: kohagi-pairs --dataset <dir> --out <pairs.jsonl>
-                    [--language jp] [--split test]
-                    [--queries N] [--candidates N]
-
-<dir> is an mteb reranking snapshot: it holds <language>-queries,
-<language>-corpus, <language>-qrels and <language>-top_ranked, each with
-one parquet file per split.";
-
 fn main() -> Result<()> {
-    let cli = Cli::parse()?;
+    let cli = Cli::parse();
     let queries = strings(&cli.file("queries")?, "_id", "text")?;
     let corpus = strings(&cli.file("corpus")?, "_id", "text")?;
     let labels = scores(&cli.file("qrels")?)?;
@@ -50,11 +42,15 @@ fn main() -> Result<()> {
             .with_context(|| format!("writing {}", cli.out.display()))?,
     );
     let (mut written, mut used) = (0usize, 0usize);
-    for (query_id, docs) in ranked.iter().take(cli.queries) {
-        let Some(query) = queries.get(query_id) else { continue };
+    for (query_id, docs) in ranked.iter().take(cli.queries.unwrap_or(usize::MAX)) {
+        let Some(query) = queries.get(query_id) else {
+            continue;
+        };
         used += 1;
-        for doc_id in docs.iter().take(cli.candidates) {
-            let Some(text) = corpus.get(doc_id) else { continue };
+        for doc_id in docs.iter().take(cli.candidates.unwrap_or(usize::MAX)) {
+            let Some(text) = corpus.get(doc_id) else {
+                continue;
+            };
             let row = serde_json::json!({
                 "query": query,
                 "text": text,
@@ -140,8 +136,7 @@ fn candidates(path: &Path) -> Result<Vec<(String, Vec<String>)>> {
 }
 
 fn reader(path: &Path) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(ParquetRecordBatchReaderBuilder::try_new(file)?.build()?)
 }
 
@@ -159,13 +154,35 @@ fn column<T: 'static + Clone>(
         .cloned()
 }
 
+/// Read an mteb reranking snapshot into the (query, text) pairs a
+/// distillation takes.
+///
+/// Queries are taken in file order and candidates in the order the dataset
+/// ranked them, so the same arguments give the same file.
+#[derive(Parser)]
+#[command(name = "kohagi-pairs", version)]
 struct Cli {
+    /// An mteb reranking snapshot: it holds <language>-queries,
+    /// <language>-corpus, <language>-qrels and <language>-top_ranked, each
+    /// with one parquet file per split.
+    #[arg(long, value_name = "DIR")]
     dataset: PathBuf,
+    /// Where to write the pairs, one JSON object per line.
+    #[arg(long)]
     out: PathBuf,
+    /// Which language's four parts to read, as the snapshot names them.
+    #[arg(long, default_value = "jp")]
     language: String,
+    /// Which split's parquet file to read from each part.
+    #[arg(long, default_value = "test")]
     split: String,
-    queries: usize,
-    candidates: usize,
+    /// Take only the first N queries; omitted takes them all.
+    #[arg(long, value_name = "N")]
+    queries: Option<usize>,
+    /// Take only the first N candidates of each query, in the order the
+    /// dataset ranked them; omitted takes them all.
+    #[arg(long, value_name = "N")]
+    candidates: Option<usize>,
 }
 
 impl Cli {
@@ -186,40 +203,5 @@ impl Cli {
         found
             .pop()
             .with_context(|| format!("no {} parquet in {}", self.split, dir.display()))
-    }
-
-    fn parse() -> Result<Self> {
-        let (mut dataset, mut out) = (None, None);
-        let mut language = "jp".to_string();
-        let mut split = "test".to_string();
-        let (mut queries, mut candidates) = (usize::MAX, usize::MAX);
-
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            let mut next = |what: &str| -> Result<String> {
-                args.next().with_context(|| format!("{what} wants a value"))
-            };
-            match arg.as_str() {
-                "--dataset" => dataset = Some(PathBuf::from(next("--dataset")?)),
-                "--out" => out = Some(PathBuf::from(next("--out")?)),
-                "--language" => language = next("--language")?,
-                "--split" => split = next("--split")?,
-                "--queries" => queries = next("--queries")?.parse()?,
-                "--candidates" => candidates = next("--candidates")?.parse()?,
-                "--help" | "-h" => {
-                    eprintln!("{USAGE}");
-                    std::process::exit(0);
-                }
-                other => anyhow::bail!("unknown argument {other:?}\n\n{USAGE}"),
-            }
-        }
-        Ok(Self {
-            dataset: dataset.context(USAGE)?,
-            out: out.context(USAGE)?,
-            language,
-            split,
-            queries,
-            candidates,
-        })
     }
 }
