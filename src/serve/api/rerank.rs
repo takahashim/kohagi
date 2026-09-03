@@ -47,16 +47,35 @@ impl Validated {
     }
 }
 
-/// Check a rerank request. `documents` may be strings or `{"text": …}`
-/// objects, as Cohere accepts both; `max_inputs` bounds their number as it
-/// bounds `input` for embeddings.
+/// Check a rerank request: the query, the documents, and how many results to
+/// keep. Each field is checked in its own place, as `embeddings` checks
+/// `input` in [`texts_of`](super::embeddings).
 pub(crate) fn validate(req: Request, max_inputs: usize) -> Result<Validated, Refusal> {
     let query = match req.query {
         Value::String(q) if !q.is_empty() => q,
         Value::String(_) => return Err(Refusal::of("query", "`query` is an empty string")),
         _ => return Err(Refusal::of("query", "`query` must be a string")),
     };
-    let items = match req.documents {
+    let documents = documents_of(req.documents, max_inputs)?;
+    let top_n = match req.top_n {
+        None => None,
+        Some(0) => return Err(Refusal::of("top_n", "`top_n` must be at least 1")),
+        Some(n) => Some(usize::try_from(n).unwrap_or(usize::MAX)),
+    };
+    Ok(Validated {
+        query,
+        documents,
+        top_n,
+        return_documents: req.return_documents,
+    })
+}
+
+/// `documents` as the texts to score: strings or `{"text": …}` objects, as
+/// Cohere accepts both. `max_inputs` bounds their number as it bounds `input`
+/// for embeddings, and an empty document is refused rather than scored, for
+/// the reason an empty `input` item is.
+fn documents_of(documents: Value, max_inputs: usize) -> Result<Vec<String>, Refusal> {
+    let items = match documents {
         Value::Array(items) => items,
         _ => {
             return Err(Refusal::of(
@@ -81,7 +100,7 @@ pub(crate) fn validate(req: Request, max_inputs: usize) -> Result<Validated, Ref
             ),
         ));
     }
-    let mut documents = Vec::with_capacity(items.len());
+    let mut texts = Vec::with_capacity(items.len());
     for (i, item) in items.into_iter().enumerate() {
         let text = match item {
             Value::String(s) => s,
@@ -107,19 +126,9 @@ pub(crate) fn validate(req: Request, max_inputs: usize) -> Result<Validated, Ref
                 format!("`documents[{i}]` is empty; there is nothing to score"),
             ));
         }
-        documents.push(text);
+        texts.push(text);
     }
-    let top_n = match req.top_n {
-        None => None,
-        Some(0) => return Err(Refusal::of("top_n", "`top_n` must be at least 1")),
-        Some(n) => Some(usize::try_from(n).unwrap_or(usize::MAX)),
-    };
-    Ok(Validated {
-        query,
-        documents,
-        top_n,
-        return_documents: req.return_documents,
-    })
+    Ok(texts)
 }
 
 /// What the reply needs beyond the scores: how many results to keep, and the
