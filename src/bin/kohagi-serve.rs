@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 use kohagi::cli::{self, ModelArgs};
 use kohagi::serve::{self, Listen, Load};
@@ -71,7 +71,15 @@ struct Args {
 /// by default: a cross-encoder is a second model (310M parameters for
 /// ruri-v3-reranker-310m), and only a caller of /v1/rerank wants it. It runs
 /// on the same --device at the same --precision as the embedder.
+///
+/// The `reranker` group is the two flags that turn it on; every other
+/// `--rerank-*` flag only says how to load it, and requires the group. A flag
+/// that decides nothing because no reranker was asked for is a mistake worth a
+/// message, not a silence.
 #[derive(Clone, clap::Args)]
+#[command(group(ArgGroup::new("reranker")
+    .args(["rerank_model_id", "rerank_model_path"])
+    .multiple(true)))]
 struct RerankArgs {
     /// Hugging Face reranker repo to load beside the embedder, which turns
     /// /v1/rerank on: cl-nagoya/ruri-v3-reranker-310m, or any ModernBERT
@@ -89,28 +97,29 @@ struct RerankArgs {
     rerank_tokenizer_path: Option<PathBuf>,
     /// Token-level truncation length for a query/document pair. The longer
     /// half is trimmed first, as in the reference implementation.
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 512, requires = "reranker")]
     rerank_max_seq_length: usize,
     /// Directory of the reranker's converted CoreML bundle for `--device
     /// coreml`, as `coreml-convert` writes it. Omit it to convert
     /// --rerank-model-id on first use.
-    #[arg(long)]
+    #[arg(long, requires = "reranker")]
     rerank_coreml_dir: Option<PathBuf>,
     /// Hugging Face repo holding that same layout, downloaded and cached on
     /// first use. --rerank-coreml-dir wins if both are set.
-    #[arg(long)]
+    #[arg(long, requires = "reranker")]
     rerank_coreml_model_id: Option<String>,
     /// Fixed sequence lengths to emit when `--device coreml` converts the
     /// reranker itself. A pair fills more of a bucket than a single text does,
     /// so these run longer than --coreml-buckets; they are `kohagi-rerank`'s
     /// defaults, so the two produce the same bundle.
-    #[arg(long, value_delimiter = ',', default_values_t = cli::RERANK_COREML_BUCKETS)]
+    #[arg(long, value_delimiter = ',', default_values_t = cli::RERANK_COREML_BUCKETS,
+          requires = "reranker")]
     rerank_coreml_buckets: Vec<usize>,
     /// Refuse to start unless the reranker's sha256 starts with this hex
     /// prefix, as --expect-sha256 does for the embedder. A threshold belongs to
     /// the weights it was tuned on; a mismatch exits 1 before anything is
     /// served.
-    #[arg(long, value_name = "HEX")]
+    #[arg(long, value_name = "HEX", requires = "reranker")]
     rerank_expect_sha256: Option<String>,
 }
 
@@ -199,6 +208,23 @@ mod tests {
         assert!(
             Args::try_parse_from(["kohagi-serve", "--rerank-model-path", "m.safetensors"]).is_err()
         );
+
+        // A flag that says how to load a reranker, with no reranker asked for,
+        // decides nothing; it is refused rather than ignored. The defaults are
+        // not an occurrence, so a plain start is still fine.
+        for flag in [
+            vec!["--rerank-coreml-dir", "/m/reranker"],
+            vec!["--rerank-coreml-model-id", "org/reranker"],
+            vec!["--rerank-coreml-buckets", "256"],
+            vec!["--rerank-max-seq-length", "256"],
+            vec!["--rerank-expect-sha256", "1c342581efc2"],
+        ] {
+            let mut argv = vec!["kohagi-serve"];
+            argv.extend(&flag);
+            assert!(Args::try_parse_from(&argv).is_err(), "{flag:?}");
+            argv.extend(["--rerank-model-id", "org/reranker"]);
+            assert!(Args::try_parse_from(&argv).is_ok(), "{flag:?}");
+        }
 
         let off = Args::try_parse_from(["kohagi-serve"]).unwrap();
         assert!(!off.rerank.wanted());
