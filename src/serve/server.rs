@@ -53,6 +53,7 @@ impl Server {
     pub(crate) async fn serve_until<T>(&mut self, until: impl Future<Output = T>) -> T {
         let mut until = std::pin::pin!(until);
         loop {
+            self.reap_finished_connections();
             tokio::select! {
                 biased;
                 outcome = &mut until => return outcome,
@@ -73,6 +74,18 @@ impl Server {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 },
+            }
+        }
+    }
+
+    /// A [`JoinSet`] keeps a completed task until it is joined. Reap those
+    /// connections during the run as well as at shutdown: a long-lived server
+    /// must use memory for its open connections, not every connection it has
+    /// ever answered.
+    fn reap_finished_connections(&mut self) {
+        while let Some(outcome) = self.connections.try_join_next() {
+            if let Err(e) = outcome {
+                remark!("connection task: {e}");
             }
         }
     }
@@ -246,6 +259,20 @@ mod tests {
             assert_eq!(stream.read_to_end(&mut rest).await.unwrap(), 0);
             // ...and the port answers no one else.
             assert!(tokio::net::TcpStream::connect(&addr).await.is_err());
+        });
+    }
+
+    #[test]
+    fn completed_connections_are_reaped_while_the_server_runs() {
+        block_on(async {
+            let listen = "127.0.0.1:0".parse::<Listen>().unwrap();
+            let mut server = Server::start(&listen, state()).await.unwrap();
+            server.connections.spawn(async {});
+            tokio::task::yield_now().await;
+
+            assert_eq!(server.connections.len(), 1);
+            server.reap_finished_connections();
+            assert!(server.connections.is_empty());
         });
     }
 

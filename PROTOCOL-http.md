@@ -108,7 +108,9 @@ The reply is the object `kohagi --format openai` writes:
 Reading `base64` back:
 
 ```ruby
-vec = reply.dig("data", 0, "embedding").unpack("e*")          # Ruby
+require "base64"
+encoded = reply.dig("data", 0, "embedding")
+vec = Base64.strict_decode64(encoded).unpack("e*")
 ```
 
 ```python
@@ -230,8 +232,9 @@ request when there are several.
 Unix domain socket instead of TCP, for a server that shares a host with its
 callers: the file's permissions are the access control and no port needs
 choosing. The socket is created with mode 0600. A socket left at the path by a
-previous run is replaced; anything at the path that is not a socket is refused
-rather than removed. The file is removed at shutdown. Unix only; on Windows
+previous run is replaced; a running `kohagi-serve` at that path, or anything
+that is not a socket, is refused rather than replaced. The file is removed at
+shutdown. Unix only; on Windows
 `--listen` takes `host:port`.
 
 ```bash

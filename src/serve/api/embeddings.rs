@@ -169,8 +169,8 @@ pub(crate) fn truncate(vectors: &mut [Vec<f32>], n: usize) {
 }
 
 /// float32, little-endian, base64: the bytes OpenAI's `encoding_format:
-/// "base64"` carries, which Ruby reads with `unpack("e*")` and Python with
-/// `np.frombuffer(..., dtype="<f4")`.
+/// "base64"` carries, which Ruby Base64-decodes before `unpack("e*")` and
+/// Python reads with `np.frombuffer(..., dtype="<f4")`.
 fn base64_f32(v: &[f32]) -> String {
     let mut bytes = Vec::with_capacity(v.len() * 4);
     for x in v {

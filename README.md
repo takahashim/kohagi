@@ -212,13 +212,16 @@ rather than one per worker, point [ruby-openai](https://github.com/alexrudall/ru
 at `kohagi-serve` instead. `base64` spares Ruby the parsing of 512 JSON numbers:
 
 ```ruby
-client = OpenAI::Client.new(uri_base: ENV.fetch("KOHAGI_URL", "http://127.0.0.1:8080"),
+require "base64"
+
+client = OpenAI::Client.new(uri_base: ENV.fetch("KOHAGI_URL", "http://127.0.0.1:8080/v1"),
                             access_token: "unused")
-vec = client.embeddings(parameters: {
+encoded = client.embeddings(parameters: {
   model: "ruri-v3-130m",
   input: "検索クエリ: #{q}",
   encoding_format: "base64",
-}).dig("data", 0, "embedding").unpack("e*")
+}).dig("data", 0, "embedding")
+vec = Base64.strict_decode64(encoded).unpack("e*")
 ```
 
 ## Using the Rust library

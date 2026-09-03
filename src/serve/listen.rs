@@ -6,6 +6,8 @@
 
 use std::fmt;
 use std::io;
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -15,6 +17,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
+
+#[cfg(unix)]
+pub(crate) struct SocketFile {
+    path: PathBuf,
+    /// Held for the listener's whole life. This is an advisory lock, released
+    /// on a crash, that serializes stale-socket cleanup and binding.
+    _lock: std::fs::File,
+    dev: u64,
+    ino: u64,
+}
 
 /// `--listen`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,7 +90,7 @@ pub(crate) type Io = Pin<Box<dyn AsyncStream>>;
 pub(crate) enum Bound {
     Tcp(TcpListener),
     #[cfg(unix)]
-    Unix(UnixListener, PathBuf),
+    Unix(UnixListener, SocketFile),
 }
 
 impl Bound {
@@ -90,6 +102,7 @@ impl Bound {
                 .map(Bound::Tcp),
             #[cfg(unix)]
             Listen::Unix(path) => {
+                let lock = lock_socket(path)?;
                 remove_stale_socket(path)?;
                 let listener = UnixListener::bind(path)
                     .with_context(|| format!("listening on unix://{}", path.display()))?;
@@ -98,7 +111,7 @@ impl Bound {
                 // moment still waits for accept, which starts after.
                 std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
                     .with_context(|| format!("setting the mode of {}", path.display()))?;
-                Ok(Bound::Unix(listener, path.clone()))
+                Ok(Bound::Unix(listener, SocketFile::at(path, lock)?))
             }
             #[cfg(not(unix))]
             Listen::Unix(_) => unreachable!("refused when the flag was parsed"),
@@ -114,7 +127,7 @@ impl Bound {
                 Err(_) => "http://?".to_string(),
             },
             #[cfg(unix)]
-            Bound::Unix(_, path) => format!("unix://{}", path.display()),
+            Bound::Unix(_, socket) => format!("unix://{}", socket.path.display()),
         }
     }
 
@@ -138,8 +151,61 @@ impl Bound {
 #[cfg(unix)]
 impl Drop for Bound {
     fn drop(&mut self) {
-        if let Bound::Unix(_, path) = self {
-            let _ = std::fs::remove_file(path);
+        if let Bound::Unix(_, socket) = self {
+            // Do not remove a replacement socket. The lock prevents another
+            // kohagi-serve process from making one, but an operator may still
+            // have replaced the path while this listener was alive.
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+            let mine = std::fs::symlink_metadata(&socket.path).is_ok_and(|meta| {
+                meta.file_type().is_socket() && meta.dev() == socket.dev && meta.ino() == socket.ino
+            });
+            if mine {
+                let _ = std::fs::remove_file(&socket.path);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl SocketFile {
+    fn at(path: &Path, lock: std::fs::File) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let meta = std::fs::symlink_metadata(path)
+            .with_context(|| format!("checking the new socket {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            _lock: lock,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+/// Take the per-socket lock before deciding whether a socket is stale. Without
+/// it two starts can both unlink the old path and each bind a listener; the
+/// second then steals new clients and the first may remove its path at exit.
+#[cfg(unix)]
+fn lock_socket(path: &Path) -> Result<std::fs::File> {
+    use std::fs::{OpenOptions, TryLockError};
+
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening socket lock {}", lock_path.display()))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(TryLockError::WouldBlock) => anyhow::bail!(
+            "{} is already owned by another kohagi-serve process",
+            path.display()
+        ),
+        Err(TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking socket {}", path.display()))
         }
     }
 }
@@ -148,11 +214,22 @@ impl Drop for Bound {
 /// nothing else has business there, so it is removed. Anything that is not a
 /// socket is refused rather than removed, since that would be someone's file.
 #[cfg(unix)]
-fn remove_stale_socket(path: &std::path::Path) -> Result<()> {
+fn remove_stale_socket(path: &Path) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)
-            .with_context(|| format!("removing the stale socket {}", path.display())),
+        Ok(meta) if meta.file_type().is_socket() => {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(_) => anyhow::bail!(
+                    "{} has a listening server; refusing to replace it",
+                    path.display()
+                ),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(path)
+                        .with_context(|| format!("removing the stale socket {}", path.display()))
+                }
+                Err(e) => Err(e).with_context(|| format!("checking socket {}", path.display())),
+            }
+        }
         Ok(_) => anyhow::bail!(
             "{} exists and is not a socket; refusing to replace it",
             path.display()
@@ -240,11 +317,16 @@ mod tests {
             assert!(!path.exists(), "the socket file outlived the listener");
         });
 
-        // A socket left by a killed run is replaced; a file that is not a
-        // socket is not.
+        // A socket left by a killed run is replaced; a live one is not, and a
+        // file that is not a socket is not either.
         block_on(async {
-            let stale = Bound::bind(&listen).await.unwrap();
-            std::mem::forget(stale);
+            let live = Bound::bind(&listen).await.unwrap();
+            let refused = Bound::bind(&listen).await.err().expect("refused");
+            assert!(refused.to_string().contains("already owned"), "{refused}");
+            drop(live);
+
+            let stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            drop(stale);
             assert!(path.exists());
             let again = Bound::bind(&listen).await.unwrap();
             drop(again);
