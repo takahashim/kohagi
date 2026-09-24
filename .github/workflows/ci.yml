@@ -40,6 +40,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
+      # The `head-laya` feature (src/decide/laya.rs) is on by default, so the
+      # step above never sees the head compiled out. Lint that shape too, so the
+      # registry's `cfg` and the feature gate stay honest.
+      - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
       # The Metal (src/fused.rs, the encoder's Metal paths) and CoreML
       # (src/coreml) backends are macOS-only and compile out otherwise, so
       # nothing above ever type-checks them. Lint them on the macOS runner.
@@ -121,13 +125,14 @@ jobs:
         # with newer NVIDIA architectures through driver JIT compilation.
         env:
           CUDA_COMPUTE_CAP: '80'
-      # Both binaries, because both are the protocol: empty input must exit 0
+      # Every stdio binary, because each is its protocol: empty input must exit 0
       # without loading anything, whichever record shape is being read.
       - name: Smoke-test the protocol without a model (Unix)
         if: runner.os != 'Windows'
         run: |
           : | ./target/${{ matrix.target }}/release/kohagi --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
           : | ./target/${{ matrix.target }}/release/kohagi-rerank --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
+          : | ./target/${{ matrix.target }}/release/kohagi-decide --model-path /nonexistent.safetensors --tokenizer-path /nonexistent.json
       # The server is the other way round: it loads before it listens, so a
       # missing model is a failed start, exit 1, and never a port left open.
       - name: Smoke-test that the server refuses to start without a model (Unix)
@@ -142,9 +147,10 @@ jobs:
       # executable therefore cannot be launched here, even with empty stdin;
       # the Windows job above deliberately validates compilation only.
       #
-      # `kohagi`, `kohagi-rerank` and `kohagi-serve` ship together: retrieval
-      # and reranking are two halves of one pipeline, and the server is the
-      # same model behind HTTP for callers that keep one per host.
+      # `kohagi`, `kohagi-rerank`, `kohagi-decide` and `kohagi-serve` ship
+      # together: embedding, reranking and typed decisions are one pipeline, and
+      # the server is the same models behind HTTP for callers that keep one per
+      # host.
       # `coreml-convert` does not — it needs `--features coreml-export`, so only
       # the macOS target builds it at all, and shipping it there alone would
       # make one platform's archive hold something the others' cannot.
@@ -152,7 +158,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir dist
-          tar -czf dist/kohagi-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release kohagi kohagi-rerank kohagi-serve
+          tar -czf dist/kohagi-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release kohagi kohagi-rerank kohagi-decide kohagi-serve
           cd dist && shasum -a 256 *.tar.gz > kohagi-${{ matrix.target }}.sha256
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -163,6 +169,7 @@ jobs:
           $binaries = @(
             ".\\target\\${{ matrix.target }}\\release\\kohagi.exe",
             ".\\target\\${{ matrix.target }}\\release\\kohagi-rerank.exe",
+            ".\\target\\${{ matrix.target }}\\release\\kohagi-decide.exe",
             ".\\target\\${{ matrix.target }}\\release\\kohagi-serve.exe"
           )
           Compress-Archive -Path $binaries -DestinationPath ".\\dist\\$archive"

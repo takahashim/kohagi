@@ -856,8 +856,9 @@ impl ModernBertLayer {
 /// Whether a position is padding is a property of the key being attended to,
 /// not of the query attending to it, so the query axis is 1 and the
 /// `[b, 1, s, s]` that [`prepare_4d_attention_mask`] builds is these same
-/// numbers repeated `s` times.
-fn padding_mask(mask: &Tensor, dtype: DType) -> Result<Tensor> {
+/// numbers repeated `s` times. Public within the crate because the packed
+/// decision head attends over the same mask.
+pub(crate) fn padding_mask(mask: &Tensor, dtype: DType) -> Result<Tensor> {
     let (bsz, src_len) = mask.dims2()?;
     let mask = mask.reshape((bsz, 1, 1, src_len))?.to_dtype(dtype)?;
     ((1.0 - mask)? * f32::MIN as f64)?.to_dtype(dtype)

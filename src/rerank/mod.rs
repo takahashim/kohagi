@@ -140,13 +140,17 @@ struct Head {
     classifier: Linear,
 }
 
-/// One of the head's two optional biases, or `None`.
+/// One of the prediction head's optional biases, or `None`.
 ///
-/// `config.json` decides, not the checkpoint: HF builds
-/// `ModernBertPredictionHead`'s `Linear` and `LayerNorm` from `classifier_bias`
-/// and `norm_bias`, both of which default to false, so a bias tensor a config
-/// does not declare is one `from_pretrained` leaves unloaded as well. Following
-/// the flag is what keeps the score equal to CrossEncoder's.
+/// `config.json` decides, not the checkpoint: HF builds `ModernBertPredictionHead`'s
+/// `Linear` from `classifier_bias` and its `LayerNorm` from `norm_bias`, both of
+/// which default to false, so a bias tensor a config does not declare is one
+/// `from_pretrained` leaves unloaded as well. Following the flag is what keeps
+/// the score equal to CrossEncoder's.
+///
+/// The final classifier is not one of these. HF builds it as
+/// `nn.Linear(hidden_size, num_labels)` with the default bias, so no flag
+/// reaches it and the checkpoint alone decides; see [`Head::load`].
 ///
 /// Hence the warning rather than silence: a dropped bias does not fail, it
 /// scores slightly wrong. `from_pretrained` reports the same disagreement as
@@ -207,8 +211,20 @@ impl Head {
             None => candle_nn::LayerNorm::new_no_bias(norm_weight, config.layer_norm_eps),
         };
 
+        // The checkpoint decides this one, not `config.json`. `classifier_bias`
+        // reaches only `ModernBertPredictionHead`'s `dense` above; HF builds the
+        // final classifier as `nn.Linear(hidden_size, num_labels)`, whose bias
+        // is on whatever the flag says. So a checkpoint carrying
+        // `classifier.bias` has a trained bias `from_pretrained` would load, and
+        // one without it (config-faithful, as a trainer that follows the flag
+        // through produces) has none to load.
         let cls = vb.pp(names::CLASSIFIER);
-        let classifier = Linear::new(cls.get((1, size), "weight")?, Some(cls.get(1, "bias")?));
+        let classifier = Linear::new(
+            cls.get((1, size), "weight")?,
+            cls.contains_tensor("bias")
+                .then(|| cls.get(1, "bias"))
+                .transpose()?,
+        );
         Ok(Self {
             dense,
             act,

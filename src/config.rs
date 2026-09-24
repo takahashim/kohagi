@@ -35,17 +35,18 @@ pub mod head {
 
     /// What a head cannot be assembled without.
     #[cfg_attr(not(feature = "coreml-export"), allow(dead_code))]
-    pub const REQUIRED: [&str; 4] = [
-        "head.dense.weight",
-        "head.norm.weight",
-        "classifier.weight",
-        "classifier.bias",
-    ];
+    pub const REQUIRED: [&str; 3] = ["head.dense.weight", "head.norm.weight", "classifier.weight"];
 
-    /// The two biases `config.json` decides on, absent from a checkpoint that
-    /// does not use them — which is ModernBERT's default.
+    /// The biases a checkpoint may or may not carry.
+    ///
+    /// The first two are the ones `config.json` decides on through
+    /// `classifier_bias` and `norm_bias`, absent from a checkpoint that does
+    /// not use them, which is ModernBERT's default. `classifier.bias` is
+    /// optional for a different reason: no flag reaches the final classifier
+    /// (HF gives it the `nn.Linear` default), so whether it is there is the
+    /// checkpoint's own business. Either way an absent one is not an error.
     #[cfg_attr(not(feature = "coreml-export"), allow(dead_code))]
-    pub const OPTIONAL: [&str; 2] = ["head.dense.bias", "head.norm.bias"];
+    pub const OPTIONAL: [&str; 3] = ["head.dense.bias", "head.norm.bias", "classifier.bias"];
 
     /// Whether a checkpoint tensor belongs to the head rather than the encoder.
     ///

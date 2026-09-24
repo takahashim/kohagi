@@ -1,6 +1,7 @@
 //! Model sources and their loading helpers.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -13,6 +14,11 @@ pub enum ModelSource {
     Hub { repo: String },
     /// Local weights and tokenizer. `config.json` must sit beside the weights.
     Files { model: PathBuf, tokenizer: PathBuf },
+    /// A local model directory, laid out as a head's [`Manifest`] describes and
+    /// optionally nested under a subfolder. For checkpoints that ship their
+    /// encoder config and tokenizer in subdirectories (`encoder/`,
+    /// `tokenizer/`), which the flat source cannot name.
+    Dir { root: PathBuf },
     /// A directory of converted CoreML models for `--device coreml`.
     CoreMl { dir: PathBuf },
     /// A Hugging Face repository containing converted CoreML models.
@@ -24,6 +30,52 @@ pub enum ModelSource {
         buckets: Vec<usize>,
         quantize: crate::CoreMlQuantize,
     },
+}
+
+/// What a head needs from a checkpoint, as paths relative to the model root.
+///
+/// A head declares this and [`ModelSource::resolve`] fetches exactly these, so a
+/// checkpoint that nests its files (`encoder/config.json`,
+/// `tokenizer/tokenizer.json`) is not a special case for the resolver — only a
+/// different manifest. Nothing here names a model.
+pub(crate) struct Manifest {
+    pub(crate) weights: &'static str,
+    pub(crate) tokenizer: &'static str,
+    /// Named extra files (a head's or encoder's config), by relative path.
+    pub(crate) configs: &'static [(&'static str, &'static str)],
+}
+
+/// The flat layout every embedder and reranker here uses: `model.safetensors`
+/// beside `config.json` and `tokenizer.json`.
+pub(crate) const FLAT: Manifest = Manifest {
+    weights: "model.safetensors",
+    tokenizer: "tokenizer.json",
+    configs: &[("config", "config.json")],
+};
+
+/// The files a [`Manifest`] resolved to, all local.
+pub(crate) struct Resolved {
+    pub(crate) weights: PathBuf,
+    pub(crate) tokenizer: PathBuf,
+    #[cfg_attr(
+        not(all(feature = "coreml", feature = "coreml-export")),
+        allow(dead_code)
+    )]
+    pub(crate) configs: BTreeMap<&'static str, PathBuf>,
+    /// `1_Pooling/config.json`, if present.
+    #[cfg_attr(
+        not(all(feature = "coreml", feature = "coreml-export")),
+        allow(dead_code)
+    )]
+    pub(crate) pooling_file: Option<PathBuf>,
+    /// `sentence_bert_config.json`, if present.
+    #[cfg_attr(
+        not(all(feature = "coreml", feature = "coreml-export")),
+        allow(dead_code)
+    )]
+    pub(crate) sentence_config: Option<PathBuf>,
+    pub(crate) pooling: Option<Pooling>,
+    pub(crate) declared_max_seq: Option<usize>,
 }
 
 /// Files used by the Candle backends.
@@ -46,24 +98,49 @@ pub(crate) struct ResolvedCoreMl {
 impl ModelSource {
     /// Resolves this source to the files used by Candle backends.
     pub(crate) fn checkpoint_files(&self) -> Result<CheckpointFiles> {
+        let resolved = self.resolve(&FLAT, None)?;
+        Ok(CheckpointFiles {
+            weights: resolved.weights,
+            tokenizer: resolved.tokenizer,
+            pooling: resolved.pooling,
+            declared_max_seq: resolved.declared_max_seq,
+        })
+    }
+
+    /// Resolves the files `manifest` names, under `subfolder` when the
+    /// checkpoint nests them.
+    ///
+    /// Generic over heads: a flat checkpoint and one with `encoder/` and
+    /// `tokenizer/` differ only in their manifest and subfolder, not in the
+    /// resolver.
+    pub(crate) fn resolve(&self, manifest: &Manifest, subfolder: Option<&str>) -> Result<Resolved> {
         match self {
-            Self::Files { model, tokenizer } => Ok(CheckpointFiles {
-                weights: model.clone(),
-                tokenizer: tokenizer.clone(),
-                pooling: model.parent().and_then(pooling_in_dir),
-                declared_max_seq: model.parent().and_then(declared_max_seq_in_dir),
-            }),
-            Self::Hub { repo } => {
-                let f = fetch_checkpoint(repo)?;
-                Ok(CheckpointFiles {
-                    weights: f.weights,
-                    tokenizer: f.tokenizer,
-                    pooling: f.pooling,
-                    declared_max_seq: f.declared_max_seq,
+            Self::Hub { repo } => fetch_manifest(repo, manifest, subfolder),
+            Self::Dir { root } => resolve_in_dir(root, manifest, subfolder),
+            Self::Files { model, tokenizer } => {
+                // Explicit paths win; extra configs are looked for beside the
+                // weights, which is where a flat checkpoint keeps them.
+                let dir = model.parent().unwrap_or_else(|| Path::new("."));
+                let configs = manifest
+                    .configs
+                    .iter()
+                    .map(|(name, rel)| (*name, dir.join(rel)))
+                    .collect();
+                Ok(Resolved {
+                    weights: model.clone(),
+                    tokenizer: tokenizer.clone(),
+                    configs,
+                    pooling_file: existing(dir.join("1_Pooling").join("config.json")),
+                    sentence_config: existing(dir.join(SENTENCE_CONFIG)),
+                    pooling: pooling_in_dir(dir),
+                    declared_max_seq: declared_max_seq_in_dir(dir),
                 })
             }
             Self::CoreMl { .. } | Self::CoreMlHub { .. } | Self::CoreMlConvert { .. } => {
-                Err(UnsupportedRequest::new("a CoreML model source needs `--device coreml`").into())
+                Err(UnsupportedRequest::new(
+                    "a CoreML model source is a converted bundle, not a checkpoint",
+                )
+                .into())
             }
         }
     }
@@ -85,11 +162,13 @@ impl ModelSource {
                 buckets,
                 quantize,
             } => convert_for_coreml(checkpoint, buckets, *quantize),
-            Self::Hub { .. } | Self::Files { .. } => Err(UnsupportedRequest::new(
-                "`--device coreml` needs a CoreML bundle (`--coreml-dir`), a Hub repo \
+            Self::Hub { .. } | Self::Files { .. } | Self::Dir { .. } => {
+                Err(UnsupportedRequest::new(
+                    "`--device coreml` needs a CoreML bundle (`--coreml-dir`), a Hub repo \
                  (`--coreml-model-id`), or a checkpoint to convert (`--model-id`)",
-            )
-            .into()),
+                )
+                .into())
+            }
         }
     }
 }
@@ -109,30 +188,9 @@ fn convert_for_coreml(
             if !hub_checkpoint_is_cached(repo) {
                 crate::program::remark!("downloading {repo} (safetensors; first run only) ...");
             }
-            let files = fetch_checkpoint(repo)?;
-            crate::coreml_export::Checkpoint {
-                config: beside(&files.weights, "config.json")?,
-                weights: files.weights,
-                tokenizer: files.tokenizer,
-                pooling: files.pooling_file,
-                sentence_config: files.sentence_config,
-                source: repo.clone(),
-            }
+            checkpoint.resolve(&FLAT, None)?
         }
-        ModelSource::Files { model, tokenizer } => crate::coreml_export::Checkpoint {
-            config: beside(model, "config.json")?,
-            weights: model.clone(),
-            tokenizer: tokenizer.clone(),
-            pooling: model
-                .parent()
-                .map(|d| d.join("1_Pooling").join("config.json"))
-                .filter(|p| p.is_file()),
-            sentence_config: model
-                .parent()
-                .map(|d| d.join(SENTENCE_CONFIG))
-                .filter(|p| p.is_file()),
-            source: model.display().to_string(),
-        },
+        ModelSource::Files { .. } => checkpoint.resolve(&FLAT, None)?,
         // Only checkpoint sources can be converted.
         _ => {
             return Err(UnsupportedRequest::new(
@@ -141,6 +199,24 @@ fn convert_for_coreml(
             )
             .into())
         }
+    };
+    let config = resolved
+        .configs
+        .get("config")
+        .cloned()
+        .context("the checkpoint has no config.json")?;
+    let source = match checkpoint {
+        ModelSource::Hub { repo } => repo.clone(),
+        ModelSource::Files { model, .. } => model.display().to_string(),
+        _ => unreachable!("only Hub and Files are converted"),
+    };
+    let resolved = crate::coreml_export::Checkpoint {
+        config,
+        weights: resolved.weights,
+        tokenizer: resolved.tokenizer,
+        pooling: resolved.pooling_file,
+        sentence_config: resolved.sentence_config,
+        source,
     };
     let provisioned = autoconvert::provision(&resolved, buckets, quantize)?;
     Ok(ResolvedCoreMl {
@@ -172,59 +248,75 @@ fn hub_checkpoint_is_cached(repo: &str) -> bool {
         .is_some()
 }
 
-/// Returns a sibling path.
-#[cfg(all(feature = "coreml", feature = "coreml-export"))]
-fn beside(path: &std::path::Path, name: &str) -> Result<PathBuf> {
-    path.parent()
-        .map(|d| d.join(name))
-        .with_context(|| format!("{} has no parent directory for {name}", path.display()))
+/// A path only when the file is there.
+fn existing(path: PathBuf) -> Option<PathBuf> {
+    path.is_file().then_some(path)
 }
 
-/// Files fetched from the Hub.
-pub(crate) struct Fetched {
-    pub(crate) weights: PathBuf,
-    pub(crate) tokenizer: PathBuf,
-    /// `1_Pooling/config.json`, if present.
-    #[cfg_attr(
-        not(all(feature = "coreml", feature = "coreml-export")),
-        allow(dead_code)
-    )]
-    pooling_file: Option<PathBuf>,
-    /// `sentence_bert_config.json`, if present.
-    #[cfg_attr(
-        not(all(feature = "coreml", feature = "coreml-export")),
-        allow(dead_code)
-    )]
-    sentence_config: Option<PathBuf>,
-    pooling: Option<Pooling>,
-    declared_max_seq: Option<usize>,
+/// Resolves a manifest inside a local model directory.
+fn resolve_in_dir(root: &Path, manifest: &Manifest, subfolder: Option<&str>) -> Result<Resolved> {
+    let base = match subfolder {
+        Some(sub) => root.join(sub.trim_matches('/')),
+        None => root.to_path_buf(),
+    };
+    let path = |rel: &str| -> Result<PathBuf> {
+        let p = base.join(rel);
+        if p.is_file() {
+            Ok(p)
+        } else {
+            Err(anyhow::anyhow!(
+                "{} is missing; this checkpoint is not laid out the way this head expects",
+                p.display()
+            ))
+        }
+    };
+    let mut configs = BTreeMap::new();
+    for (name, rel) in manifest.configs {
+        configs.insert(*name, path(rel)?);
+    }
+    Ok(Resolved {
+        weights: path(manifest.weights)?,
+        tokenizer: path(manifest.tokenizer)?,
+        configs,
+        pooling_file: existing(base.join("1_Pooling").join("config.json")),
+        sentence_config: existing(base.join(SENTENCE_CONFIG)),
+        pooling: pooling_in_dir(&base),
+        declared_max_seq: declared_max_seq_in_dir(&base),
+    })
 }
 
-/// Fetches or reuses the files needed to load a model.
-fn fetch_checkpoint(repo: &str) -> Result<Fetched> {
+/// Fetches a manifest from a Hugging Face repository, caching each file.
+fn fetch_manifest(repo: &str, manifest: &Manifest, subfolder: Option<&str>) -> Result<Resolved> {
     let api = hf_hub::api::sync::Api::new().context("initializing Hugging Face Hub client")?;
     let repo = api.model(repo.to_string());
-    let get = |f: &str| {
-        repo.get(f)
-            .with_context(|| format!("cannot fetch {f} (network down? try local --model-path)"))
+    let prefix = subfolder
+        .map(|s| format!("{}/", s.trim_matches('/')))
+        .unwrap_or_default();
+    let get = |rel: &str| {
+        repo.get(&format!("{prefix}{rel}")).with_context(|| {
+            format!("cannot fetch {prefix}{rel} (network down? try local --model-path)")
+        })
     };
-    let weights = get("model.safetensors")?;
-    get("config.json")?; // Cache it beside the weights.
-    let tokenizer = get("tokenizer.json")?;
-    // Optional: rerankers and base models may not provide either.
-    let pooling_file = repo.get("1_Pooling/config.json").ok();
+    let weights = get(manifest.weights)?;
+    let tokenizer = get(manifest.tokenizer)?;
+    let mut configs = BTreeMap::new();
+    for (name, rel) in manifest.configs {
+        configs.insert(*name, get(rel)?);
+    }
+    let pooling_file = repo.get(&format!("{prefix}1_Pooling/config.json")).ok();
     let pooling = pooling_file
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| pooling_from_st_config(&s));
-    let sentence_config = repo.get(SENTENCE_CONFIG).ok();
+    let sentence_config = repo.get(&format!("{prefix}{SENTENCE_CONFIG}")).ok();
     let declared_max_seq = sentence_config
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| max_seq_from_st_config(&s));
-    Ok(Fetched {
+    Ok(Resolved {
         weights,
         tokenizer,
+        configs,
         pooling_file,
         sentence_config,
         pooling,
@@ -343,5 +435,38 @@ mod tests {
         let combined = r#"{"pooling_mode": ["mean", "cls"]}"#;
         assert_eq!(pooling_from_st_config(weighted), None);
         assert_eq!(pooling_from_st_config(combined), None);
+    }
+
+    /// A head's manifest is resolved inside a directory, with the subfolder
+    /// prefixed and every required file checked. Nothing names a model.
+    #[test]
+    fn a_manifest_resolves_under_a_subfolder() {
+        let root = std::env::temp_dir().join(format!("kohagi-resolve-{}", std::process::id()));
+        let model = root.join("multilingual");
+        std::fs::create_dir_all(model.join("encoder")).unwrap();
+        std::fs::create_dir_all(model.join("tokenizer")).unwrap();
+        std::fs::write(model.join("model.safetensors"), b"").unwrap();
+        std::fs::write(model.join("tokenizer/tokenizer.json"), b"").unwrap();
+        std::fs::write(model.join("encoder/config.json"), b"{}").unwrap();
+        std::fs::write(model.join("head.json"), b"{}").unwrap();
+
+        const NESTED: Manifest = Manifest {
+            weights: "model.safetensors",
+            tokenizer: "tokenizer/tokenizer.json",
+            configs: &[("encoder", "encoder/config.json"), ("head", "head.json")],
+        };
+        let source = ModelSource::Dir { root: root.clone() };
+        let resolved = source.resolve(&NESTED, Some("multilingual")).unwrap();
+        assert!(resolved.weights.ends_with("multilingual/model.safetensors"));
+        assert!(resolved
+            .tokenizer
+            .ends_with("multilingual/tokenizer/tokenizer.json"));
+        assert_eq!(resolved.configs.len(), 2);
+
+        // A missing file is refused, not guessed.
+        let missing = source.resolve(&FLAT, Some("multilingual"));
+        assert!(missing.is_err());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

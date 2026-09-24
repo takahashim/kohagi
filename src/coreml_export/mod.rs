@@ -488,13 +488,15 @@ pub fn convert(
 /// encoder is rounded to fp16, which is the more accurate half of the trade
 /// rather than the less.
 ///
-/// Four small tensors: 2.4 MB for a 768-wide head, against a bundle of hundreds.
+/// Three to six small tensors: 2.4 MB for a 768-wide head, against a bundle of
+/// hundreds.
 fn write_head(weights: &safetensors::Checkpoint, path: &Path) -> Result<bool> {
     use crate::config::head;
 
     // The projection is what says a head is here at all; the norm and the
-    // classifier come with it. Biases are optional (ModernBERT's defaults are
-    // off), so an absent one is not an error.
+    // classifier weight come with it. Every bias is optional, so an absent one
+    // is not an error: `classifier_bias` and `norm_bias` default to off, and
+    // nothing at all decides `classifier.bias` but the checkpoint.
     if weights.tensor(head::REQUIRED[0]).is_none() {
         return Ok(false);
     }

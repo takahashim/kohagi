@@ -40,6 +40,7 @@ mod coreml;
 pub mod coreml_export;
 #[cfg(feature = "coreml-export")]
 mod coreml_proto;
+pub mod decide;
 mod encoder;
 mod errors;
 mod fingerprint;

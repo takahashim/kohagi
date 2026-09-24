@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`kohagi-decide`: typed decisions from a cross-encoder.** A fourth binary,
+  for callers that treat a question's candidates as a closed set: a state plus
+  named `choice` / `score` / `noul` questions in, the probabilities and the
+  value they imply out. The checkpoint (`--model-id`) and the head (`--head`)
+  are chosen independently; `--head cross-encoder` scores each option pair on
+  its own, the `argos1111` Jev-local shape. Heads are a registry, so the packed
+  `--head laya` (English and multilingual, experimental) is a module behind the
+  `head-laya` feature, on by default: `--no-default-features` builds it out
+  without touching anything else. See
+  [PROTOCOL-decide.md](PROTOCOL-decide.md).
+
 ## [0.7.0] - 2026-09-03
 
 ### Added

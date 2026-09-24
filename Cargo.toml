@@ -22,7 +22,7 @@ categories = ["command-line-utilities", "text-processing"]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 rayon = "1"
 num_cpus = "1"
 tokenizers = "0.21"
@@ -101,6 +101,13 @@ candle-core = { version = "0.11", features = ["accelerate"] }
 
 
 [features]
+# On by default: the packed `laya` decision head (src/decide/laya.rs). Building
+# with `--no-default-features` drops the head and its module, leaving
+# `kohagi-decide` with the cross-encoder head only. Nothing else depends on it,
+# so the flag exists to make the head removable without editing the registry.
+default = ["head-laya"]
+head-laya = []
+
 # NVIDIA GPU via Candle's CUDA backend: `cargo build --release --features cuda`,
 # then `kohagi --device cuda`. Requires an NVIDIA driver and CUDA runtime.
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
@@ -134,8 +141,9 @@ coreml = [
 # checkpoint itself), but only `kohagi` is packaged: converting to a directory is
 # a publisher's one-off, not part of embedding text. See src/bin/coreml-convert.rs.
 #
-# The only binary that needs a section here. `kohagi-rerank` and `kohagi-serve`
-# need no feature and ship on every target, so src/bin is left to say so.
+# The only binary that needs a section here. `kohagi-rerank`, `kohagi-decide`
+# and `kohagi-serve` need no feature and ship on every target, so src/bin is
+# left to say so.
 [[bin]]
 name = "coreml-convert"
 required-features = ["coreml-export"]
@@ -149,7 +157,7 @@ required-features = ["coreml-export"]
 #
 # `coreml-convert` is in no archive and stays that way: binstall treats a
 # `[[bin]]` carrying `required-features` as optional, so it warns that the file
-# is missing and installs the other three.
+# is missing and installs the other four.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/kohagi-{ target }.tar.gz"
 pkg-fmt = "tgz"

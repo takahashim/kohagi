@@ -44,7 +44,7 @@ cargo install kohagi
 ```
 
 [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) fetches the
-same release archive instead of compiling, and installs all three binaries:
+same release archive instead of compiling, and installs all four binaries:
 
 ```bash
 cargo binstall kohagi
@@ -145,6 +145,28 @@ skipped lines, blank-line batches, exit codes) is the same protocol. See
 kohagi-rerank --device coreml < pairs.jsonl > scores.jsonl
 ```
 
+## Typed decisions with `kohagi-decide`
+
+Some questions are a closed set: which department, how urgent, true or false.
+`kohagi-decide` scores every candidate of such a question against one state,
+softmaxes them into a distribution, and returns the `choice`, `score` or `noul`
+it implies:
+
+```console
+$ echo '{"id":1,"state":"二重請求です。返金してください。","questions":{"department":{"type":"choice","instructions":"担当部署は？","criteria":{"billing":"請求・返金","technical":"技術的な障害","sales":null}}}}' | kohagi-decide
+{"id":1,"answers":{"department":{"choice":"billing","probabilities":{"billing":0.999497,"sales":0.000475,"technical":0.000028},"probability":0.999497,"type":"choice"}}}
+```
+
+The checkpoint (`--model-id`) and the head (`--head`) are chosen independently.
+`--head cross-encoder` (the default) scores each `(context, option)` pair on its
+own — the `argos1111/modernbert-ja-310m-jev` shape, so it runs any one-label
+ModernBERT cross-encoder trained on the Jev-local prompt, the same checkpoint
+`kohagi-rerank` scores pairs with. An English and multilingual packed head
+(`--head laya`) reads state and options together; it is experimental and behind
+the `head-laya` feature, which is on by default, so `--no-default-features`
+drops it. The escalation head is deliberately not returned in v1. See
+[PROTOCOL-decide.md](PROTOCOL-decide.md).
+
 ## Calling Kohagi from another language
 
 Launch Kohagi as a subprocess, write JSONL records to its standard input, and read JSONL results from its standard output.
@@ -159,7 +181,7 @@ See [PROTOCOL.md](PROTOCOL.md) for the exit-code semantics.
 
 A pipe gives every process its own Kohagi, which is right for a batch and
 wrong for a Rails cluster, where each Puma worker would hold its own copy of
-the model. `kohagi-serve` is the third binary: the same model, loaded once per
+the model. `kohagi-serve` is the HTTP binary: the same model, loaded once per
 host, behind OpenAI's `/v1/embeddings`.
 
 ```bash
