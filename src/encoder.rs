@@ -23,7 +23,6 @@ use candle_nn::{
 };
 use serde::Deserialize;
 
-use core::f32;
 use std::sync::Arc;
 
 /// A ModernBERT `config.json`, in the two spellings the field names come in.
